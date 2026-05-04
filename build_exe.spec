@@ -66,7 +66,17 @@ _base_hidden = [
 # windows_capture 는 mac 에서 import 시 즉시 실패하므로 플랫폼별로만 넣는다.
 _platform_hidden: list[str] = []
 if sys.platform == "win32":
-    _platform_hidden = ["windows_capture", "tesseract_win_console"]
+    _platform_hidden = [
+        "windows_capture",
+        "tesseract_win_console",
+        "arduino_serial_bridge",
+        "serial",
+        "serial.serialutil",
+        "serial.tools",
+        "serial.tools.list_ports",
+        "pynput.keyboard._win32",
+        "pynput.mouse._win32",
+    ]
 elif sys.platform == "darwin":
     _platform_hidden = ["darwin_capture"]
 

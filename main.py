@@ -78,6 +78,44 @@ from detection import (
 )
 from preview_render import frame_with_overlays
 
+if sys.platform == "win32":
+    from arduino_serial_bridge import (
+        ArduinoKeyBridge,
+        bridge_supported,
+        key_pick_choices,
+        list_com_ports,
+        parse_key_filter_spec,
+    )
+else:
+
+    class ArduinoKeyBridge:  # type: ignore[no-redef]
+        def __init__(self) -> None:
+            pass
+
+        def last_error(self) -> None:
+            return None
+
+        def is_active(self) -> bool:
+            return False
+
+        def start(self, _port: str, _baud: int, _allowed: set[int]) -> bool:
+            return False
+
+        def stop(self) -> None:
+            pass
+
+    def bridge_supported() -> bool:
+        return False
+
+    def parse_key_filter_spec(_spec: str) -> tuple[set[int], list[str]]:
+        return set(), []
+
+    def list_com_ports() -> list[tuple[str, str]]:
+        return []
+
+    def key_pick_choices() -> tuple[str, ...]:
+        return ()
+
 
 def _app_writable_dir() -> Path:
     """PyInstaller exe 일 때 설정 JSON 은 실행 파일과 같은 폴더에 둔다."""
@@ -241,8 +279,17 @@ class MapleAlertApp(tk.Tk):
         self._ocr_log_after_id: str | None = None
         self._ocr_log_autoscroll_var = tk.BooleanVar(value=False)
 
+        self._arduino_bridge = ArduinoKeyBridge()
+        self._arduino_port_var = tk.StringVar(value="COM3")
+        self._arduino_baud_var = tk.StringVar(value="115200")
+        self._arduino_keys_var = tk.StringVar(value="F1,F2,F3")
+        self._arduino_status_var = tk.StringVar(value="")
+        self._arduino_summary_var = tk.StringVar(value="")
+
         self._build_ui()
         self._apply_settings_dict(_load_json_settings())
+        if sys.platform == "win32":
+            self.after(100, self._sync_arduino_bridge)
 
         self._alert_sound_lock = threading.Lock()
         self._last_alert_sound_ts = 0.0
@@ -447,6 +494,12 @@ class MapleAlertApp(tk.Tk):
             text="감지 영역 박스 표시 (영역마다 다른 색 테두리)",
             variable=self._show_overlay_var,
         ).pack(side=tk.LEFT)
+        if sys.platform == "win32":
+            ttk.Button(
+                r5,
+                text="Arduino 키 전송…",
+                command=self._open_arduino_settings_window,
+            ).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(r5, text="OCR 로그…", command=self._open_ocr_log_window).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
@@ -465,7 +518,18 @@ class MapleAlertApp(tk.Tk):
         )
         self._status.pack(fill=tk.X, padx=10, pady=(0, 2))
         self._ocr_status = ttk.Label(self, text="", anchor=tk.W, wraplength=900)
-        self._ocr_status.pack(fill=tk.X, padx=10, pady=(0, 8))
+        _ocr_bottom = 2 if sys.platform == "win32" else 8
+        self._ocr_status.pack(fill=tk.X, padx=10, pady=(0, _ocr_bottom))
+        if sys.platform == "win32":
+            self._arduino_main_line = ttk.Label(
+                self,
+                textvariable=self._arduino_summary_var,
+                foreground="gray",
+                font=("", 8),
+                anchor=tk.W,
+                wraplength=900,
+            )
+            self._arduino_main_line.pack(fill=tk.X, padx=10, pady=(0, 8))
 
         self._register_ui_cfg_dirty_traces()
 
@@ -636,6 +700,16 @@ class MapleAlertApp(tk.Tk):
                 self._src_mode.set(v)
         if window_pick_supported():
             self._on_src_mode_change()
+        if sys.platform == "win32" and "arduino_serial" in d and isinstance(
+            d["arduino_serial"], dict
+        ):
+            ad = d["arduino_serial"]
+            if ad.get("port"):
+                self._arduino_port_var.set(str(ad["port"]))
+            if ad.get("baud") is not None:
+                self._arduino_baud_var.set(str(ad["baud"]))
+            if ad.get("keys"):
+                self._arduino_keys_var.set(str(ad["keys"]))
         if "window_geometry" in d:
             g = str(d["window_geometry"]).strip()
             if g:
@@ -670,6 +744,8 @@ class MapleAlertApp(tk.Tk):
         wg = _read_window_geometry_str(self)
         if wg:
             data["window_geometry"] = wg
+        if sys.platform == "win32":
+            self._merge_arduino_into_settings_dict(data)
         try:
             _save_json_settings(data)
             self._ui_cfg_dirty = False
@@ -677,6 +753,312 @@ class MapleAlertApp(tk.Tk):
             self._ocr_status_stale = True
         except Exception as e:
             messagebox.showerror("저장 실패", str(e))
+        if sys.platform == "win32":
+            self._sync_arduino_bridge()
+
+    def _merge_arduino_into_settings_dict(self, data: dict) -> None:
+        try:
+            baud = int(str(self._arduino_baud_var.get()).strip())
+        except ValueError:
+            baud = 115200
+        self._arduino_baud_var.set(str(baud))
+        data["arduino_serial"] = {
+            "port": str(self._arduino_port_var.get()).strip(),
+            "baud": baud,
+            "keys": str(self._arduino_keys_var.get()).strip(),
+        }
+
+    def _merge_arduino_into_settings_file_only(self) -> None:
+        data = _load_json_settings()
+        self._merge_arduino_into_settings_dict(data)
+        _save_json_settings(data)
+
+    def _arduino_tokens_from_keys_var(self) -> list[str]:
+        raw = str(self._arduino_keys_var.get()).replace(";", ",")
+        return [t.strip() for t in raw.split(",") if t.strip()]
+
+    def _arduino_set_keys_var_from_tokens(self, tokens: list[str]) -> None:
+        self._arduino_keys_var.set(",".join(tokens))
+
+    def _arduino_apply_bridge_connection(self) -> bool:
+        """현재 UI 설정으로 연결(또는 재연결). 성공 시 True."""
+        if not bridge_supported():
+            self._arduino_bridge.stop()
+            self._arduino_status_var.set(
+                "pynput·pyserial 필요: pip install pynput pyserial"
+            )
+            self._arduino_summary_var.set("Arduino: pynput/pyserial 없음")
+            return False
+        spec = self._arduino_keys_var.get()
+        vks, bad = parse_key_filter_spec(spec)
+        if bad:
+            self._arduino_bridge.stop()
+            self._arduino_status_var.set(
+                "인식하지 못한 키: " + ", ".join(bad[:8])
+                + (" …" if len(bad) > 8 else "")
+            )
+            self._arduino_summary_var.set("Arduino: 키 목록 오류")
+            return False
+        if not vks:
+            self._arduino_bridge.stop()
+            self._arduino_status_var.set("전송할 키를 한 개 이상 추가하세요.")
+            self._arduino_summary_var.set("Arduino: 키 미지정")
+            return False
+        try:
+            baud = int(str(self._arduino_baud_var.get()).strip())
+        except ValueError:
+            baud = 115200
+        self._arduino_baud_var.set(str(baud))
+        port = str(self._arduino_port_var.get()).strip()
+        ok = self._arduino_bridge.start(port, baud, vks)
+        if ok:
+            self._arduino_status_var.set(
+                f"Arduino 연결됨 {port} @ {baud} — 키 {len(vks)}개 감지 중"
+            )
+            self._arduino_summary_var.set(
+                f"Arduino: {port} @ {baud} 연결 · {len(vks)}개 키 전송"
+            )
+        else:
+            err = self._arduino_bridge.last_error() or "연결 실패"
+            self._arduino_status_var.set(f"오류: {err}")
+            short = err if len(err) <= 56 else err[:53] + "…"
+            self._arduino_summary_var.set(f"Arduino: 오류 — {short}")
+        return ok
+
+    def _arduino_set_idle_disconnected(self) -> None:
+        """연결되지 않은 상태 메시지(요약만 덮어쓸 때)."""
+        self._arduino_summary_var.set("Arduino: 연결 안 됨")
+        self._arduino_status_var.set(
+            "「연결」을 누르면 선택한 COM으로 키 이벤트를 보냅니다 (프로토콜 D,<VK> / U,<VK>)."
+        )
+
+    def _open_arduino_settings_window(self) -> None:
+        if sys.platform != "win32":
+            return
+        snap = {
+            "port": self._arduino_port_var.get(),
+            "baud": self._arduino_baud_var.get(),
+            "keys": self._arduino_keys_var.get(),
+        }
+        was_active_at_open = self._arduino_bridge.is_active()
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Arduino 키 전송 설정")
+        dlg.geometry("580x460")
+        dlg.minsize(500, 400)
+        dlg.transient(self)
+        dlg.grab_set()
+        port_desc_var = tk.StringVar(value="")
+
+        top = ttk.Frame(dlg, padding=10)
+        top.pack(fill=tk.BOTH, expand=True)
+
+        prow = ttk.Frame(top)
+        prow.pack(fill=tk.X, pady=(0, 0))
+        ttk.Label(prow, text="COM 포트").pack(side=tk.LEFT)
+        combo = ttk.Combobox(prow, textvariable=self._arduino_port_var, width=16)
+        combo.pack(side=tk.LEFT, padx=8)
+
+        def update_port_desc() -> None:
+            pairs = list_com_ports()
+            dev = str(self._arduino_port_var.get()).strip()
+            for d, desc in pairs:
+                if d == dev:
+                    port_desc_var.set(desc[:140] if desc else "")
+                    return
+            port_desc_var.set(
+                "(선택한 포트가 목록에 없습니다. 직접 입력했거나 케이블을 확인하세요.)"
+            )
+
+        def refresh_ports() -> None:
+            pairs = list_com_ports()
+            devices = [d for d, _ in pairs]
+            cur = str(self._arduino_port_var.get()).strip()
+            if cur:
+                ups = {x.upper() for x in devices}
+                if cur.upper() not in ups:
+                    devices.insert(0, cur)
+            combo["values"] = devices
+            update_port_desc()
+
+        ttk.Button(prow, text="포트 새로고침", command=refresh_ports).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Label(prow, text="보드레이트").pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Entry(prow, textvariable=self._arduino_baud_var, width=10).pack(
+            side=tk.LEFT, padx=4
+        )
+
+        ttk.Label(
+            top,
+            textvariable=port_desc_var,
+            foreground="gray",
+            font=("", 8),
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        keys_lab = ttk.LabelFrame(top, text="전송할 키", padding=(6, 6))
+        keys_lab.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        pick_fr = ttk.Frame(keys_lab)
+        pick_fr.pack(fill=tk.X)
+        ttk.Label(pick_fr, text="키 선택").pack(side=tk.LEFT)
+        pick_placeholder = "(선택하면 목록에 추가)"
+        key_pick = ttk.Combobox(
+            pick_fr,
+            values=(pick_placeholder, *key_pick_choices()),
+            width=28,
+            state="readonly",
+        )
+        key_pick.pack(side=tk.LEFT, padx=8)
+        key_pick.set(pick_placeholder)
+
+        keys_row = ttk.Frame(keys_lab)
+        keys_row.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        lb_fr = ttk.Frame(keys_row)
+        lb_fr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lb_scroll = ttk.Scrollbar(lb_fr)
+        lb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        keys_lb = tk.Listbox(
+            lb_fr,
+            height=8,
+            selectmode=tk.EXTENDED,
+            yscrollcommand=lb_scroll.set,
+            exportselection=False,
+        )
+        keys_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lb_scroll.config(command=keys_lb.yview)
+
+        def sync_var_from_listbox() -> None:
+            items = [keys_lb.get(i) for i in range(keys_lb.size())]
+            self._arduino_set_keys_var_from_tokens(items)
+
+        def refill_listbox_from_var() -> None:
+            keys_lb.delete(0, tk.END)
+            for t in self._arduino_tokens_from_keys_var():
+                keys_lb.insert(tk.END, t)
+
+        def on_pick(_evt: object | None = None) -> None:
+            sel = key_pick.get()
+            if not sel or sel.startswith("("):
+                return
+            existing = {keys_lb.get(i) for i in range(keys_lb.size())}
+            if sel not in existing:
+                keys_lb.insert(tk.END, sel)
+                sync_var_from_listbox()
+            key_pick.set(pick_placeholder)
+
+        key_pick.bind("<<ComboboxSelected>>", on_pick)
+
+        btn_col = ttk.Frame(keys_row)
+        btn_col.pack(side=tk.LEFT, padx=(8, 0), fill=tk.Y)
+
+        def remove_selected() -> None:
+            sel = list(keys_lb.curselection())
+            if not sel:
+                return
+            for i in reversed(sel):
+                keys_lb.delete(i)
+            sync_var_from_listbox()
+
+        ttk.Button(btn_col, text="선택 제거", command=remove_selected).pack(
+            fill=tk.X, pady=2
+        )
+
+        def clear_all_keys() -> None:
+            keys_lb.delete(0, tk.END)
+            sync_var_from_listbox()
+
+        ttk.Button(btn_col, text="전부 비우기", command=clear_all_keys).pack(
+            fill=tk.X, pady=2
+        )
+
+        ttk.Label(
+            keys_lab,
+            text="위 목록 순서대로 설정 파일에 저장됩니다. 프로토콜: D,<VK> 다운 · U,<VK> 업",
+            foreground="gray",
+            font=("", 8),
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+        refill_listbox_from_var()
+
+        st_fr = ttk.Frame(top)
+        st_fr.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        ttk.Label(st_fr, text="상태", font=("", 9)).pack(anchor=tk.W)
+        ttk.Label(
+            st_fr,
+            textvariable=self._arduino_status_var,
+            foreground="#366",
+            wraplength=520,
+        ).pack(anchor=tk.W)
+
+        combo.bind("<<ComboboxSelected>>", lambda _e: update_port_desc())
+        combo.bind("<FocusOut>", lambda _e: update_port_desc())
+
+        refresh_ports()
+        if not bridge_supported():
+            self._arduino_status_var.set(
+                "pynput·pyserial 필요: pip install pynput pyserial"
+            )
+
+        bar = ttk.Frame(dlg, padding=(10, 0, 10, 10))
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        toggle_btn = ttk.Button(bar)
+
+        def refresh_toggle_label() -> None:
+            if self._arduino_bridge.is_active():
+                toggle_btn.configure(text="연결 해제")
+            else:
+                toggle_btn.configure(text="연결")
+
+        def do_toggle() -> None:
+            if self._arduino_bridge.is_active():
+                self._arduino_bridge.stop()
+                self._arduino_set_idle_disconnected()
+            else:
+                self._arduino_apply_bridge_connection()
+            refresh_toggle_label()
+
+        toggle_btn.configure(command=do_toggle)
+        refresh_toggle_label()
+        toggle_btn.pack(side=tk.LEFT, padx=2)
+
+        def on_ok() -> None:
+            self._merge_arduino_into_settings_file_only()
+            self._sync_arduino_bridge()
+            dlg.destroy()
+
+        def on_save_only() -> None:
+            self._merge_arduino_into_settings_file_only()
+            self._sync_arduino_bridge()
+
+        def on_cancel() -> None:
+            self._arduino_port_var.set(snap["port"])
+            self._arduino_baud_var.set(snap["baud"])
+            self._arduino_keys_var.set(snap["keys"])
+            self._arduino_bridge.stop()
+            if was_active_at_open:
+                self._arduino_apply_bridge_connection()
+            else:
+                self._arduino_set_idle_disconnected()
+            dlg.destroy()
+
+        ttk.Button(bar, text="설정 저장", command=on_save_only).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="취소", command=on_cancel).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(bar, text="확인", command=on_ok).pack(side=tk.RIGHT, padx=2)
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    def _sync_arduino_bridge(self) -> None:
+        """연결 중이면 설정으로 재연결, 아니면 대기 메시지만 갱신."""
+        if sys.platform != "win32":
+            return
+        if not self._arduino_bridge.is_active():
+            self._arduino_set_idle_disconnected()
+            return
+        self._arduino_apply_bridge_connection()
 
     def _browse_template(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -1016,6 +1398,8 @@ class MapleAlertApp(tk.Tk):
         set_ocr_keyword_alert_sound_handler(None)
         self._running = False
         self._cancel_ocr_log_polling()
+        if sys.platform == "win32":
+            self._arduino_bridge.stop()
         self._stop()
         self.destroy()
 

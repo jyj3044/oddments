@@ -13,3 +13,5 @@ rapidocr-onnxruntime>=1.2.3; python_version >= "3.13"
 # Python 3.13+ / 3.14 등: 1.20.1 휠이 없으므로 pip 에 올라온 1.24+ 사용 (맥·소스 실행·빌드).
 onnxruntime==1.20.1; python_version < "3.13"
 onnxruntime>=1.24.1,<1.26; python_version >= "3.13"
+pyserial>=3.5
+pynput>=1.7.6
