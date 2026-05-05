@@ -82,9 +82,14 @@ if sys.platform == "win32":
     from arduino_serial_bridge import (
         ArduinoKeyBridge,
         bridge_supported,
+        clear_key_bridge_debug_log,
+        clear_received_serial_log,
+        drain_received_serial_lines,
+        drain_key_bridge_debug_lines,
         key_pick_choices,
         list_com_ports,
         parse_key_filter_spec,
+        set_key_bridge_debug_logging,
     )
 else:
 
@@ -116,6 +121,21 @@ else:
     def key_pick_choices() -> tuple[str, ...]:
         return ()
 
+    def set_key_bridge_debug_logging(_enabled: bool) -> None:
+        pass
+
+    def drain_key_bridge_debug_lines(_max_n: int = 200) -> list[str]:
+        return []
+
+    def drain_received_serial_lines(_max_n: int = 200) -> list[str]:
+        return []
+
+    def clear_received_serial_log() -> None:
+        pass
+
+    def clear_key_bridge_debug_log() -> None:
+        pass
+
 
 def _app_writable_dir() -> Path:
     """PyInstaller exe 일 때 설정 JSON 은 실행 파일과 같은 폴더에 둔다."""
@@ -136,6 +156,10 @@ def _initial_ocr_engines() -> tuple[str, ...]:
 
 # 창 제목·프로세스 표시 이름 (setproctitle, Windows 콘솔 제목)
 APP_NAME = "cyj"
+
+# 상단 바(캡처 소스·FPS·송출 시작/중지)가 잘리지 않도록 최소 크기
+_MAIN_WIN_MIN_W = 1000
+_MAIN_WIN_MIN_H = 480
 
 
 def _parse_template_paths(raw: str) -> tuple[str, ...]:
@@ -198,19 +222,6 @@ def _read_window_geometry_str(root: tk.Tk) -> Optional[str]:
         return None
 
 
-def _merge_window_geometry_into_settings_file(root: tk.Tk) -> None:
-    """설정 JSON에 현재 창 크기·위치만 갱신(나머지 키 유지). 저장 버튼 없이 자동 반영용."""
-    geo = _read_window_geometry_str(root)
-    if not geo:
-        return
-    try:
-        data = _load_json_settings()
-        data["window_geometry"] = geo
-        _save_json_settings(data)
-    except Exception:
-        pass
-
-
 def _set_process_display_name(name: str) -> None:
     try:
         import setproctitle
@@ -233,7 +244,8 @@ class MapleAlertApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("960x820")
+        self.geometry("1000x820")
+        self.minsize(_MAIN_WIN_MIN_W, _MAIN_WIN_MIN_H)
 
         self._cfg = DetectionConfig(
             alert_keywords=("보스",),
@@ -288,6 +300,7 @@ class MapleAlertApp(tk.Tk):
 
         self._build_ui()
         self._apply_settings_dict(_load_json_settings())
+        self.after_idle(self._clamp_main_window_geometry_to_minimum)
         if sys.platform == "win32":
             self.after(100, self._sync_arduino_bridge)
 
@@ -328,12 +341,30 @@ class MapleAlertApp(tk.Tk):
         except tk.TclError:
             pass
 
+    def _clamp_main_window_geometry_to_minimum(self) -> None:
+        """저장된 geometry가 너무 작으면 최소 가로·세로로 맞춤 (상단 버튼이 사라지지 않게)."""
+        try:
+            self.update_idletasks()
+            w = int(self.winfo_width())
+            h = int(self.winfo_height())
+        except (tk.TclError, ValueError):
+            return
+        if w <= 1 or h <= 1:
+            return
+        nw = max(w, _MAIN_WIN_MIN_W)
+        nh = max(h, _MAIN_WIN_MIN_H)
+        if nw == w and nh == h:
+            return
+        try:
+            self.geometry(f"{nw}x{nh}")
+        except tk.TclError:
+            pass
+
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
 
         src = ttk.LabelFrame(top, text="캡처·송출 소스", padding=(6, 4))
-        src.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._src_mode = tk.StringVar(value="monitor")
         if window_pick_supported():
@@ -373,20 +404,22 @@ class MapleAlertApp(tk.Tk):
         self._pick_info = ttk.Label(src, textvariable=self._pick_info_var, width=42)
         self._pick_info.pack(side=tk.LEFT, padx=(0, 0))
 
-        fps_fr = ttk.Frame(top, padding=(8, 0))
-        fps_fr.pack(side=tk.RIGHT)
+        # 오른쪽부터 pack: 맨 먼저 pack한 쪽이 화면 오른쪽 끝 → [소스…][캡처 FPS][송출 버튼]
+        btn_fr = ttk.Frame(top, padding=(8, 0))
+        self._btn_start = ttk.Button(btn_fr, text="송출 시작", command=self._start)
+        self._btn_start.pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_fr, text="중지", command=self._stop).pack(side=tk.LEFT, padx=2)
+        btn_fr.pack(side=tk.RIGHT)
 
+        fps_fr = ttk.Frame(top, padding=(8, 0))
         ttk.Label(fps_fr, text="캡처 FPS").pack(side=tk.LEFT)
         self._fps_var = tk.StringVar(value="20")
         ttk.Spinbox(fps_fr, from_=5, to=60, width=4, textvariable=self._fps_var).pack(
             side=tk.LEFT, padx=(4, 12)
         )
+        fps_fr.pack(side=tk.RIGHT)
 
-        btn_fr = ttk.Frame(top, padding=(8, 0))
-        btn_fr.pack(side=tk.RIGHT, before=fps_fr)
-        self._btn_start = ttk.Button(btn_fr, text="송출 시작", command=self._start)
-        self._btn_start.pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_fr, text="중지", command=self._stop).pack(side=tk.LEFT, padx=2)
+        src.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         if window_pick_supported():
             self._on_src_mode_change()
@@ -502,9 +535,6 @@ class MapleAlertApp(tk.Tk):
             ).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(r5, text="OCR 로그…", command=self._open_ocr_log_window).pack(
             side=tk.RIGHT, padx=(4, 0)
-        )
-        ttk.Button(r5, text="설정 저장", command=self._save_settings_clicked).pack(
-            side=tk.RIGHT, padx=(8, 0)
         )
         ttk.Label(r5, text=f"저장 위치: {_SETTINGS_FILE.name}", foreground="gray").pack(
             side=tk.RIGHT, padx=8
@@ -718,7 +748,8 @@ class MapleAlertApp(tk.Tk):
                 except tk.TclError:
                     pass
 
-    def _save_settings_clicked(self) -> None:
+    def _persist_app_settings(self, *, show_error_dialog: bool = True) -> bool:
+        """감지·캡처·아두이노 설정을 JSON에 기록. 창 닫기 등에서 호출."""
         self._sync_cfg_from_ui()
 
         def _f(var: tk.StringVar, default: float) -> float:
@@ -752,9 +783,12 @@ class MapleAlertApp(tk.Tk):
             self._last_cfg_poll_sync = time.monotonic()
             self._ocr_status_stale = True
         except Exception as e:
-            messagebox.showerror("저장 실패", str(e))
+            if show_error_dialog:
+                messagebox.showerror("저장 실패", str(e))
+            return False
         if sys.platform == "win32":
             self._sync_arduino_bridge()
+        return True
 
     def _merge_arduino_into_settings_dict(self, data: dict) -> None:
         try:
@@ -835,17 +869,11 @@ class MapleAlertApp(tk.Tk):
     def _open_arduino_settings_window(self) -> None:
         if sys.platform != "win32":
             return
-        snap = {
-            "port": self._arduino_port_var.get(),
-            "baud": self._arduino_baud_var.get(),
-            "keys": self._arduino_keys_var.get(),
-        }
-        was_active_at_open = self._arduino_bridge.is_active()
 
         dlg = tk.Toplevel(self)
         dlg.title("Arduino 키 전송 설정")
-        dlg.geometry("580x460")
-        dlg.minsize(500, 400)
+        dlg.geometry("580x640")
+        dlg.minsize(500, 520)
         dlg.transient(self)
         dlg.grab_set()
         port_desc_var = tk.StringVar(value="")
@@ -975,7 +1003,7 @@ class MapleAlertApp(tk.Tk):
 
         ttk.Label(
             keys_lab,
-            text="위 목록 순서대로 설정 파일에 저장됩니다. 프로토콜: D,<VK> 다운 · U,<VK> 업",
+            text="PC→아두이노 프로토콜: D,<VK> 다운 · U,<VK> 업. 이 창을 닫으면 설정이 저장됩니다.",
             foreground="gray",
             font=("", 8),
             wraplength=520,
@@ -983,15 +1011,92 @@ class MapleAlertApp(tk.Tk):
 
         refill_listbox_from_var()
 
-        st_fr = ttk.Frame(top)
-        st_fr.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        ttk.Label(st_fr, text="상태", font=("", 9)).pack(anchor=tk.W)
+        log_fr = ttk.LabelFrame(top, text="아두이노 로그", padding=(6, 6))
+        log_fr.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         ttk.Label(
-            st_fr,
-            textvariable=self._arduino_status_var,
-            foreground="#366",
+            log_fr,
+            text=(
+                "[KB] 체크 시 PC 키 이벤트, [RX] 아두이노 Serial 수신, [상태] 연결·오류 안내가 한 창에 표시됩니다."
+            ),
+            foreground="gray",
+            font=("", 8),
             wraplength=520,
         ).pack(anchor=tk.W)
+        log_row = ttk.Frame(log_fr)
+        log_row.pack(fill=tk.X, pady=(4, 0))
+        kb_debug_var = tk.BooleanVar(value=False)
+
+        def on_kb_debug_toggle() -> None:
+            set_key_bridge_debug_logging(kb_debug_var.get())
+
+        ttk.Checkbutton(
+            log_row,
+            text="키 이벤트 로그 남기기",
+            variable=kb_debug_var,
+            command=on_kb_debug_toggle,
+        ).pack(side=tk.LEFT)
+
+        arduino_log = scrolledtext.ScrolledText(
+            log_fr,
+            height=14,
+            wrap=tk.NONE,
+            font=("Consolas", 9),
+        )
+        arduino_log.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        kb_poll_after: list[str | None] = [None]
+
+        def log_status_line(msg: str) -> None:
+            ts = time.strftime("%H:%M:%S")
+            try:
+                arduino_log.insert(tk.END, f"[상태] {ts} {msg}\n")
+            except tk.TclError:
+                pass
+
+        def clear_arduino_log_view() -> None:
+            clear_key_bridge_debug_log()
+            clear_received_serial_log()
+            try:
+                arduino_log.delete("1.0", tk.END)
+            except tk.TclError:
+                pass
+
+        ttk.Button(log_row, text="로그 비우기", command=clear_arduino_log_view).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
+        def cancel_kb_log_poll() -> None:
+            aid = kb_poll_after[0]
+            if aid is not None:
+                try:
+                    dlg.after_cancel(aid)
+                except (tk.TclError, ValueError):
+                    pass
+                kb_poll_after[0] = None
+
+        def close_arduino_dlg_cleanup() -> None:
+            cancel_kb_log_poll()
+            set_key_bridge_debug_logging(False)
+            kb_debug_var.set(False)
+
+        def tick_arduino_log() -> None:
+            kb_poll_after[0] = None
+            try:
+                if not dlg.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            for line in drain_key_bridge_debug_lines(250):
+                arduino_log.insert(tk.END, line)
+            for line in drain_received_serial_lines(250):
+                arduino_log.insert(tk.END, line)
+            try:
+                end_line = int(float(arduino_log.index("end-1c").split(".")[0]))
+                if end_line > 900:
+                    arduino_log.delete("1.0", "450.0")
+            except tk.TclError:
+                pass
+            kb_poll_after[0] = dlg.after(120, tick_arduino_log)
 
         combo.bind("<<ComboboxSelected>>", lambda _e: update_port_desc())
         combo.bind("<FocusOut>", lambda _e: update_port_desc())
@@ -1001,6 +1106,12 @@ class MapleAlertApp(tk.Tk):
             self._arduino_status_var.set(
                 "pynput·pyserial 필요: pip install pynput pyserial"
             )
+        open_msg = (
+            self._arduino_status_var.get().strip()
+            or self._arduino_summary_var.get().strip()
+            or "Arduino 설정 창을 열었습니다."
+        )
+        log_status_line(open_msg)
 
         bar = ttk.Frame(dlg, padding=(10, 0, 10, 10))
         bar.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1020,36 +1131,23 @@ class MapleAlertApp(tk.Tk):
             else:
                 self._arduino_apply_bridge_connection()
             refresh_toggle_label()
+            log_status_line(self._arduino_status_var.get())
 
         toggle_btn.configure(command=do_toggle)
         refresh_toggle_label()
         toggle_btn.pack(side=tk.LEFT, padx=2)
 
-        def on_ok() -> None:
+        def on_close_dlg() -> None:
+            close_arduino_dlg_cleanup()
             self._merge_arduino_into_settings_file_only()
             self._sync_arduino_bridge()
             dlg.destroy()
 
-        def on_save_only() -> None:
-            self._merge_arduino_into_settings_file_only()
-            self._sync_arduino_bridge()
+        ttk.Button(bar, text="닫기", command=on_close_dlg).pack(side=tk.RIGHT, padx=2)
 
-        def on_cancel() -> None:
-            self._arduino_port_var.set(snap["port"])
-            self._arduino_baud_var.set(snap["baud"])
-            self._arduino_keys_var.set(snap["keys"])
-            self._arduino_bridge.stop()
-            if was_active_at_open:
-                self._arduino_apply_bridge_connection()
-            else:
-                self._arduino_set_idle_disconnected()
-            dlg.destroy()
+        dlg.protocol("WM_DELETE_WINDOW", on_close_dlg)
 
-        ttk.Button(bar, text="설정 저장", command=on_save_only).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="취소", command=on_cancel).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(bar, text="확인", command=on_ok).pack(side=tk.RIGHT, padx=2)
-
-        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        dlg.after(80, tick_arduino_log)
 
     def _sync_arduino_bridge(self) -> None:
         """연결 중이면 설정으로 재연결, 아니면 대기 메시지만 갱신."""
@@ -1394,7 +1492,7 @@ class MapleAlertApp(tk.Tk):
     def _on_close(self) -> None:
         from detection.ocr_diag import set_ocr_keyword_alert_sound_handler
 
-        _merge_window_geometry_into_settings_file(self)
+        self._persist_app_settings(show_error_dialog=True)
         set_ocr_keyword_alert_sound_handler(None)
         self._running = False
         self._cancel_ocr_log_polling()

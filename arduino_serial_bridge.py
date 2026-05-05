@@ -8,10 +8,12 @@ Windows: 지정한 키(가상 키 코드)가 눌리거나 떼질 때 Arduino(COM
 
 from __future__ import annotations
 
+import queue
 import re
 import sys
 import threading
-from typing import Callable, Optional
+import time
+from typing import Optional
 
 if sys.platform == "win32":
     try:
@@ -28,6 +30,72 @@ else:
 
 
 _FKEY_RE = re.compile(r"^f(\d{1,2})$", re.IGNORECASE)
+
+_kb_debug_q: queue.SimpleQueue[str] = queue.SimpleQueue()
+_kb_debug_on = False
+_serial_rx_q: queue.SimpleQueue[str] = queue.SimpleQueue()
+
+
+def set_key_bridge_debug_logging(enabled: bool) -> None:
+    """Arduino 키 브리지 스레드에서 키 이벤트 진단 줄을 큐에 넣을지 여부."""
+    global _kb_debug_on
+    _kb_debug_on = bool(enabled)
+
+
+def drain_key_bridge_debug_lines(max_n: int = 200) -> list[str]:
+    """UI 스레드에서 소비. max_n 줄까지 한 번에 꺼냄."""
+    out: list[str] = []
+    for _ in range(max(1, max_n)):
+        try:
+            out.append(_kb_debug_q.get_nowait())
+        except queue.Empty:
+            break
+    return out
+
+
+def clear_key_bridge_debug_log() -> None:
+    while True:
+        try:
+            _kb_debug_q.get_nowait()
+        except queue.Empty:
+            break
+
+
+def drain_received_serial_lines(max_n: int = 200) -> list[str]:
+    """Arduino -> PC 로 들어온 시리얼 텍스트 줄을 UI에서 소비."""
+    out: list[str] = []
+    for _ in range(max(1, max_n)):
+        try:
+            out.append(_serial_rx_q.get_nowait())
+        except queue.Empty:
+            break
+    return out
+
+
+def clear_received_serial_log() -> None:
+    while True:
+        try:
+            _serial_rx_q.get_nowait()
+        except queue.Empty:
+            break
+
+
+def _kb_debug_line(msg: str) -> None:
+    if not _kb_debug_on:
+        return
+    ts = time.strftime("%H:%M:%S")
+    _kb_debug_q.put(f"[KB] {ts} {msg}\n")
+
+
+def _key_repr_for_log(key: object) -> str:
+    try:
+        s = str(key)
+    except Exception:
+        s = repr(key)
+    s = s.replace("\n", " ")
+    if len(s) > 96:
+        return s[:93] + "…"
+    return s
 
 
 def _token_to_vk(token: str) -> Optional[int]:
@@ -142,6 +210,8 @@ class ArduinoKeyBridge:
         self._lock = threading.Lock()
         self._ser: Optional[object] = None
         self._listener: Optional[object] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
         self._allowed: set[int] = set()
         self._port = ""
         self._baud = 115200
@@ -185,6 +255,35 @@ class ArduinoKeyBridge:
             self._baud = baud
             self._allowed = set(allowed_vks)
             self._running = True
+            self._reader_stop.clear()
+
+        def reader_loop() -> None:
+            while not self._reader_stop.is_set():
+                with self._lock:
+                    s = self._ser
+                    running = self._running
+                if not running or s is None:
+                    return
+                try:
+                    raw = s.readline()
+                except Exception as e:
+                    _serial_rx_q.put(f"[RX][ERR] {e}\n")
+                    time.sleep(0.1)
+                    continue
+                if not raw:
+                    continue
+                try:
+                    txt = raw.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    txt = repr(raw)
+                if txt:
+                    ts = time.strftime("%H:%M:%S")
+                    _serial_rx_q.put(f"[RX] {ts} {txt}\n")
+
+        self._reader_thread = threading.Thread(
+            target=reader_loop, daemon=True, name="Arduino-Serial-RX"
+        )
+        self._reader_thread.start()
 
         def on_press(key: object) -> None:
             self._send_key_event(key, down=True)
@@ -210,36 +309,61 @@ class ArduinoKeyBridge:
         return True
 
     def _send_key_event(self, key: object, down: bool) -> None:
+        phase = "DOWN" if down else "UP"
+        kr = _key_repr_for_log(key)
         vk = _event_vk(key)
         if vk is None:
+            _kb_debug_line(
+                f"{phase} key={kr} vk=(없음) → 가상키 미해석, 시리얼 없음"
+            )
             return
+        hexvk = f"0x{vk:02X}"
         with self._lock:
             if not self._running:
+                _kb_debug_line(
+                    f"{phase} key={kr} vk={vk} ({hexvk}) → 브리지 중지됨, 시리얼 없음"
+                )
                 return
             if vk not in self._allowed:
+                _kb_debug_line(
+                    f"{phase} key={kr} vk={vk} ({hexvk}) → 전송 목록에 없음 (필터), 시리얼 없음"
+                )
                 return
             ser = self._ser
         if ser is None:
+            _kb_debug_line(
+                f"{phase} key={kr} vk={vk} ({hexvk}) → 시리얼 없음 (포트 닫힘)"
+            )
             return
         line = (f"D,{vk}\n" if down else f"U,{vk}\n").encode("ascii", errors="ignore")
         try:
             ser.write(line)
             ser.flush()
-        except Exception:
-            pass
+            _kb_debug_line(
+                f"{phase} key={kr} vk={vk} ({hexvk}) → 시리얼 전송 {line.decode('ascii', errors='replace').strip()}"
+            )
+        except Exception as e:
+            _kb_debug_line(
+                f"{phase} key={kr} vk={vk} ({hexvk}) → 시리얼 쓰기 실패: {e}"
+            )
 
     def stop(self) -> None:
         with self._lock:
             self._running = False
+            self._reader_stop.set()
             lst = self._listener
             self._listener = None
             ser = self._ser
             self._ser = None
+            rd = self._reader_thread
+            self._reader_thread = None
         if lst is not None:
             try:
                 lst.stop()
             except Exception:
                 pass
+        if rd is not None and rd.is_alive():
+            rd.join(timeout=0.4)
         if ser is not None:
             try:
                 ser.close()
