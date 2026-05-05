@@ -43,6 +43,7 @@ if getattr(sys, "frozen", False):
         pass
 
 import json
+import subprocess
 import threading
 import traceback
 from typing import Optional
@@ -1619,6 +1620,82 @@ def _frozen_exe_dir() -> Path | None:
     return Path(sys.executable).resolve().parent
 
 
+def _is_windows_elevated() -> bool:
+    """Windows: 관리자(UAC 상승) 프로세스이면 True."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _windows_relaunch_as_admin() -> bool:
+    """
+    ShellExecuteW(..., \"runas\", ...) 로 동일 실행 파일을 관리자 권한으로 다시 띄운다.
+    성공 시(>32) 새 프로세스가 시작되므로 호출 측에서 sys.exit(0) 할 것.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    import os
+
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        params = subprocess.list2cmdline(sys.argv[1:])
+    else:
+        exe = sys.executable
+        script = str(Path(__file__).resolve())
+        params = subprocess.list2cmdline([script, *sys.argv[1:]])
+
+    cwd = os.getcwd()
+    rc = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        exe,
+        params if params else None,
+        cwd,
+        1,  # SW_SHOWNORMAL
+    )
+    try:
+        return int(rc) > 32
+    except (TypeError, ValueError):
+        return False
+
+
+def _maybe_prompt_windows_elevation() -> None:
+    """관리자가 아니면 안내 후 확인 시 UAC로 재실행. 취소면 일반 권한으로 계속."""
+    if sys.platform != "win32" or _is_windows_elevated():
+        return
+    ensure_pre_gui_init()
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        if not messagebox.askokcancel(
+            "관리자 권한",
+            "지금은 일반 권한으로 실행 중입니다.\n\n"
+            "「확인」을 누르면 UAC 창이 열린 뒤, 관리자 권한으로 다시 실행합니다.\n"
+            "「취소」는 일반 권한으로 그대로 계속합니다.",
+            parent=root,
+        ):
+            return
+        if _windows_relaunch_as_admin():
+            sys.exit(0)
+        messagebox.showerror(
+            "관리자 권한",
+            "관리자 권한으로 다시 실행하지 못했습니다.\n"
+            "(UAC에서 거부했거나 오류가 났을 수 있습니다.)",
+            parent=root,
+        )
+    finally:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
 def _frozen_boot_log(msg: str) -> None:
     d = _frozen_exe_dir()
     if d is None:
@@ -1644,6 +1721,7 @@ def main() -> None:
             pass
 
     _set_process_display_name(APP_NAME)
+    _maybe_prompt_windows_elevation()
     _frozen_boot_log("ensure_pre_gui_init …")
     ensure_pre_gui_init()
     _frozen_boot_log("Tk 앱 생성 …")
