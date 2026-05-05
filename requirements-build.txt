@@ -1,4 +1,4 @@
-# exe 빌드 전용. 권장: 깨끗한 venv 에서 설치 후 build_exe.bat / build_exe.sh 실행
+# exe 빌드 전용. 권장: build_exe_with_venv.bat (Windows) 또는 깨끗한 venv + build_exe.bat / build_exe.sh
 -r requirements-runtime.txt
 pyinstaller>=6.0
 # macOS 번들에서 창 캡처(darwin_capture)용
