@@ -347,6 +347,32 @@ class ArduinoKeyBridge:
                 f"{phase} key={kr} vk={vk} ({hexvk}) → 시리얼 쓰기 실패: {e}"
             )
 
+    # UI에서 포커스 변화 같은 내부 이벤트를 Arduino로 즉시 전달할 때 사용.
+    def send_virtual_key(self, vk: int, down: bool) -> bool:
+        phase = "DOWN" if down else "UP"
+        hexvk = f"0x{vk:02X}"
+        with self._lock:
+            if not self._running:
+                _kb_debug_line(
+                    f"{phase} vk={vk} ({hexvk}) → 브리지 중지됨, 시리얼 없음"
+                )
+                return False
+            ser = self._ser
+        if ser is None:
+            _kb_debug_line(f"{phase} vk={vk} ({hexvk}) → 시리얼 없음 (포트 닫힘)")
+            return False
+        line = (f"D,{vk}\n" if down else f"U,{vk}\n").encode("ascii", errors="ignore")
+        try:
+            ser.write(line)
+            ser.flush()
+            _kb_debug_line(
+                f"{phase} vk={vk} ({hexvk}) → 시리얼 전송 {line.decode('ascii', errors='replace').strip()}"
+            )
+            return True
+        except Exception as e:
+            _kb_debug_line(f"{phase} vk={vk} ({hexvk}) → 시리얼 쓰기 실패: {e}")
+            return False
+
     def stop(self) -> None:
         with self._lock:
             self._running = False

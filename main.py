@@ -110,6 +110,9 @@ else:
         def stop(self) -> None:
             pass
 
+        def send_virtual_key(self, _vk: int, _down: bool) -> bool:
+            return False
+
     def bridge_supported() -> bool:
         return False
 
@@ -241,6 +244,19 @@ def _set_process_display_name(name: str) -> None:
             pass
 
 
+def _win32_foreground_hwnd() -> int | None:
+    """Windows 현재 포그라운드 창 HWND를 반환. 실패 시 None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+        return hwnd if hwnd > 0 else None
+    except Exception:
+        return None
+
+
 class MapleAlertApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -296,8 +312,11 @@ class MapleAlertApp(tk.Tk):
         self._arduino_port_var = tk.StringVar(value="COM3")
         self._arduino_baud_var = tk.StringVar(value="115200")
         self._arduino_keys_var = tk.StringVar(value="F1,F2,F3")
+        self._arduino_focus_event_enabled_var = tk.BooleanVar(value=False)
+        self._arduino_focus_key_var = tk.StringVar(value="F8")
         self._arduino_status_var = tk.StringVar(value="")
         self._arduino_summary_var = tk.StringVar(value="")
+        self._last_window_focus_state: bool | None = None
 
         self._build_ui()
         self._apply_settings_dict(_load_json_settings())
@@ -741,6 +760,12 @@ class MapleAlertApp(tk.Tk):
                 self._arduino_baud_var.set(str(ad["baud"]))
             if ad.get("keys"):
                 self._arduino_keys_var.set(str(ad["keys"]))
+            if ad.get("focus_event_enabled") is not None:
+                self._arduino_focus_event_enabled_var.set(
+                    bool(ad.get("focus_event_enabled"))
+                )
+            if ad.get("focus_event_key"):
+                self._arduino_focus_key_var.set(str(ad.get("focus_event_key")))
         if "window_geometry" in d:
             g = str(d["window_geometry"]).strip()
             if g:
@@ -801,6 +826,8 @@ class MapleAlertApp(tk.Tk):
             "port": str(self._arduino_port_var.get()).strip(),
             "baud": baud,
             "keys": str(self._arduino_keys_var.get()).strip(),
+            "focus_event_enabled": bool(self._arduino_focus_event_enabled_var.get()),
+            "focus_event_key": str(self._arduino_focus_key_var.get()).strip(),
         }
 
     def _merge_arduino_into_settings_file_only(self) -> None:
@@ -860,6 +887,45 @@ class MapleAlertApp(tk.Tk):
             self._arduino_summary_var.set(f"Arduino: 오류 — {short}")
         return ok
 
+    # 포커스 이벤트용 키 토큰을 VK로 해석하고 유효성을 점검한다.
+    def _focus_event_vk(self) -> int | None:
+        token = str(self._arduino_focus_key_var.get()).strip()
+        if not token:
+            return None
+        vks, bad = parse_key_filter_spec(token)
+        if bad or len(vks) != 1:
+            return None
+        return next(iter(vks))
+
+    # 송출 중 선택 창의 포커스 변화(획득/해제)를 감지해 Arduino에 DOWN/UP을 보낸다.
+    def _emit_focus_transition_to_arduino_if_needed(self) -> None:
+        if sys.platform != "win32":
+            return
+        if self._thread is None:
+            self._last_window_focus_state = None
+            return
+        if self._src_mode.get() != "window" or self._picked_hwnd is None:
+            self._last_window_focus_state = None
+            return
+        now_focused = _win32_foreground_hwnd() == int(self._picked_hwnd)
+        last = self._last_window_focus_state
+        self._last_window_focus_state = now_focused
+        if last is None or last == now_focused:
+            return
+        if not bool(self._arduino_focus_event_enabled_var.get()):
+            return
+        if not self._arduino_bridge.is_active():
+            return
+        vk = self._focus_event_vk()
+        if vk is None:
+            self._arduino_status_var.set(
+                "포커스 이벤트 키 설정 오류: 셀렉트박스에서 키 1개를 선택하세요."
+            )
+            return
+        ok = self._arduino_bridge.send_virtual_key(vk, down=now_focused)
+        if not ok:
+            self._arduino_status_var.set("포커스 이벤트 전송 실패: Arduino 연결 상태를 확인하세요.")
+
     def _arduino_set_idle_disconnected(self) -> None:
         """연결되지 않은 상태 메시지(요약만 덮어쓸 때)."""
         self._arduino_summary_var.set("Arduino: 연결 안 됨")
@@ -917,6 +983,25 @@ class MapleAlertApp(tk.Tk):
         ttk.Entry(prow, textvariable=self._arduino_baud_var, width=10).pack(
             side=tk.LEFT, padx=4
         )
+
+        focus_row = ttk.Frame(top)
+        focus_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Checkbutton(
+            focus_row,
+            text="선택 창 포커스 획득/해제 시 키 전송",
+            variable=self._arduino_focus_event_enabled_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(focus_row, text="전송 키").pack(side=tk.LEFT, padx=(12, 4))
+        focus_key_combo = ttk.Combobox(
+            focus_row,
+            textvariable=self._arduino_focus_key_var,
+            values=key_pick_choices(),
+            width=16,
+            state="readonly",
+        )
+        focus_key_combo.pack(side=tk.LEFT)
+        if str(self._arduino_focus_key_var.get()).strip() not in set(key_pick_choices()):
+            self._arduino_focus_key_var.set("F8")
 
         ttk.Label(
             top,
@@ -1294,6 +1379,7 @@ class MapleAlertApp(tk.Tk):
         else:
             fps_txt = f"{fps:.0f} FPS"
         self._sound_armed = True
+        self._last_window_focus_state = None
         if hwnd is not None:
             self._stream_status_text = f"송출 중 — 선택 창 (창 ID {hwnd}), {fps_txt}"
             self._status.config(text=self._stream_status_text)
@@ -1355,6 +1441,7 @@ class MapleAlertApp(tk.Tk):
             self._last_det_triggered = False
             self._last_det_reason = ""
         self._stream_status_text = ""
+        self._last_window_focus_state = None
         self._status.config(text="중지됨")
 
         def join_bg() -> None:
@@ -1594,6 +1681,7 @@ class MapleAlertApp(tk.Tk):
                     foreground="gray" if all_ok else "#a63",
                 )
         if self._thread is not None:
+            self._emit_focus_transition_to_arduino_if_needed()
             cap_err = self._thread.get_capture_error()
             with self._det_lock:
                 triggered = self._last_det_triggered
