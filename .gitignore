@@ -55,4 +55,5 @@ desktop.ini
 # 로컬 설정(저장 경로는 코드에 있음 — 팀 공유 시 제외 목록에서 빼도 됨)
 maplealert_settings.json
 .venv-build
+oddments_settings.json
 alert_settings.json

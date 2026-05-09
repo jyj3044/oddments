@@ -10,4 +10,4 @@ python3 -m pip install -r requirements-build.txt
 echo "[2/2] PyInstaller..."
 python3 -m PyInstaller --noconfirm build_exe.spec
 
-echo "완료: dist/cyj.app (또는 dist/cyj/) — dist 폴더를 확인하세요."
+echo "완료: dist/oddments.app (또는 dist/oddments/) — dist 폴더를 확인하세요."

@@ -15,7 +15,7 @@ pyinstaller --noconfirm build_exe.spec
 if errorlevel 1 goto :fail
 
 echo.
-echo Done: dist\cyj\cyj.exe  ^(whole dist\cyj folder — ONNX needs this layout^)
+echo Done: dist\oddments\oddments.exe  ^(whole dist\oddments folder — ONNX needs this layout^)
 echo - Single-file exe: set ONEFILE = True in build_exe.spec then rebuild ^(may break RapidOCR^).
 echo - Install Tesseract on the PC ^(PATH or default install path^).
 echo - EasyOCR is not in requirements-runtime. For EasyOCR: pip install easyocr, then uncomment easyocr in build_exe.spec.

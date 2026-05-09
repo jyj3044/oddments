@@ -1,8 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 # 프로젝트 루트에서: pyinstaller --noconfirm build_exe.spec
 #
-# ONEFILE=False (기본): dist/cyj/ 폴더 + cyj.exe — onnxruntime·OpenCV DLL 로드가 안정적.
-# ONEFILE=True: dist/cyj.exe 단일 파일 — _MEIPASS 압축 해제 경로에서 ONNX 초기화 실패가 잦음.
+# ONEFILE=False (기본): dist/oddments/ 폴더 + oddments.exe — onnxruntime·OpenCV DLL 로드가 안정적.
+# ONEFILE=True: dist/oddments.exe 단일 파일 — _MEIPASS 압축 해제 경로에서 ONNX 초기화 실패가 잦음.
 ONEFILE = False
 
 # ocr_backends.py 안에 `import easyocr` 가 있어 PyInstaller가 easyocr→torch 까지 끌어올 수 있음.
@@ -141,7 +141,7 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 _use_console = sys.platform == "darwin"
 
 _exe_kw = dict(
-    name="cyj",
+    name="oddments",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -183,5 +183,5 @@ else:
         strip=False,
         upx=False,
         upx_exclude=[],
-        name="cyj",
+        name="oddments",
     )

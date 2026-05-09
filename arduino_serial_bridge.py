@@ -35,6 +35,31 @@ _kb_debug_q: queue.SimpleQueue[str] = queue.SimpleQueue()
 _kb_debug_on = False
 _serial_rx_q: queue.SimpleQueue[str] = queue.SimpleQueue()
 
+_notice_lock = threading.Lock()
+_notice_buf: list[str] = []
+
+
+def log_arduino_notice(message: str) -> None:
+    """아두이노 설정 창 로그에 남길 상태·오류 한 줄 (메인 상태 표시에서도 호출)."""
+    line = f"[상태] {time.strftime('%H:%M:%S')} {message}\n"
+    with _notice_lock:
+        _notice_buf.append(line)
+        if len(_notice_buf) > 400:
+            del _notice_buf[:200]
+
+
+def take_arduino_notice_lines() -> list[str]:
+    """UI 폴링에서 한 번에 꺼내 표시한 뒤 버퍼를 비운다."""
+    with _notice_lock:
+        out = _notice_buf[:]
+        _notice_buf.clear()
+    return out
+
+
+def clear_arduino_notice_buffer() -> None:
+    with _notice_lock:
+        _notice_buf.clear()
+
 
 def set_key_bridge_debug_logging(enabled: bool) -> None:
     """Arduino 키 브리지 스레드에서 키 이벤트 진단 줄을 큐에 넣을지 여부."""
@@ -217,9 +242,17 @@ class ArduinoKeyBridge:
         self._baud = 115200
         self._running = False
         self._last_error: Optional[str] = None
+        # 연결 후 시리얼 읽기/쓰기 실패 등 (로그에 찍히는 오류와 신호등 동기화). stop()에서는 지우지 않음.
+        self._traffic_error: Optional[str] = None
 
     def last_error(self) -> Optional[str]:
         return self._last_error
+
+    def traffic_status_error(self) -> Optional[str]:
+        """신호등용: 연결 실패 메시지 또는 동작 중 시리얼 오류."""
+        if self._last_error:
+            return self._last_error
+        return self._traffic_error
 
     def apply_filter_vks(self, vks: set[int]) -> None:
         with self._lock:
@@ -228,6 +261,7 @@ class ArduinoKeyBridge:
     def start(self, port: str, baud: int, allowed_vks: set[int]) -> bool:
         self.stop()
         self._last_error = None
+        self._traffic_error = None
         if sys.platform != "win32":
             self._last_error = "Arduino 키 전송은 Windows에서만 지원됩니다."
             return False
@@ -268,6 +302,9 @@ class ArduinoKeyBridge:
                     raw = s.readline()
                 except Exception as e:
                     _serial_rx_q.put(f"[RX][ERR] {e}\n")
+                    with self._lock:
+                        if self._running:
+                            self._traffic_error = f"Serial 읽기 오류: {e}"
                     time.sleep(0.1)
                     continue
                 if not raw:
@@ -346,6 +383,8 @@ class ArduinoKeyBridge:
             _kb_debug_line(
                 f"{phase} key={kr} vk={vk} ({hexvk}) → 시리얼 쓰기 실패: {e}"
             )
+            with self._lock:
+                self._traffic_error = f"시리얼 쓰기 실패: {e}"
 
     # UI에서 포커스 변화 같은 내부 이벤트를 Arduino로 즉시 전달할 때 사용.
     def send_virtual_key(self, vk: int, down: bool) -> bool:
@@ -371,6 +410,8 @@ class ArduinoKeyBridge:
             return True
         except Exception as e:
             _kb_debug_line(f"{phase} vk={vk} ({hexvk}) → 시리얼 쓰기 실패: {e}")
+            with self._lock:
+                self._traffic_error = f"시리얼 쓰기 실패: {e}"
             return False
 
     def stop(self) -> None:
@@ -395,6 +436,10 @@ class ArduinoKeyBridge:
                 ser.close()
             except Exception:
                 pass
+        # 연결 해제 후에는 미연결(회색) 상태로 두기 위해 오류 플래그 제거
+        with self._lock:
+            self._last_error = None
+            self._traffic_error = None
 
     def is_active(self) -> bool:
         """시리얼·키 리스너가 동작 중이면 True."""

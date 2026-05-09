@@ -91,16 +91,10 @@ def _boxes_text_blob(
 ENGINE_TESSERACT = "tesseract"
 ENGINE_EASYOCR = "easyocr"
 ENGINE_RAPIDOCR = "rapidocr"
-DEFAULT_OCR_ENGINE = ENGINE_TESSERACT
-ALL_OCR_ENGINES: Tuple[str, ...] = (
-    ENGINE_TESSERACT,
-    ENGINE_EASYOCR,
-    ENGINE_RAPIDOCR,
-)
+DEFAULT_OCR_ENGINE = ENGINE_RAPIDOCR
+ALL_OCR_ENGINES: Tuple[str, ...] = (ENGINE_RAPIDOCR,)
 
 _OCR_ENGINE_ALIASES: Dict[str, str] = {
-    "tess": ENGINE_TESSERACT,
-    "easy": ENGINE_EASYOCR,
     "rapid": ENGINE_RAPIDOCR,
     "rapid_ocr": ENGINE_RAPIDOCR,
     "rapid-ocr": ENGINE_RAPIDOCR,
@@ -127,7 +121,7 @@ _RAPID_KO_KEYS_URLS: Tuple[str, ...] = (
 
 
 def _rapid_korean_cache_dir() -> Path:
-    p = Path.home() / ".cache" / "maplealert" / "rapidocr_korean"
+    p = Path.home() / ".cache" / "oddments" / "rapidocr_korean"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -179,7 +173,7 @@ def _download_to_file(
     tmp = dest.with_suffix(dest.suffix + ".part")
     ctx = _ssl_context_for_download()
     try:
-        req = Request(url, headers={"User-Agent": "MapleAlert/1.0 (RapidOCR Korean assets)"})
+        req = Request(url, headers={"User-Agent": "Oddments/1.0 (RapidOCR Korean assets)"})
         with urlopen(req, timeout=timeout_sec, context=ctx) as resp:
             data = resp.read()
         if len(data) < min_bytes:
@@ -261,6 +255,8 @@ def normalize_ocr_engine(name: str) -> str:
         return ""
     # 제거된 엔진(설정 JSON 호환): 무시
     if n in ("paddleocr", "paddle"):
+        return ""
+    if n in ("tesseract", "easyocr", "tess", "easy"):
         return ""
     if n in ALL_OCR_ENGINES:
         return n
@@ -674,17 +670,6 @@ def ocr_word_boxes(
     alert_keywords: Optional[Tuple[str, ...]] = None,
 ) -> List[Tuple[str, Tuple[int, int, int, int]]]:
     eng = normalize_ocr_engine(engine)
-    if eng == ENGINE_TESSERACT:
-        return ocr_word_boxes_tesseract(
-            rgb,
-            tesseract_psm,
-            preprocess_label=preprocess_label,
-            alert_keywords=alert_keywords,
-        )
-    if eng == ENGINE_EASYOCR:
-        return ocr_word_boxes_easyocr(
-            rgb, preprocess_label=preprocess_label, alert_keywords=alert_keywords
-        )
     if eng == ENGINE_RAPIDOCR:
         return ocr_word_boxes_rapidocr(
             rgb, preprocess_label=preprocess_label, alert_keywords=alert_keywords
@@ -701,11 +686,6 @@ def joined_text_from_rgb(
 ) -> str:
     """단일 RGB 이미지에서 한 줄로 이은 전체 문자열 (뉴럴 엔진용)."""
     eng = normalize_ocr_engine(engine)
-    if eng == ENGINE_EASYOCR:
-        boxes = ocr_word_boxes_easyocr(
-            rgb, preprocess_label=preprocess_label, alert_keywords=alert_keywords
-        )
-        return " ".join(t for t, _ in boxes)
     if eng == ENGINE_RAPIDOCR:
         boxes = ocr_word_boxes_rapidocr(
             rgb, preprocess_label=preprocess_label, alert_keywords=alert_keywords
@@ -717,27 +697,6 @@ def joined_text_from_rgb(
 def _ocr_engine_runtime_ok_core(eng: str) -> Tuple[bool, str]:
     if not eng:
         return False, "알 수 없는 OCR 엔진"
-    if eng == ENGINE_TESSERACT:
-        try:
-            import pytesseract
-            import pytesseract.pytesseract as pt
-
-            _log_tesseract_version_probe_once()
-            pt.get_tesseract_version()
-            return True, ""
-        except ImportError:
-            return False, "pytesseract 미설치. pip install pytesseract (+ Tesseract 본체)"
-        except Exception as e:
-            return False, str(e)
-    if eng == ENGINE_EASYOCR:
-        try:
-            import easyocr  # noqa: F401
-
-            return True, ""
-        except ImportError:
-            return False, "easyocr 미설치. pip install easyocr"
-        except Exception as e:
-            return False, str(e)
     if eng == ENGINE_RAPIDOCR:
         try:
             import rapidocr_onnxruntime  # noqa: F401

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Tuple
 
 # UI에서 전처리를 하나도 선택하지 않았을 때 (키워드 OCR 변형 호출 안 함)
-OCR_VARIANT_GROUPS_DISABLED: Tuple[str, ...] = ("__maplealert_ocr_variants_disabled__",)
+OCR_VARIANT_GROUPS_DISABLED: Tuple[str, ...] = ("__oddments_ocr_variants_disabled__",)
 
 
 @dataclass
@@ -27,7 +27,7 @@ class DetectionConfig:
     template_paths: Tuple[str, ...] = ()
     template_threshold: float = 0.80
     # 키워드 OCR에 쓸 엔진(순서대로 호출, 하나라도 키워드면 알림). 비어 있으면 키워드 OCR 안 함.
-    ocr_engines: Tuple[str, ...] = ("tesseract",)
+    ocr_engines: Tuple[str, ...] = ("rapidocr",)
     # 비어 있으면 전처리 변형 전부 사용. OCR_VARIANT_GROUPS_DISABLED 이면 변형 OCR 호출 안 함.
     ocr_variant_groups: Tuple[str, ...] = ()
 
