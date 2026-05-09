@@ -897,7 +897,7 @@ class MapleAlertApp(tk.Tk):
             return None
         return next(iter(vks))
 
-    # 송출 중 선택 창의 포커스 변화(획득/해제)를 감지해 Arduino에 DOWN/UP을 보낸다.
+    # 송출 중 선택 창의 포커스 변화(획득/해제)마다 Arduino에 DOWN→UP 한 번씩 보낸다.
     def _emit_focus_transition_to_arduino_if_needed(self) -> None:
         if sys.platform != "win32":
             return
@@ -922,8 +922,9 @@ class MapleAlertApp(tk.Tk):
                 "포커스 이벤트 키 설정 오류: 셀렉트박스에서 키 1개를 선택하세요."
             )
             return
-        ok = self._arduino_bridge.send_virtual_key(vk, down=now_focused)
-        if not ok:
+        ok_down = self._arduino_bridge.send_virtual_key(vk, down=True)
+        ok_up = self._arduino_bridge.send_virtual_key(vk, down=False)
+        if not (ok_down and ok_up):
             self._arduino_status_var.set("포커스 이벤트 전송 실패: Arduino 연결 상태를 확인하세요.")
 
     def _arduino_set_idle_disconnected(self) -> None:
