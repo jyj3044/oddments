@@ -3,12 +3,9 @@
 #
 # ONEFILE=False (기본): dist/oddments/ 폴더 + oddments.exe — onnxruntime·OpenCV DLL 로드가 안정적.
 # ONEFILE=True: dist/oddments.exe 단일 파일 — _MEIPASS 압축 해제 경로에서 ONNX 초기화 실패가 잦음.
+#
+# OCR 번들: RapidOCR·onnxruntime 만. pytesseract / easyocr / torch 는 excludes 로 넣지 않는다.
 ONEFILE = False
-
-# ocr_backends.py 안에 `import easyocr` 가 있어 PyInstaller가 easyocr→torch 까지 끌어올 수 있음.
-# torch DLL 과 onnxruntime OpenMP 가 겹치면 exe 에서만 "onnxruntime_pybind11_state 초기화 실패" 가 난다.
-# EasyOCR 을 exe 에 넣을 때만 True 로 두고, 아래 excludes 에서 torch 계열을 빼 준다.
-INCLUDE_EASYOCR = False
 
 import sys
 from pathlib import Path
@@ -59,7 +56,6 @@ _base_hidden = [
     "mss",
     "cv2",
     "numpy",
-    "pytesseract",
     "rapidocr_onnxruntime",
     "onnxruntime",
 ]
@@ -68,7 +64,6 @@ _platform_hidden: list[str] = []
 if sys.platform == "win32":
     _platform_hidden = [
         "windows_capture",
-        "tesseract_win_console",
         "arduino_serial_bridge",
         "serial",
         "serial.serialutil",
@@ -85,8 +80,6 @@ hiddenimports = list(
         _base_hidden + _platform_hidden + list(_rapid_hidden) + list(_onnx_hidden)
     )
 )
-# EasyOCR 을 exe 에 넣으려면: INCLUDE_EASYOCR = True, venv 에 easyocr 설치 후 아래 줄 주석 해제
-# hiddenimports.append("easyocr")
 
 # 앱에서 PaddleOCR 미사용 — 전역에 설치돼 있어도 번들에 넣지 않음
 _paddle_excludes = (
@@ -97,7 +90,9 @@ _paddle_excludes = (
     "paddlenlp",
 )
 
-_torch_easyocr_excludes = (
+_ocr_unused_excludes = (
+    "pytesseract",
+    "tesseract_win_console",
     "easyocr",
     "torch",
     "torchvision",
@@ -110,10 +105,7 @@ _torch_easyocr_excludes = (
     "jaxlib",
 )
 
-_all_excludes = list(_paddle_excludes)
-if not INCLUDE_EASYOCR:
-    _all_excludes.extend(_torch_easyocr_excludes)
-_all_excludes = list(dict.fromkeys(_all_excludes))
+_all_excludes = list(dict.fromkeys(list(_paddle_excludes) + list(_ocr_unused_excludes)))
 
 a = Analysis(
     [str(ROOT / "main.py")],

@@ -33,7 +33,7 @@ if errorlevel 1 goto :fail
 echo.
 echo 완료: dist\oddments\ 폴더 전체와 oddments.exe ^(onedir 배포^)
 echo - 단일 exe: build_exe.spec 에서 ONEFILE = True 후 이 스크립트로 다시 빌드 ^(RapidOCR 깨질 수 있음^)
-echo - Tesseract는 exe에 포함되지 않습니다. 사용 PC에 설치 또는 PATH 설정.
+echo - OCR 번들: RapidOCR만 ^(build_exe.spec excludes 참고^).
 echo.
 pause
 goto :eof

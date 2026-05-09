@@ -12,25 +12,15 @@ python -m pip install --upgrade pip
 
 ### 2) Python 패키지 설치
 
-**일반 개발·실행용** (EasyOCR 포함, 용량 큼):
+프로젝트 루트에서:
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-`requirements.txt`에 포함되는 주요 항목은 다음과 같습니다.
+`requirements.txt`에는 캡처·GUI·**RapidOCR(onnxruntime)**·웹 송출 등 실행에 필요한 패키지가 정리되어 있습니다.
 
-- `mss`, `numpy`, `opencv-python`, `Pillow`, `setproctitle`, `pytesseract`
-- `easyocr`, `rapidocr-onnxruntime` (OCR 엔진)
-
-### 3) Tesseract 본체 (Tesseract 엔진을 쓸 때만)
-
-`pytesseract`는 Python 래퍼이며, **Tesseract 실행 파일은 별도 설치**가 필요합니다.
-
-- 설치 가이드: [UB-Mannheim Tesseract for Windows](https://github.com/UB-Mannheim/tesseract/wiki)
-- 기본적으로 `C:\Program Files\Tesseract-OCR\tesseract.exe` 가 있으면 앱에서 자동으로 가리킵니다. 없으면 **PATH**에 `tesseract`가 잡혀 있어야 합니다.
-
-### 4) 실행
+### 3) 실행
 
 ```powershell
 python main.py
@@ -57,9 +47,9 @@ arch -arm64 python3 main.py
 
 ## 실행 파일(exe) 만들기
 
-### 권장: 가벼운 exe (EasyOCR·PyTorch 제외)
+### 권장: 전용 빌드 가상환경 (`.venv-build`)
 
-전역 Python에 `easyocr`가 있으면 PyInstaller가 **torch까지 끌어와 exe가 수백 MB**가 될 수 있으므로, **전용 venv `.venv-build`**에서 빌드하는 것을 권장합니다.
+전역 Python에 불필요한 패키지가 깔려 있으면 PyInstaller가 **의존성을 과하게 끌어와** exe가 비대해지거나 DLL 충돌이 날 수 있습니다. **`requirements-build.txt`** 만 설치한 **깨끗한 venv**에서 빌드하는 것을 권장합니다.
 
 **한 번에 실행 (권장)** — 프로젝트 루트에서 CMD 또는 탐색기에서 더블클릭:
 
@@ -101,14 +91,16 @@ pyinstaller --noconfirm build_exe.spec
 
 완료 후 산출물:
 
-- **`dist\cyj\` 폴더 전체** + 그 안의 `cyj.exe` (기본). 단일 exe가 아니라 **폴더째** 배포·실행합니다. RapidOCR/ONNX는 이 방식에서 훨씬 잘 동작합니다.
+- **`dist\oddments\` 폴더 전체** + 그 안의 `oddments.exe` (기본). 단일 exe가 아니라 **폴더째** 배포·실행합니다. RapidOCR/ONNX는 이 방식에서 훨씬 잘 동작합니다.
 - 예전처럼 **파일 하나만** 쓰려면 `build_exe.spec` 맨 위 `ONEFILE = True` 로 바꿔 빌드하세요 (같은 PC에서 `python main.py`는 되는데 exe만 깨질 때는 `False` 권장).
 
-### macOS에서 앱 번들(.app) 만들기
+**번들에 넣지 않는 것:** `build_exe.spec` 의 `excludes`에 **pytesseract / easyocr / torch** 등이 들어 있어, OCR은 **RapidOCR·onnxruntime** 만 exe에 포함되는 구성입니다. 빌드 후 `dist\oddments\_internal` 안에 **`torch` 폴더가 생겼다면** 빌드 환경에 torch 계열이 끌려온 것이므로 venv를 비우고 다시 빌드해 보세요.
 
-Windows의 `exe`와 같이 **PyInstaller**로 묶습니다. 산출물은 보통 **`dist/cyj/`** 폴더 안의 **`cyj`** 실행 파일(PyInstaller 버전에 따라 **`dist/cyj.app`** 인 경우도 있으니 `dist/` 를 확인하세요).
+### macOS에서 앱 번들 만들기
 
-mac 빌드는 **`console=True`** 로 두어, 터미널에서 `./dist/cyj/cyj` 를 실행할 때 **로그·오류가 터미널에 보이게** 합니다. Dock에만 아이콘이 있고 창이 늦게 뜨면 **첫 실행 시 ONNX/OpenCV 로딩에 수십 초** 걸릴 수 있습니다. 문제가 있으면 같은 폴더의 **`cyj_startup_log.txt`**, **`cyj_fatal_error.txt`**, **`pyi_rthook_onnx_error.txt`** 를 확인하세요.
+Windows의 `exe`와 같이 **PyInstaller**로 묶습니다. 산출물은 보통 **`dist/oddments/`** 폴더 안의 **`oddments`** 실행 파일(PyInstaller 버전에 따라 **`dist/oddments.app`** 인 경우도 있으니 `dist/` 를 확인하세요).
+
+mac 빌드는 **`console=True`** 로 두어, 터미널에서 `./dist/oddments/oddments` 를 실행할 때 **로그·오류가 터미널에 보이게** 합니다. Dock에만 아이콘이 있고 창이 늦게 뜨면 **첫 실행 시 ONNX/OpenCV 로딩에 수십 초** 걸릴 수 있습니다. 문제가 있으면 같은 폴더의 **`oddments_startup_log.txt`**, **`oddments_fatal_error.txt`**, **`pyi_rthook_onnx_error.txt`** 를 확인하세요.
 
 ```zsh
 python3 -m venv .venv-build
@@ -121,18 +113,14 @@ pip install -r requirements-build.txt
 
 - **Apple Silicon**: Rosetta 터미널이면 x86_64 휠이 깔릴 수 있으므로, 가능하면 **arm64 터미널**에서 `arch -arm64 python3 -m venv .venv-build` 등으로 맞춥니다.
 - **코드 서명 없음**: 다른 Mac에 복사했을 때 게이트키퍼가 막으면, **시스템 설정 → 개인 정보 보호 및 보안**에서 “확인 없이 열기”, 또는 **우클릭 → 열기**로 첫 실행을 허용합니다. 배포용이면 Apple Developer 로 **notarize** 하는 것이 정석입니다.
-- **Tesseract**: 번들에 포함되지 않습니다. `brew install tesseract` 등으로 본체를 두거나 PATH에 잡아 두어야 합니다.
 - **한글 RapidOCR 자원**: 최초 실행 시 `~/.cache/프로그램명/rapidocr_korean/` 로 내려받습니다(네트워크·SSL 참고는 위 macOS 절).
 
 ### exe 배포 시 참고
 
-- **Tesseract**: exe에 포함되지 않습니다. 사용 PC에 Tesseract 설치 또는 PATH 설정이 필요합니다.
-- **기본 OCR**: exe는 기본으로 **RapidOCR**을 쓰도록 되어 있으며, RapidOCR 관련 파일은 spec에서 번들됩니다.
-- **EasyOCR를 exe에 넣으려면**: `build_exe.spec` 에서 `INCLUDE_EASYOCR = True`, venv에 `pip install easyocr`, `hiddenimports.append("easyocr")` 주석 해제 후 빌드 (용량·빌드 시간 크게 증가, RapidOCR과 DLL 충돌 가능).
+- **OCR**: exe는 **RapidOCR** 관련 파일을 spec에서 번들합니다.
 - **RapidOCR / `onnxruntime_pybind11_state` DLL 초기화 실패 (`python main.py` 는 되는데 exe만 안 될 때)**:
-  - PyInstaller가 **`import easyocr` 를 따라가며 torch 전체를 번들**에 넣으면, torch·onnxruntime OpenMP DLL이 겹쳐 exe에서만 깨질 수 있습니다. 기본 spec은 **`INCLUDE_EASYOCR = False`** 로 **easyocr·torch를 제외**합니다. **최신 spec으로 다시 빌드**한 뒤 `dist\cyj\_internal` 안에 **`torch` 폴더가 없는지** 확인하세요.
-  - 그 외: `KMP_DUPLICATE_LIB_OK`, `_internal` 안 **DLL이 있는 모든 폴더**를 `add_dll_directory`에 등록(`bootstrap_onnx`), cv2 전 `onnxruntime` 선로드, `collect_all("onnxruntime")`, **onedir** 배포.
-  - 여전히 실패 시 `dist\cyj\` 옆에 생기는 **`pyi_rthook_onnx_error.txt`**(rthook 단계 예외) 내용을 확인하세요.
+  - `_internal` 안 **DLL이 있는 모든 폴더**를 `add_dll_directory`에 등록(`bootstrap_onnx`), cv2 전 `onnxruntime` 선로드, `collect_all("onnxruntime")`, **onedir** 배포.
+  - 여전히 실패 시 `dist\oddments\` 옆에 생기는 **`pyi_rthook_onnx_error.txt`**(rthook 단계 예외) 내용을 확인하세요.
   - **`onnxruntime` 버전**: **Python 3.12 이하(Windows exe 권장)** 에서는 `requirements-runtime.txt` 가 **1.20.1** 을 고정합니다(1.22+ 는 Windows 번들·VC 조합에서 초기화 실패 보고). **Python 3.13+**(맥·3.14 등)에서는 1.20.1 휠이 없어 **1.24.x** 를 쓰도록 분기해 두었습니다. 재현 가능한 Windows 빌드는 **3.12 venv** 권장입니다.
 
 ---
@@ -141,8 +129,8 @@ pip install -r requirements-build.txt
 
 | 파일 | 설명 |
 |------|------|
-| `requirements.txt` | 개발 실행용 전체 의존성 |
-| `requirements-runtime.txt` | exe 번들용 최소 의존성 (EasyOCR 제외) |
+| `requirements.txt` | 개발 실행용 의존성 |
+| `requirements-runtime.txt` | exe 번들용 최소 의존성 (RapidOCR·웹 송출 등) |
 | `requirements-build.txt` | exe 빌드 시 pip 설치 목록 |
 | `build_exe.spec` | PyInstaller 설정 |
 | `build_exe_with_venv.bat` | Windows: venv 생성·pip·PyInstaller까지 한 번에 |
