@@ -313,7 +313,8 @@ class MapleAlertApp(tk.Tk):
         self._arduino_baud_var = tk.StringVar(value="115200")
         self._arduino_keys_var = tk.StringVar(value="F1,F2,F3")
         self._arduino_focus_event_enabled_var = tk.BooleanVar(value=False)
-        self._arduino_focus_key_var = tk.StringVar(value="F8")
+        self._arduino_focus_gain_key_var = tk.StringVar(value="F8")
+        self._arduino_focus_loss_key_var = tk.StringVar(value="F8")
         self._arduino_status_var = tk.StringVar(value="")
         self._arduino_summary_var = tk.StringVar(value="")
         self._last_window_focus_state: bool | None = None
@@ -599,18 +600,15 @@ class MapleAlertApp(tk.Tk):
 
     def _effective_capture_fps(self) -> float:
         """
-        사용자 캡처 FPS 와 감지 주기를 맞춰 불필요하게 빠른 grab 을 줄인다.
-        min(사용자 FPS, max(10, 2 * (1000/감지주기ms))) — 미리보기는 최소 ~10fps 유지.
+        사용자가 지정한 캡처 FPS를 그대로 사용한다.
+        (감지 주기와 독립; 캡처 스레드는 입력 FPS 기준으로 동작)
         """
         try:
             u = float(self._fps_var.get())
         except ValueError:
             u = 20.0
         u = max(5.0, min(60.0, u))
-        d = max(150, int(self._detect_every_ms))
-        detect_hz_budget = 2.0 * (1000.0 / float(d))
-        cap = max(10.0, detect_hz_budget)
-        return min(u, cap)
+        return u
 
     def _on_src_mode_change(self) -> None:
         if not window_pick_supported():
@@ -764,8 +762,17 @@ class MapleAlertApp(tk.Tk):
                 self._arduino_focus_event_enabled_var.set(
                     bool(ad.get("focus_event_enabled"))
                 )
-            if ad.get("focus_event_key"):
-                self._arduino_focus_key_var.set(str(ad.get("focus_event_key")))
+            legacy_focus = ad.get("focus_event_key")
+            gain_k = ad.get("focus_event_key_gain")
+            loss_k = ad.get("focus_event_key_loss")
+            if gain_k:
+                self._arduino_focus_gain_key_var.set(str(gain_k))
+            elif legacy_focus:
+                self._arduino_focus_gain_key_var.set(str(legacy_focus))
+            if loss_k:
+                self._arduino_focus_loss_key_var.set(str(loss_k))
+            elif legacy_focus:
+                self._arduino_focus_loss_key_var.set(str(legacy_focus))
         if "window_geometry" in d:
             g = str(d["window_geometry"]).strip()
             if g:
@@ -827,7 +834,8 @@ class MapleAlertApp(tk.Tk):
             "baud": baud,
             "keys": str(self._arduino_keys_var.get()).strip(),
             "focus_event_enabled": bool(self._arduino_focus_event_enabled_var.get()),
-            "focus_event_key": str(self._arduino_focus_key_var.get()).strip(),
+            "focus_event_key_gain": str(self._arduino_focus_gain_key_var.get()).strip(),
+            "focus_event_key_loss": str(self._arduino_focus_loss_key_var.get()).strip(),
         }
 
     def _merge_arduino_into_settings_file_only(self) -> None:
@@ -887,9 +895,13 @@ class MapleAlertApp(tk.Tk):
             self._arduino_summary_var.set(f"Arduino: 오류 — {short}")
         return ok
 
-    # 포커스 이벤트용 키 토큰을 VK로 해석하고 유효성을 점검한다.
-    def _focus_event_vk(self) -> int | None:
-        token = str(self._arduino_focus_key_var.get()).strip()
+    # 포커스 획득(now_focused=True)·해제(False) 각각의 키 토큰을 VK로 해석한다.
+    def _focus_event_vk(self, now_focused: bool) -> int | None:
+        token = str(
+            self._arduino_focus_gain_key_var.get()
+            if now_focused
+            else self._arduino_focus_loss_key_var.get()
+        ).strip()
         if not token:
             return None
         vks, bad = parse_key_filter_spec(token)
@@ -916,10 +928,10 @@ class MapleAlertApp(tk.Tk):
             return
         if not self._arduino_bridge.is_active():
             return
-        vk = self._focus_event_vk()
+        vk = self._focus_event_vk(now_focused)
         if vk is None:
             self._arduino_status_var.set(
-                "포커스 이벤트 키 설정 오류: 셀렉트박스에서 키 1개를 선택하세요."
+                "포커스 이벤트 키 설정 오류: 획득/해제 각각 셀렉트박스에서 키 1개를 선택하세요."
             )
             return
         ok_down = self._arduino_bridge.send_virtual_key(vk, down=True)
@@ -940,11 +952,15 @@ class MapleAlertApp(tk.Tk):
 
         dlg = tk.Toplevel(self)
         dlg.title("Arduino 키 전송 설정")
-        dlg.geometry("580x640")
-        dlg.minsize(500, 520)
+        dlg.geometry("600x760")
+        dlg.minsize(520, 680)
         dlg.transient(self)
         dlg.grab_set()
         port_desc_var = tk.StringVar(value="")
+
+        # 하단 연결/닫기 줄을 먼저 붙여 두면 창 높이가 작아도 버튼이 잘리지 않는다.
+        bar = ttk.Frame(dlg, padding=(10, 8, 10, 10))
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         top = ttk.Frame(dlg, padding=10)
         top.pack(fill=tk.BOTH, expand=True)
@@ -985,24 +1001,40 @@ class MapleAlertApp(tk.Tk):
             side=tk.LEFT, padx=4
         )
 
-        focus_row = ttk.Frame(top)
-        focus_row.pack(fill=tk.X, pady=(8, 0))
+        focus_chk_fr = ttk.Frame(top)
+        focus_chk_fr.pack(fill=tk.X, pady=(8, 0))
         ttk.Checkbutton(
-            focus_row,
-            text="선택 창 포커스 획득/해제 시 키 전송",
+            focus_chk_fr,
+            text="선택 창 포커스 획득·해제 시 키 전송 (각각 다른 키 가능)",
             variable=self._arduino_focus_event_enabled_var,
         ).pack(side=tk.LEFT)
-        ttk.Label(focus_row, text="전송 키").pack(side=tk.LEFT, padx=(12, 4))
-        focus_key_combo = ttk.Combobox(
+
+        focus_row = ttk.Frame(top)
+        focus_row.pack(fill=tk.X, pady=(6, 0))
+        _choices = key_pick_choices()
+        _choice_set = set(_choices)
+        ttk.Label(focus_row, text="포커스 획득 시").pack(side=tk.LEFT)
+        gain_combo = ttk.Combobox(
             focus_row,
-            textvariable=self._arduino_focus_key_var,
-            values=key_pick_choices(),
-            width=16,
+            textvariable=self._arduino_focus_gain_key_var,
+            values=_choices,
+            width=14,
             state="readonly",
         )
-        focus_key_combo.pack(side=tk.LEFT)
-        if str(self._arduino_focus_key_var.get()).strip() not in set(key_pick_choices()):
-            self._arduino_focus_key_var.set("F8")
+        gain_combo.pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(focus_row, text="포커스 해제 시").pack(side=tk.LEFT)
+        loss_combo = ttk.Combobox(
+            focus_row,
+            textvariable=self._arduino_focus_loss_key_var,
+            values=_choices,
+            width=14,
+            state="readonly",
+        )
+        loss_combo.pack(side=tk.LEFT, padx=(6, 0))
+        if str(self._arduino_focus_gain_key_var.get()).strip() not in _choice_set:
+            self._arduino_focus_gain_key_var.set("F8")
+        if str(self._arduino_focus_loss_key_var.get()).strip() not in _choice_set:
+            self._arduino_focus_loss_key_var.set("F8")
 
         ttk.Label(
             top,
@@ -1199,9 +1231,6 @@ class MapleAlertApp(tk.Tk):
             or "Arduino 설정 창을 열었습니다."
         )
         log_status_line(open_msg)
-
-        bar = ttk.Frame(dlg, padding=(10, 0, 10, 10))
-        bar.pack(fill=tk.X, side=tk.BOTTOM)
 
         toggle_btn = ttk.Button(bar)
 

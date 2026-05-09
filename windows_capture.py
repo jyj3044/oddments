@@ -134,6 +134,23 @@ def _window_rect_for_capture(hwnd: int) -> tuple[int, int, int, int]:
     )
 
 
+def _window_rect_for_printwindow(hwnd: int) -> tuple[int, int, int, int]:
+    """
+    (left, top, width, height) — PrintWindow용 기준.
+    DWM 확장 프레임 대신 GetWindowRect를 사용해 GDI 윈도우 DC 좌표와 맞춘다.
+    """
+    h = HWND(hwnd)
+    wr = wintypes.RECT()
+    if not user32.GetWindowRect(h, ctypes.byref(wr)):
+        raise OSError("창 위치를 읽을 수 없습니다.")
+    return (
+        int(wr.left),
+        int(wr.top),
+        int(wr.right - wr.left),
+        int(wr.bottom - wr.top),
+    )
+
+
 def _client_rect_screen(hwnd: int) -> tuple[int, int, int, int] | None:
     """클라이언트 영역을 화면 좌표로. (left, top, w, h)"""
     h = HWND(hwnd)
@@ -280,7 +297,8 @@ class WindowCapture:
     실제로 보이는 그리기 영역에 가깝도록 **클라이언트 영역(화면 좌표)** 을
     전체 창(DWM 테두리)보다 먼저 시도합니다. (게임·브라우저에서 바깥 프레임·
     안 보이는 영역이 섞이는 현상 완화)
-    순서: 클라 BitBlt → 클라 mss → 전체 창 BitBlt → 전체 mss → PrintWindow(전체)
+    순서: PrintWindow(전체→클라 crop) → 클라 BitBlt → 클라 mss → 전체 창 BitBlt → 전체 mss
+    (겹침 창이 함께 캡처되는 현상을 줄이기 위해 PrintWindow 경로를 우선 시도)
     """
 
     def __init__(self, hwnd: int):
@@ -299,6 +317,15 @@ class WindowCapture:
         if w <= 0 or h <= 0:
             raise OSError("창 크기가 0입니다 (최소화됨?).")
         win_area = max(1, w * h)
+
+        # 창 위에 다른 창이 겹쳐도 대상 창 자체를 우선 얻기 위해 PrintWindow 먼저 시도.
+        # 일부 앱(D3D/보안/관리자 권한 차이)은 PrintWindow를 거부할 수 있어 실패 시 화면 복사 경로로 폴백.
+        pw_left, pw_top, pw_w, pw_h = _window_rect_for_printwindow(self.hwnd)
+        alt = _grab_bgr_printwindow(self.hwnd, pw_w, pw_h)
+        if alt is not None:
+            alt = _crop_image_to_client_area(alt, self.hwnd, pw_left, pw_top)
+            if not _frame_looks_black(alt):
+                return alt
 
         def grab_mss_region(l: int, t: int, ww: int, hh: int) -> np.ndarray:
             reg = {"left": l, "top": t, "width": ww, "height": hh}
@@ -348,12 +375,6 @@ class WindowCapture:
                 got = try_rect(cl, ct, cw, ch)
                 if got is not None:
                     return got
-
-        alt = _grab_bgr_printwindow(self.hwnd, w, h)
-        if alt is not None:
-            alt = _crop_image_to_client_area(alt, self.hwnd, left, top)
-            if not _frame_looks_black(alt):
-                return alt
 
         for c in reversed(candidates):
             if c.size:
