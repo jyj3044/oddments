@@ -11,6 +11,9 @@ import threading
 import time
 from typing import Callable, Optional, Union
 
+# (송출 스레드) 동적으로 바뀌는 HWND — 롤: League of Legends.exe 우선 → UX → 선택 창
+DynamicHwndResolver = Callable[[], int]
+
 import mss
 import numpy as np
 
@@ -71,10 +74,12 @@ class CaptureThread(threading.Thread):
         target_fps: float = 30.0,
         on_frame: Optional[Callable[[np.ndarray], None]] = None,
         window_hwnd: Optional[int] = None,
+        dynamic_hwnd_resolver: Optional[DynamicHwndResolver] = None,
     ):
         super().__init__(daemon=True)
         self._monitor_index = monitor_index
         self._window_hwnd = window_hwnd
+        self._dynamic_hwnd_resolver = dynamic_hwnd_resolver
         self._interval = 1.0 / max(target_fps, 1.0)
         self._on_frame = on_frame
         self._running = threading.Event()
@@ -104,15 +109,50 @@ class CaptureThread(threading.Thread):
 
     def run(self) -> None:
         self._running.set()
-        cap = _make_capture(
-            monitor_index=self._monitor_index, window_hwnd=self._window_hwnd
-        )
+        cap: Optional[Union[ScreenCapture, object]] = None
+        current_hwnd: Optional[int] = None
+        next_resolve_t = 0.0
+        resolve_every_s = 0.15
         try:
             while self._running.is_set():
                 t0 = time.perf_counter()
                 sleep_for = self._interval
                 try:
-                    frame = cap.grab_bgr()
+                    if self._window_hwnd is None:
+                        if cap is None:
+                            cap = _make_capture(
+                                monitor_index=self._monitor_index,
+                                window_hwnd=None,
+                            )
+                        frame = cap.grab_bgr()
+                    else:
+                        if self._dynamic_hwnd_resolver is not None:
+                            if t0 >= next_resolve_t:
+                                try:
+                                    target_hwnd = int(self._dynamic_hwnd_resolver())
+                                except Exception:
+                                    target_hwnd = int(self._window_hwnd)
+                                next_resolve_t = t0 + resolve_every_s
+                            else:
+                                target_hwnd = (
+                                    current_hwnd
+                                    if current_hwnd is not None
+                                    else int(self._window_hwnd)
+                                )
+                        else:
+                            target_hwnd = int(self._window_hwnd)
+
+                        if cap is None or current_hwnd != target_hwnd:
+                            if cap is not None:
+                                cap.close()
+                            cap = _make_capture(
+                                monitor_index=self._monitor_index,
+                                window_hwnd=target_hwnd,
+                            )
+                            current_hwnd = target_hwnd
+
+                        frame = cap.grab_bgr()
+
                     with self._lock:
                         self._latest = frame
                         self._frame_seq += 1
@@ -129,7 +169,8 @@ class CaptureThread(threading.Thread):
                 if wait > 0:
                     time.sleep(wait)
         finally:
-            cap.close()
+            if cap is not None:
+                cap.close()
 
 
 if __name__ == "__main__":

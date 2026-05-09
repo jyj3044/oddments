@@ -51,6 +51,27 @@ def ensure_windows_dpi_awareness() -> None:
             pass
 
 
+# 롤 창 전환: 이 두 실행 파일만 대상으로 한다 (다른 프로세스와 무관).
+_LEAGUE_CAPTURE_PAIR_EXES = frozenset({"league of legends.exe", "leagueclientux.exe"})
+
+
+def hwnd_exe_basename_lower(hwnd: int) -> str:
+    """HWND 가 속한 프로세스 실행 파일명(소문자 basename). 무효하면 빈 문자열."""
+    if not user32.IsWindow(HWND(hwnd)):
+        return ""
+    pid = DWORD(0)
+    user32.GetWindowThreadProcessId(HWND(hwnd), ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    return _exe_basename_from_pid(pid.value).lower()
+
+
+def is_league_capture_pair_hwnd(hwnd: int) -> bool:
+    """League of Legends.exe 또는 LeagueClientUx.exe 창인지 여부."""
+    b = hwnd_exe_basename_lower(hwnd)
+    return b in _LEAGUE_CAPTURE_PAIR_EXES
+
+
 def _exe_basename_from_pid(pid: int) -> str:
     h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, DWORD(pid))
     if not h:
@@ -100,6 +121,69 @@ def enumerate_windows(min_width: int = 80, min_height: int = 80) -> List[WindowE
     user32.EnumWindows(callback, LPARAM(0))
     out.sort(key=lambda e: (e.process_name.lower(), e.title.lower()))
     return out
+
+
+def best_visible_hwnd_for_exe(
+    exe_basename: str,
+    *,
+    min_width: int = 64,
+    min_height: int = 48,
+) -> Optional[int]:
+    """
+    동일 실행 파일명을 가진 최상위 보이는 창 중 **면적이 가장 큰** HWND.
+    리그 클라이언트 등 부착 창이 여러 개일 때 본 화면에 가까운 창을 고르는 용도.
+    """
+    target = (exe_basename or "").strip().lower()
+    if not target:
+        return None
+    best_hwnd: Optional[int] = None
+    best_area = -1
+
+    @ctypes.WINFUNCTYPE(BOOL, HWND, LPARAM)
+    def callback(hwnd, _lparam):
+        nonlocal best_hwnd, best_area
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if w < min_width or h < min_height:
+            return True
+        pid = DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe = _exe_basename_from_pid(pid.value).lower()
+        if exe != target:
+            return True
+        area = w * h
+        if area > best_area:
+            best_area = area
+            best_hwnd = int(hwnd)
+        return True
+
+    user32.EnumWindows(callback, LPARAM(0))
+    return best_hwnd
+
+
+def resolve_league_capture_hwnd(base_hwnd: int) -> int:
+    """
+    League of Legends 전용: 다른 프로세스는 보지 않는다.
+
+    보이는 창만 고려해 League of Legends.exe 와 LeagueClientUx.exe 사이에서만 전환한다.
+    우선순위: League of Legends.exe (있으면) -> LeagueClientUx.exe -> 둘 다 없으면 base_hwnd
+    (호출부에서 base 는 위 둘 중 하나에서 고른 HWND 여야 한다).
+
+    전환 방향: 인게임·클라 League of Legends.exe 창이 뜨면 그쪽으로,
+    없어지고 UX 만 남으면 LeagueClientUx.exe 로.
+    """
+    lol = best_visible_hwnd_for_exe("League of Legends.exe")
+    if lol is not None:
+        return int(lol)
+    ux = best_visible_hwnd_for_exe("LeagueClientUx.exe")
+    if ux is not None:
+        return int(ux)
+    return int(base_hwnd)
 
 
 class _RECT_L(ctypes.Structure):

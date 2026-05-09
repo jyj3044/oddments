@@ -1390,7 +1390,18 @@ class OddmentsApp(tk.Tk):
         if self._src_mode.get() != "window" or self._picked_hwnd is None:
             self._last_window_focus_state = None
             return
-        now_focused = _win32_foreground_hwnd() == int(self._picked_hwnd)
+        eff = int(self._picked_hwnd)
+        try:
+            from windows_capture import (
+                is_league_capture_pair_hwnd,
+                resolve_league_capture_hwnd,
+            )
+
+            if is_league_capture_pair_hwnd(eff):
+                eff = int(resolve_league_capture_hwnd(eff))
+        except Exception:
+            pass
+        now_focused = _win32_foreground_hwnd() == eff
         last = self._last_window_focus_state
         self._last_window_focus_state = now_focused
         if last is None or last == now_focused:
@@ -1944,10 +1955,28 @@ class OddmentsApp(tk.Tk):
             except ValueError:
                 messagebox.showerror("오류", "모니터 번호를 숫자로 입력하세요.")
                 return
+        # 롤: 선택 창이 League of Legends.exe / LeagueClientUx.exe 일 때만 위 둘 사이 전환.
+        dyn_resolver = None
+        if sys.platform == "win32" and hwnd is not None:
+            try:
+                from windows_capture import (
+                    is_league_capture_pair_hwnd,
+                    resolve_league_capture_hwnd,
+                )
+
+                if is_league_capture_pair_hwnd(int(hwnd)):
+                    _base = int(hwnd)
+
+                    def dyn_resolver() -> int:
+                        return int(resolve_league_capture_hwnd(_base))
+            except Exception:
+                dyn_resolver = None
+
         self._thread = CaptureThread(
             monitor_index=mon,
             target_fps=fps,
             window_hwnd=hwnd,
+            dynamic_hwnd_resolver=dyn_resolver,
             on_frame=(
                 (lambda frm: web_streamer.push_video_frame(frm))
                 if web_streamer is not None
