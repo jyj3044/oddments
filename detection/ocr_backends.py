@@ -83,6 +83,32 @@ def _keyword_alert_hit(
     return any(k in b for k in kws)
 
 
+def _keyword_alert_matches(
+    text_blob: str, alert_keywords: Optional[Tuple[str, ...]]
+) -> Optional[List[str]]:
+    """``alert_keywords`` 중 ``text_blob`` 에 포함된 토큰만 *원본 표기* 그대로
+    중복 없이 순서를 유지해 반환한다.
+
+    - ``alert_keywords`` 가 비어/``None`` 이면 ``None`` (알림 검사 비활성화).
+    - 등록은 되어 있으나 하나도 매칭되지 않으면 빈 리스트.
+    - 매칭이 있으면 매칭된 키워드 리스트(예: ``["가나", "마바"]``).
+    """
+    if not alert_keywords:
+        return None
+    cleaned = [(k or "").strip() for k in alert_keywords]
+    cleaned = [k for k in cleaned if k]
+    if not cleaned:
+        return None
+    blob = (text_blob or "").lower()
+    matched: List[str] = []
+    seen: set[str] = set()
+    for k in cleaned:
+        if k.lower() in blob and k not in seen:
+            seen.add(k)
+            matched.append(k)
+    return matched
+
+
 def _boxes_text_blob(
     boxes: List[Tuple[str, Tuple[int, int, int, int]]],
 ) -> str:
@@ -448,7 +474,7 @@ def tesseract_image_to_data(
                     "tesseract",
                     time.perf_counter() - t0,
                     d,
-                    keyword_alert_hit=_keyword_alert_hit(
+                    matched_keywords=_keyword_alert_matches(
                         _tesseract_dict_text_blob(out), alert_keywords
                     ),
                 )
@@ -473,7 +499,7 @@ def tesseract_image_to_data(
             "tesseract",
             time.perf_counter() - t0,
             d2,
-            keyword_alert_hit=_keyword_alert_hit(
+            matched_keywords=_keyword_alert_matches(
                 _tesseract_dict_text_blob(out_fb), alert_keywords
             ),
         )
@@ -518,7 +544,7 @@ def tesseract_call_image_to_string(
             "tesseract",
             time.perf_counter() - t0,
             d,
-            keyword_alert_hit=_keyword_alert_hit(out, alert_keywords),
+            matched_keywords=_keyword_alert_matches(out, alert_keywords),
         )
     return out
 
@@ -597,7 +623,7 @@ def ocr_word_boxes_easyocr(
             "easyocr",
             time.perf_counter() - t0,
             detail,
-            keyword_alert_hit=_keyword_alert_hit(
+            matched_keywords=_keyword_alert_matches(
                 _boxes_text_blob(out), alert_keywords
             ),
         )
@@ -654,7 +680,7 @@ def ocr_word_boxes_rapidocr(
             "rapidocr",
             time.perf_counter() - t0,
             detail,
-            keyword_alert_hit=_keyword_alert_hit(
+            matched_keywords=_keyword_alert_matches(
                 _boxes_text_blob(out), alert_keywords
             ),
         )

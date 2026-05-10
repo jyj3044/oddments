@@ -292,6 +292,11 @@ class ArduinoKeyBridge:
             self._reader_stop.clear()
 
         def reader_loop() -> None:
+            # readline() 은 USB 패킷 분할 시 한 논리 줄이 여러 번 나뉘어 로그가 중복·잘리는
+            # 경우가 있어, 바이트를 모았다가 '\n' 단위로만 한 줄씩 큐에 넣는다.
+            line_acc = bytearray()
+            max_acc = 16384
+
             while not self._reader_stop.is_set():
                 with self._lock:
                     s = self._ser
@@ -299,7 +304,7 @@ class ArduinoKeyBridge:
                 if not running or s is None:
                     return
                 try:
-                    raw = s.readline()
+                    chunk = s.read(4096)
                 except Exception as e:
                     _serial_rx_q.put(f"[RX][ERR] {e}\n")
                     with self._lock:
@@ -307,15 +312,29 @@ class ArduinoKeyBridge:
                             self._traffic_error = f"Serial 읽기 오류: {e}"
                     time.sleep(0.1)
                     continue
-                if not raw:
+                if not chunk:
                     continue
-                try:
-                    txt = raw.decode("utf-8", errors="replace").strip()
-                except Exception:
-                    txt = repr(raw)
-                if txt:
-                    ts = time.strftime("%H:%M:%S")
-                    _serial_rx_q.put(f"[RX] {ts} {txt}\n")
+                if len(line_acc) + len(chunk) > max_acc:
+                    line_acc.clear()
+                    _serial_rx_q.put(
+                        "[RX][ERR] 시리얼 수신 줄이 너무 길어 버퍼를 비웠습니다.\n"
+                    )
+                    continue
+                line_acc.extend(chunk)
+                while True:
+                    nl = line_acc.find(b"\n")
+                    if nl < 0:
+                        break
+                    raw_line = line_acc[: nl + 1]
+                    del line_acc[: nl + 1]
+                    try:
+                        txt = raw_line.decode("utf-8", errors="replace").strip()
+                    except Exception:
+                        txt = repr(bytes(raw_line))
+                    txt = txt.strip("\r")
+                    if txt:
+                        ts = time.strftime("%H:%M:%S")
+                        _serial_rx_q.put(f"[RX] {ts} {txt}\n")
 
         self._reader_thread = threading.Thread(
             target=reader_loop, daemon=True, name="Arduino-Serial-RX"
@@ -379,9 +398,18 @@ class ArduinoKeyBridge:
             _kb_debug_line(
                 f"{phase} key={kr} vk={vk} ({hexvk}) → 시리얼 전송 {line.decode('ascii', errors='replace').strip()}"
             )
+            # 사용자 가시 로그: '전송할 키' 필터를 통과해 실제로 시리얼로 나간 이벤트만
+            # Arduino 로그 패널에 한 줄 남긴다. 필터 거부/포트 닫힘/브리지 정지 같은
+            # 케이스는 진단 잡음이라 debug 채널에만 둔다.
+            log_arduino_notice(
+                f"[KEY] {phase} key={kr} vk={vk} ({hexvk}) → 전송"
+            )
         except Exception as e:
             _kb_debug_line(
                 f"{phase} key={kr} vk={vk} ({hexvk}) → 시리얼 쓰기 실패: {e}"
+            )
+            log_arduino_notice(
+                f"[KEY] {phase} key={kr} vk={vk} ({hexvk}) → 전송 실패: {e}"
             )
             with self._lock:
                 self._traffic_error = f"시리얼 쓰기 실패: {e}"

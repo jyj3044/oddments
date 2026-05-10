@@ -31,9 +31,12 @@ def run_detection_with_overlays(
     )
     if stop_event is not None and stop_event.is_set():
         return False, "", []
-    tpl_ovs = tpl.match_all_templates(
-        frame_bgr, cfg.template_paths, cfg.template_threshold
-    )
+    # OCR 미사용(settings 에서 ocr_engines 비움) 시 키워드 OCR·템플릿 매칭 모두 생략
+    tpl_ovs: List[OverlayRect] = []
+    if cfg.ocr_engines:
+        tpl_ovs = tpl.match_all_templates(
+            frame_bgr, cfg.template_paths, cfg.template_threshold
+        )
     overlays = kw_ovs + tpl_ovs
     get_overlay_store().touch(overlays)
 

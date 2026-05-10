@@ -77,7 +77,6 @@ from detection import (
     run_detection_with_overlays,
 )
 from detection.ocr_backends import ENGINE_RAPIDOCR
-from preview_render import frame_with_overlays
 
 from detection.ocr_diag import log_ocr_activity
 from web_log import log_web_event
@@ -438,7 +437,6 @@ class OddmentsApp(tk.Tk):
         self._tpl_var = tk.StringVar(value="")
         self._th_var = tk.StringVar(value="0.80")
         self._cd_var = tk.StringVar(value="3")
-        self._show_overlay_var = tk.BooleanVar(value=True)
         self._keyword_ocr_var = tk.BooleanVar(value=True)
         self._ocr_variant_group_vars = {
             vid: tk.BooleanVar(value=True) for vid, _ in OCR_VARIANT_UI_CHOICES
@@ -529,14 +527,6 @@ class OddmentsApp(tk.Tk):
         ttk.Spinbox(r4, from_=1, to=60, width=4, textvariable=self._cd_var).pack(
             side=tk.LEFT, padx=8
         )
-
-        r5 = ttk.Frame(bot)
-        r5.pack(fill=tk.X, pady=4)
-        ttk.Checkbutton(
-            r5,
-            text="감지 영역 박스 표시 (영역마다 다른 색 테두리)",
-            variable=self._show_overlay_var,
-        ).pack(side=tk.LEFT)
 
         self._apply_keyword_ocr_tpl_ui_state()
 
@@ -877,7 +867,6 @@ class OddmentsApp(tk.Tk):
             self._tpl_var,
             self._th_var,
             self._cd_var,
-            self._show_overlay_var,
         ):
             var.trace_add("write", _mark)
 
@@ -1143,8 +1132,6 @@ class OddmentsApp(tk.Tk):
             self._keyword_ocr_var.set(bool(n) or legacy)
         if "cooldown_sec" in d:
             self._cd_var.set(str(d["cooldown_sec"]))
-        if "show_overlay" in d:
-            self._show_overlay_var.set(bool(d["show_overlay"]))
         if "ocr_variant_groups" in d:
             v = d["ocr_variant_groups"]
             if not isinstance(v, list):
@@ -1263,7 +1250,6 @@ class OddmentsApp(tk.Tk):
             "template_threshold": _f(self._th_var, 0.80),
             "ocr_engines": list(self._ocr_engines_for_cfg()),
             "cooldown_sec": _f(self._cd_var, 3.0),
-            "show_overlay": self._show_overlay_var.get(),
             "ocr_variant_groups": list(og),
             "capture_fps": cap_fps,
             "capture_source_mode": self._src_mode.get(),
@@ -2549,11 +2535,7 @@ class OddmentsApp(tk.Tk):
             self._preview_last_frame_seq = seq
             frame = self._thread.get_frame()
             if frame is not None:
-                if self._show_overlay_var.get():
-                    ovl = get_overlay_store().snapshot()
-                    vis = frame_with_overlays(frame, ovl) if ovl else frame
-                else:
-                    vis = frame
+                vis = frame
                 h, w = vis.shape[:2]
                 cw_meas = self._canvas.winfo_width()
                 ch_meas = self._canvas.winfo_height()

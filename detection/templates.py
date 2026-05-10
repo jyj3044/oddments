@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import List, Optional, Tuple
 
 import cv2
@@ -100,7 +101,10 @@ def match_all_templates(
     template_paths: Tuple[str, ...],
     threshold: float,
 ) -> List[OverlayRect]:
-    from .ocr_diag import log_ocr_activity
+    from .ocr_diag import begin_ocr_call, end_ocr_call
+
+    fh, fw = frame_bgr.shape[:2]
+    shape_prefix = f"{fw}x{fh}"
 
     out: List[OverlayRect] = []
     seen_rect: set[Tuple[int, int, int, int]] = set()
@@ -109,26 +113,36 @@ def match_all_templates(
         if not p:
             continue
         base = os.path.basename(p)
+        detail_call = f"{shape_prefix} {base}"
+        cid = begin_ocr_call("match", "template", detail_call)
+        t0 = time.perf_counter()
         hit, max_seen = match_one_template(frame_bgr, p, threshold)
+        elapsed = time.perf_counter() - t0
         if hit is None:
             if max_seen < 0.0:
-                log_ocr_activity(
-                    "매칭",
-                    "템플릿",
-                    f"{base} 로드 실패",
-                )
+                end_detail = f"{shape_prefix} {base} 로드 실패"
             else:
-                log_ocr_activity(
-                    "매칭",
-                    "템플릿",
-                    f"{base} 미일치 max={max_seen:.3f} 임계={threshold:.2f}",
+                end_detail = (
+                    f"{shape_prefix} {base} 미일치 max={max_seen:.3f} "
+                    f"임계={threshold:.2f}"
                 )
+            end_ocr_call(
+                cid,
+                "match",
+                "template",
+                elapsed,
+                end_detail,
+                count_completed=False,
+            )
             continue
         ov, sc = hit
-        log_ocr_activity(
-            "매칭",
-            "템플릿",
-            f"{base} 일치 score={sc:.3f}",
+        end_ocr_call(
+            cid,
+            "match",
+            "template",
+            elapsed,
+            f"{shape_prefix} {base} 일치 score={sc:.3f}",
+            count_completed=False,
         )
         key = (ov.x, ov.y, ov.w, ov.h)
         if key in seen_rect:

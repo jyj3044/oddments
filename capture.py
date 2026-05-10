@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from typing import Callable, Optional, Union
@@ -18,6 +19,238 @@ import mss
 import numpy as np
 
 from app_platform.host import make_window_capture, window_pick_supported
+
+
+def _parse_edid_monitor_name(edid: bytes) -> Optional[str]:
+    """EDID 128바이트에서 0xFC (Monitor Name) 디스크립터를 ASCII 로 디코드.
+
+    EDID 1.x 의 4개 디스크립터(오프셋 54/72/90/108, 각 18바이트) 를 순회한다.
+    Monitor 디스크립터는 첫 3바이트가 0x00 0x00 0x00 이고 4번째 바이트가 타입,
+    type=0xFC 이면 5–17 바이트가 ASCII 모델명이다(0x0A 종료, 0x20 패딩).
+    """
+    if not edid or len(edid) < 128:
+        return None
+    for off in (54, 72, 90, 108):
+        block = edid[off : off + 18]
+        if len(block) < 18:
+            continue
+        if block[0] == 0 and block[1] == 0 and block[2] == 0 and block[3] == 0xFC:
+            try:
+                text = bytes(block[5:18]).decode("ascii", errors="ignore")
+            except Exception:  # noqa: BLE001
+                continue
+            if "\n" in text:
+                text = text.split("\n", 1)[0]
+            text = text.strip()
+            if text:
+                return text
+    return None
+
+
+def _read_edid_name_from_registry(device_id: str) -> Optional[str]:
+    """``EnumDisplayDevicesW`` 가 돌려준 DeviceID 에서 EDID 모니터 이름 파싱.
+
+    DeviceID 형식 예: ``MONITOR\\MSI4D02\\{4d36e96e-...}\\0001``.
+    여기서 ``MSI4D02`` 가 hardware id 라 레지스트리 경로
+    ``HKLM\\SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\MSI4D02\\<instance>``
+    아래의 ``Device Parameters\\EDID`` 바이너리를 읽어 파싱한다.
+    """
+    if sys.platform != "win32":
+        return None
+    if not device_id:
+        return None
+    parts = device_id.split("\\")
+    if len(parts) < 2 or parts[0].upper() != "MONITOR":
+        return None
+    hwid = parts[1]
+    try:
+        import winreg
+    except Exception:  # noqa: BLE001
+        return None
+
+    base = f"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\{hwid}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as base_key:
+            i = 0
+            while True:
+                try:
+                    instance = winreg.EnumKey(base_key, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    sub = f"{base}\\{instance}\\Device Parameters"
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub) as k:
+                        try:
+                            edid, _ = winreg.QueryValueEx(k, "EDID")
+                        except FileNotFoundError:
+                            continue
+                        name = _parse_edid_monitor_name(bytes(edid or b""))
+                        if name:
+                            return name
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    return None
+
+
+def _win32_monitor_friendly_names() -> list[dict]:
+    """Win32 EnumDisplayMonitors + EnumDisplayDevices + EDID 로 모니터 이름 수집.
+
+    이름 우선순위:
+
+    1. ``EDID`` 의 0xFC Monitor Name (예: "MSI MAG274QRF", "DELL U2415")
+       — 모니터가 자기 자신을 보고하는 가장 정확한 이름.
+    2. ``EnumDisplayDevicesW`` 의 ``DeviceString`` (예: "LG ULTRAGEAR")
+       — 드라이버 INF 가 보고하는 이름. 전용 드라이버 없는 경우
+       대부분 "Generic PnP Monitor" 가 나오기 때문에 폴백으로만 사용.
+    3. 둘 다 못 얻으면 ``None``.
+
+    Returns:
+        ``[{"left", "top", "right", "bottom", "name"}, ...]``
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001
+        return []
+
+    user32 = ctypes.windll.user32
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    class MONITORINFOEXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", wintypes.DWORD),
+            ("szDevice", wintypes.WCHAR * 32),
+        ]
+
+    class DISPLAY_DEVICEW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("DeviceName", wintypes.WCHAR * 32),
+            ("DeviceString", wintypes.WCHAR * 128),
+            ("StateFlags", wintypes.DWORD),
+            ("DeviceID", wintypes.WCHAR * 128),
+            ("DeviceKey", wintypes.WCHAR * 128),
+        ]
+
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(RECT),
+        wintypes.LPARAM,
+    )
+
+    out: list[dict] = []
+
+    def _callback(hmon, _hdc, _lprect, _lparam):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            return 1
+        adapter = info.szDevice
+        dd = DISPLAY_DEVICEW()
+        dd.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+        name: Optional[str] = None
+        idx = 0
+        while user32.EnumDisplayDevicesW(adapter, idx, ctypes.byref(dd), 0):
+            device_id = (dd.DeviceID or "")
+            edid_name = _read_edid_name_from_registry(device_id)
+            if edid_name:
+                name = edid_name
+                break
+            cand = (dd.DeviceString or "").strip()
+            if cand and not name:
+                # 드라이버 보고 이름은 일단 보관해 두고 다음 모니터 디바이스에 EDID 가
+                # 있는지 마저 시도. 전부 EDID 가 비어 있으면 이걸 폴백으로 사용.
+                name = cand
+            idx += 1
+        out.append(
+            {
+                "left": int(info.rcMonitor.left),
+                "top": int(info.rcMonitor.top),
+                "right": int(info.rcMonitor.right),
+                "bottom": int(info.rcMonitor.bottom),
+                "name": name,
+            }
+        )
+        return 1
+
+    try:
+        if not user32.EnumDisplayMonitors(
+            None, None, MonitorEnumProc(_callback), 0
+        ):
+            return []
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def enumerate_monitors() -> list[dict]:
+    """현재 시스템에 연결된 물리 모니터 목록.
+
+    Returns:
+        ``[{"index": 1, "left": 0, "top": 0, "width": 1920, "height": 1080,
+            "name": "LG ULTRAGEAR" | None}, ...]``
+        ``mss`` 규칙상 ``monitors[0]`` 은 모든 모니터를 합친 *가상 화면* 이므로
+        실제 물리 모니터인 1번부터만 노출한다. ``name`` 은 Windows 에서만
+        EDID 기반으로 채워지며(가능한 경우), 그 외 OS 나 조회 실패 시 ``None``.
+        호출 실패 시 빈 리스트.
+    """
+    out: list[dict] = []
+    try:
+        with mss.mss() as sct:
+            for i, m in enumerate(sct.monitors):
+                if i == 0:
+                    continue
+                try:
+                    out.append(
+                        {
+                            "index": int(i),
+                            "left": int(m.get("left", 0)),
+                            "top": int(m.get("top", 0)),
+                            "width": int(m.get("width", 0)),
+                            "height": int(m.get("height", 0)),
+                            "name": None,
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+    except Exception:  # noqa: BLE001
+        return out
+
+    # Windows: ctypes 로 얻은 친근한 이름을 좌표로 매칭해 채워 넣는다. 실패해도
+    # name 은 None 으로 남고 UI 는 인덱스/해상도만으로 동작한다.
+    win_info = _win32_monitor_friendly_names()
+    for entry in out:
+        l = entry["left"]
+        t = entry["top"]
+        r = l + entry["width"]
+        b = t + entry["height"]
+        for w in win_info:
+            if (
+                w["left"] == l
+                and w["top"] == t
+                and w["right"] == r
+                and w["bottom"] == b
+            ):
+                entry["name"] = w.get("name")
+                break
+    return out
 
 
 class ScreenCapture:

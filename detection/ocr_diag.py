@@ -5,7 +5,11 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
+
+# 한 줄 앞에 이 sentinel 이 붙어 있으면 LogConsole 이 그 줄을 알림 색(밝은 빨강) 으로 렌더링한다.
+# 파일 로그/외부 소비자는 줄을 화면에 보여주기 직전에 strip 하면 된다 (``flet_ui.log_buffers``).
+ALERT_LOG_LINE_PREFIX = "\x01ALERT\x01"
 
 _queue: queue.SimpleQueue[str] = queue.SimpleQueue()
 _lock = threading.Lock()
@@ -68,10 +72,33 @@ def begin_ocr_call(
         n = _next_call_id
     ts = time.strftime("%H:%M:%S")
     d = _fmt_detail(detail)
-    # 응답 줄의 ms 자리(약 9칸)와 맞추기 위해 호출 줄은 고정 폭
-    line = f"#{n:5d} {ts} {engine:10s} {operation:18s} 호출            —    {d}\n"
+    # engine/operation 모두 *최소* 10자로 맞춰 등폭 글꼴에서 컬럼이 가지런히 정렬되게 한다.
+    line = f"#{n:5d} {ts} {engine:10s} {operation:10s} 호출            —    {d}\n"
     _queue.put(line)
     return n
+
+
+def _format_matched_keywords(
+    matched: Optional[Sequence[str]],
+) -> tuple[Optional[str], bool]:
+    """``end_ocr_call`` 보조: ``매치 키워드 목록`` 을 화면 표기 + 알림여부로 환산.
+
+    - ``matched is None`` → ``(None, False)`` : 알림 검사를 안 한 호출.
+    - 비어 있음 → ``("알림:없음", False)``.
+    - 1개 이상 → ``("알림: 가나,마바", True)``.
+    """
+    if matched is None:
+        return None, False
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for k in matched:
+        s = (k or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            ordered.append(s)
+    if not ordered:
+        return "알림:없음", False
+    return "알림: " + ",".join(ordered), True
 
 
 def end_ocr_call(
@@ -82,21 +109,46 @@ def end_ocr_call(
     detail: str = "",
     *,
     keyword_alert_hit: Optional[bool] = None,
+    matched_keywords: Optional[Sequence[str]] = None,
+    count_completed: bool = True,
 ) -> None:
-    """해당 call_id 요청이 끝났을 때 호출 (예외여도 finally에서 호출 권장)."""
+    """해당 call_id 요청이 끝났을 때 호출 (예외여도 finally에서 호출 권장).
+
+    ``matched_keywords`` 가 우선 적용된다 (예: ``["가나", "마바"]``).
+    호환을 위해 레거시 ``keyword_alert_hit`` 도 그대로 받는다.
+    """
     global _completed_calls
-    with _lock:
-        _completed_calls += 1
+    if count_completed:
+        with _lock:
+            _completed_calls += 1
     ms = duration_sec * 1000.0
     ts = time.strftime("%H:%M:%S")
     d = _fmt_detail(detail)
-    if keyword_alert_hit is True:
-        d = f"{d} 알림:있음" if d else "알림:있음"
+
+    is_alert = False
+    alert_text: Optional[str] = None
+    if matched_keywords is not None:
+        alert_text, is_alert = _format_matched_keywords(matched_keywords)
+    elif keyword_alert_hit is True:
+        alert_text, is_alert = "알림:있음", True
     elif keyword_alert_hit is False:
-        d = f"{d} 알림:없음" if d else "알림:없음"
-    line = f"#{call_id:5d} {ts} {engine:10s} {operation:18s} {ms:9.2f} ms 응답 {d}\n"
+        alert_text = "알림:없음"
+
+    # 응답 줄: "호출" 라인과 동일하게 ``응답            —    {detail} {ms} ms [알림:...]``
+    # 순서로 출력해 등폭 글꼴에서 detail 컬럼이 호출 라인과 같이 정렬되게 한다.
+    rest_parts: list[str] = []
+    if d:
+        rest_parts.append(d)
+    rest_parts.append(f"{ms:9.2f} ms")
+    if alert_text:
+        rest_parts.append(alert_text)
+    rest = " ".join(rest_parts)
+
+    line = f"#{call_id:5d} {ts} {engine:10s} {operation:10s} 응답            —    {rest}\n"
+    if is_alert:
+        line = f"{ALERT_LOG_LINE_PREFIX}{line}"
     _queue.put(line)
-    if keyword_alert_hit is True and _on_keyword_alert_sound is not None:
+    if is_alert and _on_keyword_alert_sound is not None:
         try:
             _on_keyword_alert_sound()
         except Exception:
