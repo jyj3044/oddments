@@ -1,4 +1,4 @@
-"""송출 미리보기: 캡처 프레임에 감지 박스만 그리기 (OpenCV, Tk와 분리)."""
+"""송출 미리보기: 캡처 프레임에 감지 박스만 그리기 (OpenCV, UI 프레임워크와 분리)."""
 
 from __future__ import annotations
 

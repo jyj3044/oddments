@@ -1,7 +1,6 @@
-"""Flet 기반의 새 Material Design 3 UI 패키지.
+"""Flet 기반 Material Design 3 UI 패키지.
 
-기존 ``main.py`` 의 Tk UI 를 대체하기 위한 모듈 모음. 백엔드(`capture`,
-`detection`, `arduino_serial_bridge`, `web_stream`)는 그대로 재사용한다.
+백엔드(`capture`, `detection`, `arduino_serial_bridge`, `web_stream`)는 그대로 재사용한다.
 
 Flet 0.85 에서 사라진 헬퍼(padding.symmetric/only/all, border.all/only,
 margin.only/symmetric, alignment.center)를 import 시점에 보강한다.

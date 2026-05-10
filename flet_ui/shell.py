@@ -336,7 +336,7 @@ class StreamMasterApp:
         win = getattr(page, "window", None)
         if win is not None:
             try:
-                # 폭/높이는 ``flet_main._apply_window_settings`` 가 저장된 값(또는
+                # 폭/높이는 ``main._apply_window_settings`` 가 저장된 값(또는
                 # 기본값)으로 이미 셋업했으므로 여기서는 최소 크기 가드만 둔다.
                 # (예전엔 매번 1280×820 으로 강제 덮어써 사용자가 늘려둔 창 크기가
                 # 다음 부팅에 사라지는 문제가 있었다.)

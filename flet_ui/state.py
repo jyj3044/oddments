@@ -1,7 +1,6 @@
-"""Flet UI 와 기존 백엔드 모듈을 잇는 애플리케이션 상태.
+"""Flet UI 와 백엔드 모듈을 잇는 애플리케이션 상태.
 
-기존 ``main.OddmentsApp`` 의 비-UI 책임(설정 로드/저장, 캡처·감지 스레드,
-WebRTC 송출, Arduino 브리지 동기화)을 Tk 의존 없이 다시 구성한 객체.
+설정 로드/저장, 캡처·감지 스레드, WebRTC 송출, Arduino 브리지 동기화 등 비-UI 책임을 담는 객체.
 Flet 페이지에서 이 상태를 의존성 주입처럼 받아 호출한다.
 """
 
@@ -494,12 +493,30 @@ class AppState:
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
 
+        dyn_resolver: Callable[[], int] | None = None
+        if sys.platform == "win32" and hwnd is not None:
+            try:
+                from windows_capture import (  # type: ignore[import-not-found]
+                    is_league_capture_pair_hwnd,
+                    resolve_league_capture_hwnd,
+                )
+
+                if is_league_capture_pair_hwnd(int(hwnd)):
+                    _base_hwnd = int(hwnd)
+
+                    def dyn_resolver() -> int:
+                        return int(resolve_league_capture_hwnd(_base_hwnd))
+
+            except Exception:  # noqa: BLE001
+                dyn_resolver = None
+
         try:
             self._capture = CaptureThread(
                 monitor_index=int(cap.monitor_index or 1),
                 target_fps=float(fps),
                 on_frame=_on_frame,
                 window_hwnd=hwnd,
+                dynamic_hwnd_resolver=dyn_resolver,
             )
             self._capture.start()
         except Exception as exc:  # noqa: BLE001

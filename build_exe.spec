@@ -37,8 +37,26 @@ try:
 except Exception:
     pass
 
+try:
+    _flet_datas, _flet_bins, _flet_hidden = collect_all("flet")
+    datas += list(_flet_datas)
+    binaries += list(_flet_bins)
+except Exception:
+    _flet_hidden = ()
+
+try:
+    _fd_datas, _fd_bins, _fd_hidden = collect_all("flet_desktop")
+    datas += list(_fd_datas)
+    binaries += list(_fd_bins)
+except Exception:
+    _fd_hidden = ()
+
+# Flet `assets_dir` (미리보기 등) — 없으면 생략
+_assets = ROOT / "assets"
+if _assets.is_dir():
+    datas.append((str(_assets), "assets"))
+
 _base_hidden = [
-    "PIL._tkinter_finder",
     "app_platform",
     "app_platform.audio",
     "app_platform.host",
@@ -58,6 +76,22 @@ _base_hidden = [
     "numpy",
     "rapidocr_onnxruntime",
     "onnxruntime",
+    "flet",
+    "flet_ui",
+    "flet_ui.shell",
+    "flet_ui.state",
+    "flet_ui.components",
+    "flet_ui.theme",
+    "flet_ui.log_buffers",
+    "flet_ui.pages",
+    "flet_ui.pages.page_dashboard",
+    "flet_ui.pages.page_ocr",
+    "flet_ui.pages.page_arduino",
+    "flet_ui.pages.page_web",
+    "flet_desktop",
+    "flet_desktop.version",
+    "web_stream",
+    "web_log",
 ]
 # windows_capture 는 mac 에서 import 시 즉시 실패하므로 플랫폼별로만 넣는다.
 _platform_hidden: list[str] = []
@@ -77,7 +111,12 @@ elif sys.platform == "darwin":
 
 hiddenimports = list(
     dict.fromkeys(
-        _base_hidden + _platform_hidden + list(_rapid_hidden) + list(_onnx_hidden)
+        _base_hidden
+        + _platform_hidden
+        + list(_rapid_hidden)
+        + list(_onnx_hidden)
+        + list(_flet_hidden)
+        + list(_fd_hidden)
     )
 )
 

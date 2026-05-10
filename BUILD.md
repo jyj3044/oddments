@@ -117,6 +117,8 @@ pip install -r requirements-build.txt
 
 ### exe 배포 시 참고
 
+- **Flet UI**: `requirements-build.txt` → `flet`·**`flet-desktop`**(동일 메이저 버전)이 포함됩니다. PyInstaller spec 에서 `collect_all("flet")`·`collect_all("flet_desktop")` 와 프로젝트 **`assets/`** 트리를 번들합니다.
+- **Flet 데스크톱 클라이언트**: 설치된 wheel 에 `flet-windows.zip` 등이 없으면 **최초 실행 시** GitHub 에서 Flet 뷰어를 받아 `~/.flet/client/` 에 풉니다(방화벽·오프라인이면 실패할 수 있음).
 - **OCR**: exe는 **RapidOCR** 관련 파일을 spec에서 번들합니다.
 - **RapidOCR / `onnxruntime_pybind11_state` DLL 초기화 실패 (`python main.py` 는 되는데 exe만 안 될 때)**:
   - `_internal` 안 **DLL이 있는 모든 폴더**를 `add_dll_directory`에 등록(`bootstrap_onnx`), cv2 전 `onnxruntime` 선로드, `collect_all("onnxruntime")`, **onedir** 배포.

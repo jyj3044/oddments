@@ -112,7 +112,7 @@ def window_pick_supported() -> bool:
 
 
 def ensure_pre_gui_init() -> None:
-    """Tk() 전에 호출: DPI 등 OS 별 준비."""
+    """GUI 표시 전에 호출: DPI 등 OS 별 준비."""
     if sys.platform == "win32":
         from windows_capture import ensure_windows_dpi_awareness
 

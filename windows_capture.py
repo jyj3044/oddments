@@ -39,8 +39,8 @@ SRCCOPY = 0x00CC0020
 
 def ensure_windows_dpi_awareness() -> None:
     """
-    Tk·mss·GetWindowRect 좌표계를 맞추기 위해 가능한 한 먼저 호출하세요.
-    (main()에서 Tk() 생성 전에 호출하는 것이 좋습니다.)
+    GUI·mss·GetWindowRect 좌표계를 맞추기 위해 가능한 한 먼저 호출하세요.
+    (앱 ``main()`` 에서 창을 띄우기 전에 ``ensure_pre_gui_init()`` 로 호출하는 것이 좋습니다.)
     """
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
