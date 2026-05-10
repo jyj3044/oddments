@@ -92,6 +92,7 @@ _base_hidden = [
     "flet_ui.log_buffers",
     "flet_ui.pages",
     "flet_ui.pages.page_dashboard",
+    "flet_ui.pages.page_app_settings",
     "flet_ui.pages.page_ocr",
     "flet_ui.pages.page_arduino",
     "flet_ui.pages.page_web",

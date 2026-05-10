@@ -10,6 +10,114 @@ from __future__ import annotations
 import flet as ft
 
 
+_COLOR_KEYS: tuple[str, ...] = (
+    "SURFACE",
+    "SURFACE_DIM",
+    "SURFACE_BRIGHT",
+    "SURFACE_CONTAINER_LOWEST",
+    "SURFACE_CONTAINER_LOW",
+    "SURFACE_CONTAINER",
+    "SURFACE_CONTAINER_HIGH",
+    "SURFACE_CONTAINER_HIGHEST",
+    "ON_SURFACE",
+    "ON_SURFACE_VARIANT",
+    "INVERSE_SURFACE",
+    "INVERSE_ON_SURFACE",
+    "OUTLINE",
+    "OUTLINE_VARIANT",
+    "SURFACE_TINT",
+    "PRIMARY",
+    "ON_PRIMARY",
+    "PRIMARY_CONTAINER",
+    "ON_PRIMARY_CONTAINER",
+    "INVERSE_PRIMARY",
+    "SECONDARY",
+    "ON_SECONDARY",
+    "SECONDARY_CONTAINER",
+    "ON_SECONDARY_CONTAINER",
+    "TERTIARY",
+    "ON_TERTIARY",
+    "TERTIARY_CONTAINER",
+    "ON_TERTIARY_CONTAINER",
+    "ERROR",
+    "ON_ERROR",
+    "ERROR_CONTAINER",
+    "ON_ERROR_CONTAINER",
+    "SUCCESS",
+    "SUCCESS_DIM",
+    "WARNING",
+    "PRIMARY_FIXED",
+    "PRIMARY_FIXED_DIM",
+    "ON_PRIMARY_FIXED",
+    "SECONDARY_FIXED",
+    "SECONDARY_FIXED_DIM",
+    "BACKGROUND",
+)
+
+# 라이트 테마 스냅샷은 클래스 정의 직후 한 번 채운다.
+_LIGHT_THEME_SNAPSHOT: dict[str, str] | None = None
+
+_DARK_THEME_OVERRIDES: dict[str, str] = {
+    "SURFACE": "#1c1b1f",
+    "SURFACE_DIM": "#141218",
+    "SURFACE_BRIGHT": "#1c1b1f",
+    "SURFACE_CONTAINER_LOWEST": "#1c1b1f",
+    "SURFACE_CONTAINER_LOW": "#2b2930",
+    "SURFACE_CONTAINER": "#36343b",
+    "SURFACE_CONTAINER_HIGH": "#423f47",
+    "SURFACE_CONTAINER_HIGHEST": "#4e4a53",
+    "ON_SURFACE": "#e6e1e5",
+    "ON_SURFACE_VARIANT": "#cac4d0",
+    "INVERSE_SURFACE": "#e6e1e5",
+    "INVERSE_ON_SURFACE": "#1c1b1f",
+    "OUTLINE": "#938f99",
+    "OUTLINE_VARIANT": "#49454f",
+    "SURFACE_TINT": "#a8c7fa",
+    "PRIMARY": "#a8c7fa",
+    "ON_PRIMARY": "#003258",
+    "PRIMARY_CONTAINER": "#004a77",
+    "ON_PRIMARY_CONTAINER": "#d0e4ff",
+    "INVERSE_PRIMARY": "#3f5d92",
+    "SECONDARY": "#bcc7db",
+    "ON_SECONDARY": "#283141",
+    "SECONDARY_CONTAINER": "#3f4a5c",
+    "ON_SECONDARY_CONTAINER": "#d9e3f8",
+    "TERTIARY": "#d0c0d8",
+    "ON_TERTIARY": "#382e42",
+    "TERTIARY_CONTAINER": "#534660",
+    "ON_TERTIARY_CONTAINER": "#eddff7",
+    "ERROR": "#ffb4ab",
+    "ON_ERROR": "#690005",
+    "ERROR_CONTAINER": "#93000a",
+    "ON_ERROR_CONTAINER": "#ffdad6",
+    "SUCCESS": "#6ee7b7",
+    "SUCCESS_DIM": "#34d399",
+    "WARNING": "#fcd34d",
+    "PRIMARY_FIXED": "#d0e4ff",
+    "PRIMARY_FIXED_DIM": "#a8c7fa",
+    "ON_PRIMARY_FIXED": "#041c35",
+    "SECONDARY_FIXED": "#d9e3f8",
+    "SECONDARY_FIXED_DIM": "#bcc7db",
+    "BACKGROUND": "#121316",
+}
+
+
+def apply_theme_mode(*, dark: bool) -> None:
+    """StreamMasterTheme 의 색상 토큰을 라이트/다크로 전환한다.
+
+    레이아웃 컨트롤은 각 속성을 빌드 시점에 읽으므로, 전환 후에는 UI 를 다시
+    구성해야 한다.
+    """
+    global _LIGHT_THEME_SNAPSHOT
+    if _LIGHT_THEME_SNAPSHOT is None:
+        _LIGHT_THEME_SNAPSHOT = {
+            k: getattr(StreamMasterTheme, k) for k in _COLOR_KEYS
+        }
+    src = _DARK_THEME_OVERRIDES if dark else _LIGHT_THEME_SNAPSHOT
+    for k in _COLOR_KEYS:
+        setattr(StreamMasterTheme, k, src[k])
+
+
 class StreamMasterTheme:
     """Material Design 3 톤맵을 헥사 코드로 모은 정적 테이블."""
 
@@ -200,6 +308,7 @@ def label_md() -> ft.TextStyle:
 
 
 __all__ = [
+    "apply_theme_mode",
     "StreamMasterTheme",
     "display_lg",
     "headline_lg",

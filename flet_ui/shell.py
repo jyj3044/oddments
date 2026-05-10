@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from typing import Callable, Optional
 
 import flet as ft
@@ -14,9 +15,11 @@ from .components import (
     show_snack,
     status_dot,
 )
+from .log_buffers import log_app_event
 from .state import AppState
 from .theme import (
     StreamMasterTheme as T,
+    apply_theme_mode,
     headline_md,
     label_lg,
     label_md,
@@ -28,6 +31,7 @@ ROUTE_DASHBOARD = "dashboard"
 ROUTE_OCR = "ocr"
 ROUTE_ARDUINO = "arduino"
 ROUTE_WEB = "web"
+ROUTE_APP_SETTINGS = "app_settings"
 
 
 def _nav_item(
@@ -85,6 +89,7 @@ class StreamMasterApp:
         self._footer_arduino: ft.Row | None = None
         self._footer_web: ft.Row | None = None
         self._footer = self._build_footer()
+        self._root_row: ft.Row | None = None
 
     def _build_sidebar(self) -> ft.Container:
         self._nav_items = {
@@ -94,6 +99,7 @@ class StreamMasterApp:
             ROUTE_WEB: ("Web Stream", ft.Icons.SETTINGS_INPUT_ANTENNA),
         }
         self._nav_column = ft.Column(spacing=4, expand=True)
+        self._settings_nav_slot = ft.Container()
         self._refresh_nav_buttons()
 
         return ft.Container(
@@ -112,7 +118,14 @@ class StreamMasterApp:
                             color=T.PRIMARY,
                         ),
                     ),
-                    self._nav_column,
+                    ft.Container(content=self._nav_column, expand=True),
+                    ft.Column(
+                        spacing=0,
+                        controls=[
+                            ft.Divider(height=1, color=T.OUTLINE_VARIANT),
+                            self._settings_nav_slot,
+                        ],
+                    ),
                 ],
                 spacing=0,
                 expand=True,
@@ -131,6 +144,12 @@ class StreamMasterApp:
                 )
             )
         self._nav_column.controls = items
+        self._settings_nav_slot.content = _nav_item(
+            label="앱 설정",
+            icon=ft.Icons.SETTINGS_OUTLINED,
+            active=(self.current_route == ROUTE_APP_SETTINGS),
+            on_click=lambda _e: self._goto(ROUTE_APP_SETTINGS),
+        )
 
     def _goto(self, route: str) -> None:
         if route == self.current_route:
@@ -168,9 +187,16 @@ class StreamMasterApp:
         try:
             self._page_container.content = build_fn(self.state)
         except Exception as exc:
-            import traceback
-
+            tb_text = traceback.format_exc()
             traceback.print_exc()
+            try:
+                log_app_event(
+                    "ERROR",
+                    f"페이지 렌더 오류 (route={self.current_route}): {exc}",
+                    detail=tb_text,
+                )
+            except Exception:
+                pass
             self._page_container.content = ft.Text(
                 f"페이지 렌더 오류: {exc}", color=T.ERROR
             )
@@ -326,9 +352,55 @@ class StreamMasterApp:
         snack.open = True
         self.page.update()
 
+    def refresh_chrome(self) -> None:
+        """다크 모드 등 테마 토큰 변경 후 사이드바·상단·하단·본문을 다시 구성한다."""
+        apply_theme_mode(dark=self.state.settings.dark_mode)
+        page = self.page
+        if page is None:
+            return
+        page.theme_mode = (
+            ft.ThemeMode.DARK
+            if self.state.settings.dark_mode
+            else ft.ThemeMode.LIGHT
+        )
+        page.theme = T.theme()
+        page.bgcolor = T.BACKGROUND
+
+        self._sidebar = self._build_sidebar()
+        self._topbar = self._build_topbar()
+        self._footer = self._build_footer()
+        self._page_container.bgcolor = T.SURFACE_BRIGHT
+
+        root = self._root_row
+        if root is None or len(root.controls) < 2:
+            return
+        root.controls[0] = self._sidebar
+        outer = root.controls[1]
+        try:
+            outer.bgcolor = T.SURFACE_BRIGHT
+        except Exception:
+            pass
+        col = outer.content
+        if isinstance(col, ft.Column) and len(col.controls) >= 3:
+            col.controls[0] = self._topbar
+            col.controls[2] = self._footer
+
+        self._render_current_page()
+        self._refresh_topbar_state()
+        self._refresh_footer()
+        try:
+            page.update()
+        except Exception:
+            pass
+
     def attach(self, page: ft.Page) -> None:
         self.page = page
         page.title = "Oddments"
+        page.theme_mode = (
+            ft.ThemeMode.DARK
+            if self.state.settings.dark_mode
+            else ft.ThemeMode.LIGHT
+        )
         page.bgcolor = T.BACKGROUND
         page.padding = 0
         page.theme = T.theme()
@@ -355,6 +427,7 @@ class StreamMasterApp:
                 pass
 
         self.state.add_state_listener(_on_state)
+        self.state.add_theme_listener(self.refresh_chrome)
 
         layout = ft.Row(
             controls=[
@@ -376,6 +449,7 @@ class StreamMasterApp:
             spacing=0,
             expand=True,
         )
+        self._root_row = layout
 
         self._render_current_page()
         self._refresh_topbar_state()
@@ -403,4 +477,5 @@ __all__ = [
     "ROUTE_OCR",
     "ROUTE_ARDUINO",
     "ROUTE_WEB",
+    "ROUTE_APP_SETTINGS",
 ]

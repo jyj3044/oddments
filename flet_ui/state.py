@@ -226,6 +226,7 @@ class AppSettings:
     web: WebStreamSettings = field(default_factory=WebStreamSettings)
     arduino: ArduinoSettings = field(default_factory=ArduinoSettings)
     window: WindowSettings = field(default_factory=WindowSettings)
+    dark_mode: bool = False
 
 
 class AppState:
@@ -274,6 +275,7 @@ class AppState:
 
         self._on_frame_listeners: list[Callable[[np.ndarray], None]] = []
         self._on_state_listeners: list[Callable[[], None]] = []
+        self._theme_listeners: list[Callable[[], None]] = []
 
         set_ocr_keyword_alert_sound_handler(self._handle_keyword_sound)
 
@@ -360,6 +362,8 @@ class AppState:
                 win_d.get("dashboard_preview_height", win.dashboard_preview_height)
             )
 
+        self.settings.dark_mode = bool(d.get("dark_mode", self.settings.dark_mode))
+
     def _serialize_settings_dict(self) -> dict:
         det = self.settings.detection
         cap = self.settings.capture
@@ -397,6 +401,7 @@ class AppState:
                 "maximized": bool(self.settings.window.maximized),
                 "dashboard_preview_height": self.settings.window.dashboard_preview_height,
             },
+            "dark_mode": bool(self.settings.dark_mode),
         }
 
     # ─── 설정 → DetectionConfig 동기화 ────────────────────
@@ -706,6 +711,17 @@ class AppState:
     def add_state_listener(self, cb: Callable[[], None]) -> None:
         if cb not in self._on_state_listeners:
             self._on_state_listeners.append(cb)
+
+    def add_theme_listener(self, cb: Callable[[], None]) -> None:
+        if cb not in self._theme_listeners:
+            self._theme_listeners.append(cb)
+
+    def notify_theme_changed(self) -> None:
+        for cb in list(self._theme_listeners):
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
 
     def _notify_state(self) -> None:
         for cb in list(self._on_state_listeners):

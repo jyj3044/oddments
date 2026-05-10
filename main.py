@@ -25,6 +25,7 @@ from app_platform import ensure_pre_gui_init
 from app_platform.host import require_windows_admin_or_exit
 from flet_ui.components import show_error_dialog
 from flet_ui.shell import (
+    ROUTE_APP_SETTINGS,
     ROUTE_ARDUINO,
     ROUTE_DASHBOARD,
     ROUTE_OCR,
@@ -33,11 +34,13 @@ from flet_ui.shell import (
 )
 from flet_ui.log_buffers import get_log_store, shutdown_log_store
 from flet_ui.pages import (
+    build_app_settings,
     build_arduino_link,
     build_dashboard,
     build_ocr_settings,
     build_web_stream,
 )
+from flet_ui.theme import apply_theme_mode
 from flet_ui.state import APP_NAME, AppState
 
 
@@ -252,12 +255,14 @@ def main(page: ft.Page) -> None:
     state = AppState()
     state.load()
     state.assets_dir = ASSETS_DIR  # type: ignore[attr-defined]
+    apply_theme_mode(dark=state.settings.dark_mode)
 
     pages = {
         ROUTE_DASHBOARD: ("Dashboard", "dashboard", build_dashboard),
         ROUTE_OCR: ("OCR Settings", "visibility", build_ocr_settings),
         ROUTE_ARDUINO: ("Arduino Link", "memory", build_arduino_link),
         ROUTE_WEB: ("Web Stream", "settings_input_antenna", build_web_stream),
+        ROUTE_APP_SETTINGS: ("앱 설정", "settings", build_app_settings),
     }
 
     app = StreamMasterApp(state, pages)

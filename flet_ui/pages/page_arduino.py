@@ -214,7 +214,7 @@ def build_arduino_link(state: AppState) -> ft.Control:
 
     def _apply_baud_state(active: bool) -> None:
         baud_field.read_only = active
-        baud_field.bgcolor = T.SURFACE_CONTAINER_HIGH if active else "#ffffff"
+        baud_field.bgcolor = T.SURFACE_CONTAINER_HIGH if active else T.SURFACE_CONTAINER_LOWEST
         try:
             if baud_field.page is not None:
                 baud_field.update()
