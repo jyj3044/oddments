@@ -469,7 +469,8 @@ class AppState:
                     host="0.0.0.0",
                     port=web.port,
                     fps=float(fps),
-                    max_stream_side=int(web.max_side or 1080),
+                    # 0 = 원본(리사이즈 없음). ``0 or 1080`` 이면 원본이 1080으로 깨짐.
+                    max_stream_side=int(web.max_side),
                     audio_output_name=web.audio_output or None,
                     ssl_context=ssl_ctx,
                 )
