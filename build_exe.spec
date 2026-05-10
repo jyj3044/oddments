@@ -69,7 +69,14 @@ _base_hidden = [
     "detection.ocr_diag",
     "detection.templates",
     "detection.overlay_store",
-    "bootstrap_onnx",
+    "app_platform.bootstrap_onnx",
+    "capture",
+    "capture.thread",
+    "streaming",
+    "streaming.web_stream",
+    "streaming.web_log",
+    "arduino",
+    "arduino.serial_bridge",
     "setproctitle",
     "mss",
     "cv2",
@@ -90,15 +97,13 @@ _base_hidden = [
     "flet_ui.pages.page_web",
     "flet_desktop",
     "flet_desktop.version",
-    "web_stream",
-    "web_log",
 ]
 # windows_capture 는 mac 에서 import 시 즉시 실패하므로 플랫폼별로만 넣는다.
 _platform_hidden: list[str] = []
 if sys.platform == "win32":
     _platform_hidden = [
-        "windows_capture",
-        "arduino_serial_bridge",
+        "app_platform.windows_capture",
+        "arduino.serial_bridge",
         "serial",
         "serial.serialutil",
         "serial.tools",
@@ -107,7 +112,7 @@ if sys.platform == "win32":
         "pynput.mouse._win32",
     ]
 elif sys.platform == "darwin":
-    _platform_hidden = ["darwin_capture"]
+    _platform_hidden = ["app_platform.darwin_capture"]
 
 hiddenimports = list(
     dict.fromkeys(
@@ -131,7 +136,6 @@ _paddle_excludes = (
 
 _ocr_unused_excludes = (
     "pytesseract",
-    "tesseract_win_console",
     "easyocr",
     "torch",
     "torchvision",
@@ -155,8 +159,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[
-        str(ROOT / "pyi_rthook_00_openmp.py"),
-        str(ROOT / "pyi_rthook_onnx.py"),
+        str(ROOT / "packaging" / "pyinstaller" / "pyi_rthook_00_openmp.py"),
+        str(ROOT / "packaging" / "pyinstaller" / "pyi_rthook_onnx.py"),
     ],
     excludes=_all_excludes,
     win_no_prefer_redirects=False,

@@ -43,10 +43,10 @@ from detection.ocr_diag import (
     reset_ocr_log,
     set_ocr_keyword_alert_sound_handler,
 )
-from web_log import drain_web_log_lines, log_web_event, reset_web_log
+from streaming.web_log import drain_web_log_lines, log_web_event, reset_web_log
 
 if sys.platform == "win32":
-    from arduino_serial_bridge import (
+    from arduino.serial_bridge import (
         ArduinoKeyBridge,
         bridge_supported,
         clear_arduino_notice_buffer,
@@ -121,13 +121,13 @@ else:  # 비 Windows 환경에서는 무동작 스텁으로 대체
         pass
 
 
-from web_stream import (
+from streaming.web_stream import (
     build_web_stream_ssl_context,
     list_web_stream_audio_outputs,
 )
 
 try:
-    from web_stream import WebStreamServer
+    from streaming.web_stream import WebStreamServer
 except ImportError:
     WebStreamServer = None  # type: ignore[assignment]
 
@@ -497,7 +497,7 @@ class AppState:
         dyn_resolver: Callable[[], int] | None = None
         if sys.platform == "win32" and hwnd is not None:
             try:
-                from windows_capture import (  # type: ignore[import-not-found]
+                from app_platform.windows_capture import (  # type: ignore[import-not-found]
                     is_league_capture_pair_hwnd,
                     resolve_league_capture_hwnd,
                 )
@@ -833,7 +833,7 @@ class AppState:
 
         target_hwnd = int(cap.picked_hwnd)
         try:
-            from windows_capture import (  # type: ignore[import-not-found]
+            from app_platform.windows_capture import (  # type: ignore[import-not-found]
                 is_league_capture_pair_hwnd,
                 resolve_league_capture_hwnd,
             )

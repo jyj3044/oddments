@@ -25,7 +25,7 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 
-from web_log import log_web_event
+from .web_log import log_web_event
 
 
 def build_web_stream_ssl_context(

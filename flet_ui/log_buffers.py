@@ -27,10 +27,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from detection.ocr_diag import ALERT_LOG_LINE_PREFIX, drain_ocr_log_lines
-from web_log import drain_web_log_lines
+from streaming.web_log import drain_web_log_lines
 
 if sys.platform == "win32":
-    from arduino_serial_bridge import (
+    from arduino.serial_bridge import (
         drain_key_bridge_debug_lines,
         drain_received_serial_lines,
         take_arduino_notice_lines,

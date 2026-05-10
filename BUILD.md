@@ -121,7 +121,7 @@ pip install -r requirements-build.txt
 - **Flet 데스크톱 클라이언트**: 설치된 wheel 에 `flet-windows.zip` 등이 없으면 **최초 실행 시** GitHub 에서 Flet 뷰어를 받아 `~/.flet/client/` 에 풉니다(방화벽·오프라인이면 실패할 수 있음).
 - **OCR**: exe는 **RapidOCR** 관련 파일을 spec에서 번들합니다.
 - **RapidOCR / `onnxruntime_pybind11_state` DLL 초기화 실패 (`python main.py` 는 되는데 exe만 안 될 때)**:
-  - `_internal` 안 **DLL이 있는 모든 폴더**를 `add_dll_directory`에 등록(`bootstrap_onnx`), cv2 전 `onnxruntime` 선로드, `collect_all("onnxruntime")`, **onedir** 배포.
+  - `_internal` 안 **DLL이 있는 모든 폴더**를 `add_dll_directory`에 등록(`app_platform.bootstrap_onnx`), cv2 전 `onnxruntime` 선로드, `collect_all("onnxruntime")`, **onedir** 배포.
   - 여전히 실패 시 `dist\oddments\` 옆에 생기는 **`pyi_rthook_onnx_error.txt`**(rthook 단계 예외) 내용을 확인하세요.
   - **`onnxruntime` 버전**: **Python 3.12 이하(Windows exe 권장)** 에서는 `requirements-runtime.txt` 가 **1.20.1** 을 고정합니다(1.22+ 는 Windows 번들·VC 조합에서 초기화 실패 보고). **Python 3.13+**(맥·3.14 등)에서는 1.20.1 휠이 없어 **1.24.x** 를 쓰도록 분기해 두었습니다. 재현 가능한 Windows 빌드는 **3.12 venv** 권장입니다.
 

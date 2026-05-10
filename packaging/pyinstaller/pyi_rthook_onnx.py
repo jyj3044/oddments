@@ -20,9 +20,9 @@ def _write_rthook_log(title: str, exc: BaseException) -> None:
 
 
 try:
-    import bootstrap_onnx
+    from app_platform.bootstrap_onnx import apply as _bootstrap_onnx_apply
 
-    bootstrap_onnx.apply()
+    _bootstrap_onnx_apply()
 except Exception as e:
     _write_rthook_log("bootstrap_onnx.apply", e)
 
