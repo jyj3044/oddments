@@ -43,6 +43,11 @@ from detection.ocr_diag import (
     reset_ocr_log,
     set_ocr_keyword_alert_sound_handler,
 )
+from streaming.remote_log import (
+    drain_remote_log_lines,
+    log_remote_event,
+    reset_remote_log,
+)
 from streaming.web_log import drain_web_log_lines, log_web_event, reset_web_log
 
 if sys.platform == "win32":
@@ -131,6 +136,8 @@ try:
 except ImportError:
     WebStreamServer = None  # type: ignore[assignment]
 
+from streaming.remote_host import RemoteHostServer, rtc_configuration_from_stun_turn
+
 APP_NAME = "Oddments"
 SETTINGS_FILENAME = "oddments_settings.json"
 DEFAULT_KEYWORDS = "보스,레드"
@@ -217,6 +224,43 @@ class WindowSettings:
     top: Optional[int] = None
     maximized: bool = False
     dashboard_preview_height: Optional[int] = None
+    # 메인 창 왼쪽 네비게이션 패널 폭(px). None 이면 테마 기본 SIDEBAR_WIDTH.
+    sidebar_width: Optional[int] = None
+
+
+@dataclass
+class RemoteHostProfile:
+    """원격 제어 호스트(공유 측) 옵션. 캡처·인코딩·리슨은 네이티브 모듈에서 소비."""
+
+    listen_port: int = 49152
+    monitor_index: int = 1
+    stream_fps: int = 30
+    # 0 = 인코더가 대상 화면의 네이티브 해상도를 그대로 쓰도록 둔다(스케일은 별도).
+    capture_width: int = 0
+    capture_height: int = 0
+    stun_urls: str = "stun:stun.l.google.com:19302"
+    turn_uri: str = ""
+    turn_username: str = ""
+    turn_password: str = ""
+    # 비어 있으면 연결 시 비밀번호를 요구하지 않음. 설정 시 클라이언트와 동일해야 한다.
+    auth_token: str = ""
+    # True 이면 호스트 시작 시 NVENC/AMF/VideoToolbox 등을 시도하고, 없으면 libx264 유지.
+    h264_hardware_encode: bool = False
+
+
+@dataclass
+class RemoteClientProfile:
+    """원격 제어 클라이언트(뷰어) 연결 정보."""
+
+    host: str = ""
+    port: int = 49152
+    auth_token: str = ""
+
+
+@dataclass
+class RemoteControlSettings:
+    host: RemoteHostProfile = field(default_factory=RemoteHostProfile)
+    client: RemoteClientProfile = field(default_factory=RemoteClientProfile)
 
 
 @dataclass
@@ -226,6 +270,7 @@ class AppSettings:
     web: WebStreamSettings = field(default_factory=WebStreamSettings)
     arduino: ArduinoSettings = field(default_factory=ArduinoSettings)
     window: WindowSettings = field(default_factory=WindowSettings)
+    remote: RemoteControlSettings = field(default_factory=RemoteControlSettings)
     dark_mode: bool = False
 
 
@@ -256,6 +301,10 @@ class AppState:
 
         self._streamer = None
         self._stream_audio_error: str | None = None
+
+        self._remote_host = None
+        # 호스트 시작 실패 시에만 설정. 성공·중지 시 None.
+        self._remote_host_last_error: str | None = None
 
         # 공인 IPv4 조회 결과 캐시(60초). URL 복사 같은 빈번한 호출에서 매번
         # 외부 HTTP 요청을 날리지 않게 한다.
@@ -361,14 +410,76 @@ class AppState:
             win.dashboard_preview_height = _maybe_int(
                 win_d.get("dashboard_preview_height", win.dashboard_preview_height)
             )
+            raw_sw = win_d.get("sidebar_width", win.sidebar_width)
+            if raw_sw is not None:
+                try:
+                    swi = int(raw_sw)
+                except (TypeError, ValueError):
+                    swi = 0
+                if swi > 0:
+                    win.sidebar_width = max(180, min(560, swi))
 
         self.settings.dark_mode = bool(d.get("dark_mode", self.settings.dark_mode))
+
+        r = d.get("remote_control")
+        if isinstance(r, dict):
+            rh = r.get("host") or {}
+            rc = r.get("client") or {}
+
+            def _safe_u16_port(v: object, default: int) -> int:
+                try:
+                    p = int(v)
+                except (TypeError, ValueError):
+                    p = int(default)
+                return max(1, min(65535, p))
+
+            if isinstance(rh, dict):
+                h = self.settings.remote.host
+                h.listen_port = _safe_u16_port(
+                    rh.get("listen_port", h.listen_port), h.listen_port
+                )
+                try:
+                    h.monitor_index = max(
+                        1, int(rh.get("monitor_index", h.monitor_index) or 1)
+                    )
+                except (TypeError, ValueError):
+                    h.monitor_index = 1
+                try:
+                    h.stream_fps = max(
+                        5, min(60, int(rh.get("stream_fps", h.stream_fps) or 30))
+                    )
+                except (TypeError, ValueError):
+                    h.stream_fps = 30
+                try:
+                    h.capture_width = int(rh.get("capture_width", h.capture_width) or 0)
+                except (TypeError, ValueError):
+                    h.capture_width = 0
+                try:
+                    h.capture_height = int(rh.get("capture_height", h.capture_height) or 0)
+                except (TypeError, ValueError):
+                    h.capture_height = 0
+                h.stun_urls = str(rh.get("stun_urls", h.stun_urls) or "")
+                h.turn_uri = str(rh.get("turn_uri", h.turn_uri) or "")
+                h.turn_username = str(rh.get("turn_username", h.turn_username) or "")
+                h.turn_password = str(rh.get("turn_password", h.turn_password) or "")
+                h.auth_token = str(rh.get("auth_token", h.auth_token) or "")
+                h.h264_hardware_encode = bool(
+                    rh.get("h264_hardware_encode", h.h264_hardware_encode)
+                )
+            if isinstance(rc, dict):
+                c = self.settings.remote.client
+                c.host = str(rc.get("host", c.host) or "")
+                c.port = _safe_u16_port(rc.get("port", c.port), c.port)
+                c.auth_token = str(rc.get("auth_token", c.auth_token) or "")
 
     def _serialize_settings_dict(self) -> dict:
         det = self.settings.detection
         cap = self.settings.capture
         web = self.settings.web
         ard = self.settings.arduino
+        rem = self.settings.remote
+        rh = rem.host
+        rc = rem.client
         return {
             "keywords": det.keywords,
             "template_paths": list(det.template_paths),
@@ -400,8 +511,29 @@ class AppState:
                 "top": self.settings.window.top,
                 "maximized": bool(self.settings.window.maximized),
                 "dashboard_preview_height": self.settings.window.dashboard_preview_height,
+                "sidebar_width": self.settings.window.sidebar_width,
             },
             "dark_mode": bool(self.settings.dark_mode),
+            "remote_control": {
+                "host": {
+                    "listen_port": rh.listen_port,
+                    "monitor_index": rh.monitor_index,
+                    "stream_fps": rh.stream_fps,
+                    "capture_width": rh.capture_width,
+                    "capture_height": rh.capture_height,
+                    "stun_urls": rh.stun_urls,
+                    "turn_uri": rh.turn_uri,
+                    "turn_username": rh.turn_username,
+                    "turn_password": rh.turn_password,
+                    "auth_token": rh.auth_token,
+                    "h264_hardware_encode": rh.h264_hardware_encode,
+                },
+                "client": {
+                    "host": rc.host,
+                    "port": rc.port,
+                    "auth_token": rc.auth_token,
+                },
+            },
         }
 
     # ─── 설정 → DetectionConfig 동기화 ────────────────────
@@ -484,7 +616,7 @@ class AppState:
                 self._stream_audio_error = web_streamer.get_audio_error()
                 log_web_event("WebRTC 송출 시작 요청")
             except Exception as exc:  # noqa: BLE001
-                log_web_event(f"WebRTC 시작 실패: {exc}")
+                log_web_event(f"WebRTC 시작 실패: {exc}", error=True)
                 return False, f"웹 송출 시작 실패: {exc}"
 
         def _on_frame(frame: np.ndarray) -> None:
@@ -1034,6 +1166,80 @@ class AppState:
         except Exception:  # noqa: BLE001
             return []
 
+    # ─── 원격 호스트 (WebRTC) ────────────────────────────
+
+    def remote_host_active(self) -> bool:
+        return self._remote_host is not None
+
+    def remote_host_has_start_error(self) -> bool:
+        """송출 중이 아니고 마지막 호스트 시작이 실패한 경우(푸터 오류 표시)."""
+        return self._remote_host is None and self._remote_host_last_error is not None
+
+    def start_remote_host(self) -> tuple[bool, str | None]:
+        if self._remote_host is not None:
+            return True, None
+        hp = self.settings.remote.host
+        try:
+            rtc_cfg = rtc_configuration_from_stun_turn(
+                stun_urls=hp.stun_urls,
+                turn_uri=hp.turn_uri,
+                turn_username=hp.turn_username,
+                turn_password=hp.turn_password,
+            )
+            srv = RemoteHostServer(
+                host="0.0.0.0",
+                port=hp.listen_port,
+                fps=float(hp.stream_fps),
+                monitor_index=hp.monitor_index,
+                capture_width=hp.capture_width,
+                capture_height=hp.capture_height,
+                rtc_configuration=rtc_cfg,
+                auth_token=hp.auth_token,
+                h264_hardware_encode=hp.h264_hardware_encode,
+            )
+            srv.start()
+            self._remote_host = srv
+            self._remote_host_last_error = None
+            try:
+                log_remote_event(
+                    f"원격 호스트: 시작됨 (포트 {hp.listen_port}, 첫 연결 시 캡처)"
+                )
+            except Exception:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log_remote_event(f"원격 호스트: 시작 실패 — {exc}", error=True)
+            except Exception:
+                pass
+            self._remote_host_last_error = str(exc)
+            self._notify_state()
+            return False, str(exc)
+        self._notify_state()
+        return True, None
+
+    def stop_remote_host(self) -> None:
+        srv = self._remote_host
+        self._remote_host = None
+        self._remote_host_last_error = None
+        if srv is not None:
+            try:
+                log_remote_event("원격 호스트: 송출 종료")
+            except Exception:
+                pass
+            try:
+                srv.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from streaming.h264_hw_patch import install_h264_hardware_encoder
+
+            install_h264_hardware_encoder(
+                enabled=self.settings.remote.host.h264_hardware_encode
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._notify_state()
+
     # ─── 종료 ─────────────────────────────────────────────
 
     def shutdown(self) -> None:
@@ -1041,6 +1247,7 @@ class AppState:
             self.save()
         except Exception:  # noqa: BLE001
             pass
+        self.stop_remote_host()
         self.stop_capture(blocking=True)
         try:
             self.arduino_disconnect()
@@ -1055,6 +1262,9 @@ class AppState:
 __all__ = [
     "AppState",
     "AppSettings",
+    "RemoteControlSettings",
+    "RemoteHostProfile",
+    "RemoteClientProfile",
     "ArduinoSettings",
     "WebStreamSettings",
     "CaptureSettings",
@@ -1063,8 +1273,11 @@ __all__ = [
     "drain_ocr_log_lines",
     "get_ocr_call_total",
     "reset_ocr_log",
+    "drain_remote_log_lines",
     "drain_web_log_lines",
+    "log_remote_event",
     "log_web_event",
+    "reset_remote_log",
     "reset_web_log",
     "list_com_ports",
     "drain_received_serial_lines",

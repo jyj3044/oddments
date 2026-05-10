@@ -5,6 +5,8 @@
 
 * 메모리 ``deque`` (최대 500줄) 에 보관 — 페이지 재방문 시 그대로 표시.
 * 일자별 파일 ``logs/{kind}-YYYYMMDD.log`` 에 추가 기록.
+* 에러 전용으로 같은 날짜의 ``logs/{kind}_error-YYYYMMDD.log`` 에 한 줄을 즉시 추가할 수 있다.
+* 앱 진단 ``log_app_event(..., ERROR|CRITICAL)`` 는 ``app_error-YYYYMMDD.log`` 에도 동일 본문을 남긴다.
 * 1시간마다 ``LOG_RETENTION_DAYS`` (기본 2일) 보다 오래된 로그 파일 자동 삭제.
 
 페이지(``page_ocr``, ``page_arduino``, ``page_web``) 들은 더 이상 소스 큐를
@@ -27,6 +29,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from detection.ocr_diag import ALERT_LOG_LINE_PREFIX, drain_ocr_log_lines
+from streaming.remote_log import drain_remote_log_lines
 from streaming.web_log import drain_web_log_lines
 
 if sys.platform == "win32":
@@ -64,6 +67,35 @@ def _log_dir_path() -> Path:
     else:
         base = Path.cwd()
     return base / LOG_DIR_NAME
+
+
+_sidecar_err_lock = threading.Lock()
+
+
+def append_sidecar_error_file(kind: str, message: str) -> None:
+    """에러 한 줄을 ``logs/{kind}_error-YYYYMMDD.log`` 에 즉시 추가한다.
+
+    드레인 버퍼와 별도로 남기므로, UI 링 버퍼를 거치지 않는 진단용 부가 기록이다.
+    ``kind`` 는 ``remote`` / ``web`` / ``ocr`` 등 기존 로그 종류 이름과 동일하게 둔다.
+    """
+    clean = (message or "").replace("\r", " ").replace("\n", " ").strip()
+    if not clean:
+        return
+    if len(clean) > 4000:
+        clean = clean[:3999] + "…"
+    try:
+        d = _log_dir_path()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{kind}_error-{datetime.now():%Y%m%d}.log"
+    except Exception:
+        return
+    ts = datetime.now().strftime("%H:%M:%S")
+    with _sidecar_err_lock:
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {clean}\n")
+        except OSError:
+            pass
 
 
 class LogBuffer:
@@ -123,12 +155,16 @@ class LogBuffer:
 
 
 class LogStore:
-    """OCR/Arduino/Web 세 버퍼를 묶고 백그라운드 드레인 + 파일 영속화를 담당."""
+    """OCR/Arduino/Web/Remote 네 버퍼를 묶고 백그라운드 드레인 + 파일 영속화를 담당.
+
+    에러 부가 파일(``{kind}_error-*.log``, ``app_error-*.log``)은 각 로깅 API 가 직접 쓴다.
+    """
 
     def __init__(self) -> None:
         self.ocr = LogBuffer("ocr")
         self.arduino = LogBuffer("arduino")
         self.web = LogBuffer("web")
+        self.remote = LogBuffer("remote")
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -184,6 +220,11 @@ class LogStore:
         if web_lines:
             self.web.push_many(web_lines)
             self._write_lines("web", web_lines)
+
+        remote_lines = drain_remote_log_lines(500)
+        if remote_lines:
+            self.remote.push_many(remote_lines)
+            self._write_lines("remote", remote_lines)
 
         ard_lines: list[str] = []
         try:
@@ -262,6 +303,8 @@ class LogStore:
     ) -> None:
         """``logs/app-YYYYMMDD.log`` 에 한 줄(또는 여러 줄) 추가.
 
+        ``ERROR``/``CRITICAL`` 이면 동일 내용을 ``logs/app_error-YYYYMMDD.log`` 에도 남긴다.
+
         UI 의 LogConsole 에는 표시하지 않는다(별도 화면이 없음). 단순 파일 진단용.
         ``level`` 은 ``INFO``/``WARN``/``ERROR`` 등 자유 문자열. ``detail`` 이
         주어지면 다음 줄들에 ``    | `` prefix 로 들여쓰기해 traceback 같은 멀티라인을
@@ -281,6 +324,19 @@ class LogStore:
                     if detail:
                         for ln in detail.splitlines():
                             f.write(f"    | {ln}\n")
+                if lvl in ("ERROR", "CRITICAL"):
+                    try:
+                        err_path = (
+                            self._ensure_dir()
+                            / f"app_error-{datetime.now():%Y%m%d}.log"
+                        )
+                        with err_path.open("a", encoding="utf-8") as ef:
+                            ef.write(f"[{ts}] {lvl} {head}\n")
+                            if detail:
+                                for ln in detail.splitlines():
+                                    ef.write(f"    | {ln}\n")
+                    except OSError:
+                        pass
             except OSError:
                 pass
 
@@ -335,6 +391,7 @@ def log_app_event(
 __all__ = [
     "LogBuffer",
     "LogStore",
+    "append_sidecar_error_file",
     "get_log_store",
     "shutdown_log_store",
     "log_app_event",

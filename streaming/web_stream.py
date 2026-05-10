@@ -1069,7 +1069,7 @@ class WebStreamServer:
             loop.run_until_complete(self._startup_async())
         except OSError as e:
             msg = f"웹 송출 포트 바인드 실패 ({self.host}:{self.port}): {e}"
-            log_web_event(msg)
+            log_web_event(msg, error=True)
             _web_print(msg)
             try:
                 loop.run_until_complete(self._shutdown_async())

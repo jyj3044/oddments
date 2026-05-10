@@ -307,9 +307,24 @@ def label_md() -> ft.TextStyle:
     )
 
 
+def button_style_click_cursor(base: ft.ButtonStyle | None = None) -> ft.ButtonStyle:
+    """Material 버튼 스타일에 호버 시 손가락(CLICK) 커서를 넣는다.
+
+    비활성화 상태에서는 BASIC(기본 화살표)만 쓰도록 분리한다.
+    """
+    b = base if base is not None else ft.ButtonStyle()
+    return b.copy(
+        mouse_cursor={
+            ft.ControlState.DEFAULT: ft.MouseCursor.CLICK,
+            ft.ControlState.DISABLED: ft.MouseCursor.BASIC,
+        }
+    )
+
+
 __all__ = [
     "apply_theme_mode",
     "StreamMasterTheme",
+    "button_style_click_cursor",
     "display_lg",
     "headline_lg",
     "headline_md",

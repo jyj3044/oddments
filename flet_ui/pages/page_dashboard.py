@@ -20,6 +20,7 @@ from ..state import AppState
 from ..theme import (
     StreamMasterTheme as T,
     body_md,
+    button_style_click_cursor,
     label_md,
     title_lg,
 )
@@ -515,7 +516,11 @@ def _open_window_picker(
             content=ft.ListView(controls=items, spacing=4),
         ),
         actions=[
-            ft.TextButton("닫기", on_click=lambda _e: _close_self()),
+            ft.TextButton(
+                "닫기",
+                on_click=lambda _e: _close_self(),
+                style=button_style_click_cursor(ft.ButtonStyle()),
+            ),
         ],
         on_dismiss=lambda _e=None: (closed.__setitem__("v", True), _restore_keyboard()),
     )
@@ -648,7 +653,11 @@ def _open_monitor_picker(
             content=ft.ListView(controls=items, spacing=4),
         ),
         actions=[
-            ft.TextButton("닫기", on_click=lambda _e: _close_self()),
+            ft.TextButton(
+                "닫기",
+                on_click=lambda _e: _close_self(),
+                style=button_style_click_cursor(ft.ButtonStyle()),
+            ),
         ],
         on_dismiss=lambda _e=None: (closed.__setitem__("v", True), _restore_keyboard()),
     )

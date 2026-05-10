@@ -8,6 +8,7 @@ from typing import Callable, Optional
 import flet as ft
 
 from .components import (
+    STATUS_ERROR,
     STATUS_IDLE,
     STATUS_OFFLINE,
     STATUS_ONLINE,
@@ -20,6 +21,7 @@ from .state import AppState
 from .theme import (
     StreamMasterTheme as T,
     apply_theme_mode,
+    button_style_click_cursor,
     headline_md,
     label_lg,
     label_md,
@@ -31,7 +33,12 @@ ROUTE_DASHBOARD = "dashboard"
 ROUTE_OCR = "ocr"
 ROUTE_ARDUINO = "arduino"
 ROUTE_WEB = "web"
+ROUTE_REMOTE_SETTINGS = "remote_settings"
+ROUTE_LOGS = "logs"
 ROUTE_APP_SETTINGS = "app_settings"
+
+_SIDEBAR_WIDTH_MIN = 180.0
+_SIDEBAR_WIDTH_MAX = 560.0
 
 
 def _nav_item(
@@ -73,6 +80,13 @@ class StreamMasterApp:
         self.pages = pages
         self.current_route = ROUTE_DASHBOARD
         self.page: ft.Page | None = None
+        sw = state.settings.window.sidebar_width
+        if sw is not None and sw > 0:
+            self._sidebar_width = float(
+                max(_SIDEBAR_WIDTH_MIN, min(_SIDEBAR_WIDTH_MAX, float(sw)))
+            )
+        else:
+            self._sidebar_width = float(T.SIDEBAR_WIDTH)
 
         self._page_container = ft.Container(
             padding=T.MARGIN_DESKTOP,
@@ -82,12 +96,14 @@ class StreamMasterApp:
         )
 
         self._sidebar = self._build_sidebar()
+        self._sidebar_splitter = self._build_sidebar_splitter()
         self._topbar_btn_start: ft.FilledButton | None = None
         self._topbar_btn_stop: ft.OutlinedButton | None = None
         self._topbar = self._build_topbar()
         self._footer_ocr: ft.Row | None = None
         self._footer_arduino: ft.Row | None = None
         self._footer_web: ft.Row | None = None
+        self._footer_remote: ft.Row | None = None
         self._footer = self._build_footer()
         self._root_row: ft.Row | None = None
 
@@ -97,13 +113,15 @@ class StreamMasterApp:
             ROUTE_OCR: ("OCR Settings", ft.Icons.VISIBILITY_OUTLINED),
             ROUTE_ARDUINO: ("Arduino Link", ft.Icons.MEMORY),
             ROUTE_WEB: ("Web Stream", ft.Icons.SETTINGS_INPUT_ANTENNA),
+            ROUTE_REMOTE_SETTINGS: ("Remote Desktop", ft.Icons.SCREEN_SHARE_OUTLINED),
+            ROUTE_LOGS: ("Log", ft.Icons.TERMINAL),
         }
         self._nav_column = ft.Column(spacing=4, expand=True)
         self._settings_nav_slot = ft.Container()
         self._refresh_nav_buttons()
 
         return ft.Container(
-            width=T.SIDEBAR_WIDTH,
+            width=self._sidebar_width,
             bgcolor=T.SURFACE_CONTAINER,
             border=ft.border.only(right=ft.BorderSide(1, T.OUTLINE_VARIANT)),
             padding=ft.padding.symmetric(vertical=24),
@@ -129,6 +147,65 @@ class StreamMasterApp:
                 ],
                 spacing=0,
                 expand=True,
+            ),
+        )
+
+    def _sidebar_drag_delta(self, e: ft.DragUpdateEvent) -> float:
+        if e.primary_delta is not None:
+            return float(e.primary_delta)
+        ld = e.local_delta
+        if ld is not None:
+            return float(ld.x)
+        gd = e.global_delta
+        if gd is not None:
+            return float(gd.x)
+        return 0.0
+
+    def _on_sidebar_drag_update(self, e: ft.DragUpdateEvent) -> None:
+        page = self.page
+        if page is None:
+            return
+        delta = self._sidebar_drag_delta(e)
+        if delta == 0.0:
+            return
+        max_w = _SIDEBAR_WIDTH_MAX
+        try:
+            pw = float(page.width or 1280.0)
+            max_w = min(max_w, max(_SIDEBAR_WIDTH_MIN + 48.0, pw * 0.58))
+        except Exception:
+            pass
+        w = max(_SIDEBAR_WIDTH_MIN, min(max_w, self._sidebar_width + delta))
+        if abs(w - self._sidebar_width) < 0.25:
+            return
+        self._sidebar_width = w
+        self._sidebar.width = w
+        try:
+            page.update()
+        except Exception:
+            pass
+
+    def _persist_sidebar_width(self) -> None:
+        try:
+            self.state.settings.window.sidebar_width = int(round(self._sidebar_width))
+            self.state.save()
+        except Exception:
+            pass
+
+    def _on_sidebar_drag_end(self, _e: ft.DragEndEvent) -> None:
+        self._persist_sidebar_width()
+
+    def _build_sidebar_splitter(self) -> ft.Container:
+        # 시각적 구분선(회색 막대) 없이 사이드바와 동색 — 드래그만 가능한 좁은 띠.
+        # Row 에서 가로 expand 주면 본문 폭을 잡아먹으므로 폭 고정 유지.
+        hit = ft.Container(expand=True, bgcolor=T.SURFACE_CONTAINER)
+        return ft.Container(
+            width=6,
+            bgcolor=T.SURFACE_CONTAINER,
+            content=ft.GestureDetector(
+                mouse_cursor=ft.MouseCursor.RESIZE_LEFT_RIGHT,
+                on_horizontal_drag_update=self._on_sidebar_drag_update,
+                on_horizontal_drag_end=self._on_sidebar_drag_end,
+                content=hit,
             ),
         )
 
@@ -170,13 +247,13 @@ class StreamMasterApp:
 
             shutdown_arduino_log_poller_if_any()
         elif leaving == ROUTE_WEB:
-            from .pages.page_web import shutdown_web_log_poller_if_any
+            from .pages.page_web import shutdown_web_viewer_poller_if_any
 
-            shutdown_web_log_poller_if_any()
-        elif leaving == ROUTE_OCR:
-            from .pages.page_ocr import shutdown_ocr_log_poller_if_any
+            shutdown_web_viewer_poller_if_any()
+        elif leaving == ROUTE_LOGS:
+            from .pages.page_logs import shutdown_logs_page_poller_if_any
 
-            shutdown_ocr_log_poller_if_any()
+            shutdown_logs_page_poller_if_any()
 
     def _render_current_page(self) -> None:
         builder = self.pages.get(self.current_route)
@@ -197,32 +274,75 @@ class StreamMasterApp:
                 )
             except Exception:
                 pass
-            self._page_container.content = ft.Text(
-                f"페이지 렌더 오류: {exc}", color=T.ERROR
+            page = self.page
+
+            def _goto_dashboard(_e: ft.ControlEvent) -> None:
+                self._goto(ROUTE_DASHBOARD)
+
+            self._page_container.content = ft.Column(
+                spacing=T.SPACE_MD,
+                horizontal_alignment=ft.CrossAxisAlignment.START,
+                controls=[
+                    ft.Text(
+                        "이 페이지를 그리는 중 오류가 났습니다. 아래에서 다른 메뉴로 "
+                        "이동할 수 있습니다.",
+                        style=label_lg(),
+                        color=T.ON_SURFACE_VARIANT,
+                    ),
+                    ft.Text(str(exc), color=T.ERROR),
+                    ft.OutlinedButton(
+                        text="대시보드로 이동",
+                        icon=ft.Icons.HOME_OUTLINED,
+                        on_click=_goto_dashboard,
+                        style=button_style_click_cursor(
+                            ft.ButtonStyle(
+                                color=T.ON_SURFACE,
+                                side=ft.BorderSide(1, T.OUTLINE),
+                                padding=ft.padding.symmetric(
+                                    horizontal=18, vertical=12
+                                ),
+                            )
+                        ),
+                    ),
+                ],
             )
+            if page is not None:
+                try:
+                    show_snack(
+                        page,
+                        f"페이지 오류: {exc}",
+                        severity="error",
+                        duration_sec=12,
+                    )
+                except Exception:
+                    pass
 
     def _build_topbar(self) -> ft.Container:
         self._topbar_btn_stop = ft.OutlinedButton(
             text="Stop",
             on_click=self._on_click_stop,
-            style=ft.ButtonStyle(
-                color=T.ON_SURFACE,
-                bgcolor=T.SURFACE_CONTAINER_LOWEST,
-                side=ft.BorderSide(1, T.OUTLINE),
-                padding=ft.padding.symmetric(horizontal=16, vertical=10),
-                shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
-                text_style=label_lg(),
+            style=button_style_click_cursor(
+                ft.ButtonStyle(
+                    color=T.ON_SURFACE,
+                    bgcolor=T.SURFACE_CONTAINER_LOWEST,
+                    side=ft.BorderSide(1, T.OUTLINE),
+                    padding=ft.padding.symmetric(horizontal=16, vertical=10),
+                    shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
+                    text_style=label_lg(),
+                )
             ),
         )
         self._topbar_btn_start = ft.FilledButton(
             text="Start",
             on_click=self._on_click_start,
-            style=ft.ButtonStyle(
-                bgcolor=T.PRIMARY,
-                color=T.ON_PRIMARY,
-                padding=ft.padding.symmetric(horizontal=16, vertical=10),
-                shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
-                text_style=label_lg(),
+            style=button_style_click_cursor(
+                ft.ButtonStyle(
+                    bgcolor=T.PRIMARY,
+                    color=T.ON_PRIMARY,
+                    padding=ft.padding.symmetric(horizontal=16, vertical=10),
+                    shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
+                    text_style=label_lg(),
+                )
             ),
         )
         return ft.Container(
@@ -242,6 +362,7 @@ class StreamMasterApp:
         self._footer_ocr = status_dot(status=STATUS_OFFLINE, label="OCR: Offline")
         self._footer_arduino = status_dot(status=STATUS_OFFLINE, label="Arduino: Offline")
         self._footer_web = status_dot(status=STATUS_OFFLINE, label="Web: Offline")
+        self._footer_remote = status_dot(status=STATUS_OFFLINE, label="Host: Offline")
         return ft.Container(
             height=T.FOOTER_HEIGHT,
             bgcolor=T.SURFACE_CONTAINER_LOW,
@@ -255,6 +376,7 @@ class StreamMasterApp:
                     self._footer_ocr,
                     self._footer_arduino,
                     self._footer_web,
+                    self._footer_remote,
                 ],
             ),
         )
@@ -323,6 +445,23 @@ class StreamMasterApp:
             label=f"Web: {web_status.capitalize()}",
         )
 
+        # 원격 호스트(WebRTC 송출): 미사용·중지 → offline / 송출 중 → online /
+        # 마지막 시작 실패 → error
+        if self.state.remote_host_active():
+            rh_status = STATUS_ONLINE
+            rh_label = "Host: Online"
+        elif self.state.remote_host_has_start_error():
+            rh_status = STATUS_ERROR
+            rh_label = "Host: Error"
+        else:
+            rh_status = STATUS_OFFLINE
+            rh_label = "Host: Offline"
+        self._update_status_row(
+            self._footer_remote,
+            status=rh_status,
+            label=rh_label,
+        )
+
     @staticmethod
     def _update_status_row(row: Optional[ft.Row], *, status: str, label: str) -> None:
         if row is None or not row.controls:
@@ -367,15 +506,17 @@ class StreamMasterApp:
         page.bgcolor = T.BACKGROUND
 
         self._sidebar = self._build_sidebar()
+        self._sidebar_splitter = self._build_sidebar_splitter()
         self._topbar = self._build_topbar()
         self._footer = self._build_footer()
         self._page_container.bgcolor = T.SURFACE_BRIGHT
 
         root = self._root_row
-        if root is None or len(root.controls) < 2:
+        if root is None or len(root.controls) < 3:
             return
         root.controls[0] = self._sidebar
-        outer = root.controls[1]
+        root.controls[1] = self._sidebar_splitter
+        outer = root.controls[2]
         try:
             outer.bgcolor = T.SURFACE_BRIGHT
         except Exception:
@@ -432,6 +573,7 @@ class StreamMasterApp:
         layout = ft.Row(
             controls=[
                 self._sidebar,
+                self._sidebar_splitter,
                 ft.Container(
                     expand=True,
                     bgcolor=T.SURFACE_BRIGHT,
@@ -448,6 +590,7 @@ class StreamMasterApp:
             ],
             spacing=0,
             expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
         self._root_row = layout
 
@@ -477,5 +620,7 @@ __all__ = [
     "ROUTE_OCR",
     "ROUTE_ARDUINO",
     "ROUTE_WEB",
+    "ROUTE_REMOTE_SETTINGS",
+    "ROUTE_LOGS",
     "ROUTE_APP_SETTINGS",
 ]
