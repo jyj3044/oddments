@@ -1,4 +1,4 @@
-"""BGR ndarray 리사이즈 — OpenCV 대신 Pillow."""
+"""BGR ndarray 리사이즈 — OpenCV 대신 Pillow (cv2·PyAV 동시 로딩 부담 완화)."""
 
 from __future__ import annotations
 

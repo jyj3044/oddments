@@ -27,6 +27,7 @@ from capture.thread import CaptureThread, enumerate_monitors
 from .pil_bgr import resize_bgr
 from .remote_log import log_remote_event
 from .remote_presets import normalize_preset_id, preset_dimensions
+from .rtc_ice import rtc_configuration_from_stun_turn
 from .web_stream import (
     SharedAudioBuffer,
     SharedAudioTrack,
@@ -662,7 +663,10 @@ class RemoteHostServer:
             return False
 
     def _invoke_on_host_loop(self, fn: Callable[[], _T], *, timeout: float = 120.0) -> _T:
-        """CGVirtualDisplay 생성·해제는 aiohttp 이벤트 루프 스레드에서만 호출한다."""
+        """CGVirtualDisplay 생성·해제는 aiohttp 이벤트 루프 스레드에서만 호출한다.
+
+        run_in_executor 워커에서 vd.release 하면 세그폴트가 날 수 있어 직렬화한다.
+        """
         loop = self._loop
         if loop is None or not loop.is_running():
             return fn()
@@ -735,7 +739,7 @@ class RemoteHostServer:
             )
             w, h = preset_dimensions(
                 self._resolution_preset_id,
-                host_native=_darwin_main_pixel_size,
+                host_native=_darwin_main_pixel_size(),
             )
             w = max(320, int(w))
             h = max(240, int(h))
@@ -936,6 +940,7 @@ class RemoteHostServer:
         mic = None
         needle = self._darwin_audio_device.lower()
         try:
+            # 맥: soundcard 가 loopback=True 일 때 경고·불안정 CoreAudio 경로를 탄다.
             all_m = list(
                 sc.all_microphones(include_loopback=(sys.platform != "darwin"))
             )
@@ -1396,4 +1401,5 @@ class RemoteHostServer:
 __all__ = [
     "RemoteHostServer",
     "default_rtc_configuration",
+    "rtc_configuration_from_stun_turn",
 ]

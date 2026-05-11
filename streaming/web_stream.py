@@ -20,12 +20,12 @@ from pathlib import Path
 from typing import Optional
 
 import av
-import cv2
 import numpy as np
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 
+from .pil_bgr import resize_bgr
 from .web_log import log_web_event
 
 
@@ -74,7 +74,7 @@ def _resize_bgr_max_side(bgr: np.ndarray, max_side: int) -> np.ndarray:
     scale = float(max_side) / float(long_edge)
     nw = max(1, int(round(w * scale)))
     nh = max(1, int(round(h * scale)))
-    return cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    return resize_bgr(bgr, nw, nh)
 
 
 def _even_dims_bgr(bgr: np.ndarray) -> np.ndarray:
@@ -749,10 +749,8 @@ class SharedVideoTrack(VideoStreamTrack):
         if snap is not None and snap.size:
             resized = _resize_bgr_max_side(snap, self._max_stream_side)
             self._last = np.ascontiguousarray(_even_dims_bgr(resized))
-        rgb = cv2.cvtColor(self._last, cv2.COLOR_BGR2RGB)
-        vf = av.VideoFrame.from_ndarray(
-            np.ascontiguousarray(rgb), format="rgb24"
-        )
+        rgb = np.ascontiguousarray(self._last[:, :, ::-1])
+        vf = av.VideoFrame.from_ndarray(rgb, format="rgb24")
         vf.pts = self._pts
         vf.time_base = self._time_base
         self._pts += self._pts_step
@@ -1033,6 +1031,10 @@ class WebStreamServer:
         self._audio_low_signal_logged = False
 
     def _audio_capture_loop(self) -> None:
+        # Windows WASAPI 루프백만 지원. 맥에서 soundcard 를 켜면 CoreAudio 경로가
+        # PyAV/OpenCV FFmpeg 스택과 겹칠 때 프로세스 SIGSEGV 가 보고된 적이 있다.
+        if sys.platform != "win32":
+            return
         try:
             import soundcard as sc
         except Exception as e:

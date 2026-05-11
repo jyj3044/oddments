@@ -36,6 +36,10 @@ ssl._create_default_https_context = lambda cafile=_ssl_ca: ssl.create_default_co
     cafile=cafile
 )
 
+# PyAV(av)·OpenCV(cv2) 가 서로 다른 FFmpeg 를 묶기 때문에 둘 다 쓰면 맥에서 objc 중복 경고가 난다.
+# aiortc 쪽을 가능한 한 먼저 로드한다(경고는 남을 수 있음).
+from streaming.rtc_ice import rtc_configuration_from_stun_turn
+
 import cv2
 import flet as ft
 import numpy as np
