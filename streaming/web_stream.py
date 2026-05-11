@@ -634,21 +634,50 @@ _VIEWER_HTML = """<!doctype html>
 
 
 class SharedVideoBuffer:
-    """캡처 스레드가 최신 BGR 프레임을 기록하고 트랙이 읽는 공유 버퍼."""
+    """캡처 스레드가 최신 BGR 프레임을 기록하고 트랙이 읽는 공유 버퍼.
+
+    트랙은 :meth:`subscribe` 로 받은 ``asyncio.Event`` 를 기다려 새 프레임 도착 시
+    즉시 깨어난다(고정 ``sleep(1/fps)`` 보다 평균 ~1/(2·fps) 지연 감소).
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._latest: Optional[np.ndarray] = None
+        self._waiters: list[
+            tuple[asyncio.AbstractEventLoop, asyncio.Event]
+        ] = []
 
     def push(self, frame: np.ndarray) -> None:
         with self._lock:
             self._latest = frame.copy()
+            waiters = list(self._waiters)
+        for loop, ev in waiters:
+            try:
+                loop.call_soon_threadsafe(ev.set)
+            except RuntimeError:
+                # 루프가 이미 닫힌 경우 — 다음 unsubscribe 에서 제거된다.
+                pass
 
     def snapshot(self) -> Optional[np.ndarray]:
         with self._lock:
             if self._latest is None:
                 return None
             return self._latest.copy()
+
+    def subscribe(self) -> asyncio.Event:
+        """현재 이벤트 루프에서 동작하는 새 프레임 알림 이벤트."""
+        loop = asyncio.get_running_loop()
+        ev = asyncio.Event()
+        with self._lock:
+            self._waiters.append((loop, ev))
+            if self._latest is not None:
+                # 이미 프레임이 있으면 첫 recv 가 즉시 진행되도록 미리 세팅.
+                ev.set()
+        return ev
+
+    def unsubscribe(self, ev: asyncio.Event) -> None:
+        with self._lock:
+            self._waiters = [(l, e) for (l, e) in self._waiters if e is not ev]
 
 
 class SharedAudioBuffer:
@@ -725,7 +754,11 @@ class SharedAudioBuffer:
 
 
 class SharedVideoTrack(VideoStreamTrack):
-    """공유 버퍼의 최신 프레임을 일정 FPS로 송출하는 WebRTC 비디오 트랙."""
+    """공유 버퍼의 최신 프레임을 송출하는 WebRTC 비디오 트랙.
+
+    push 이벤트로 즉시 깨어나며, 인코더 과부하 방지를 위해 최소 ``1/fps``
+    간격을 강제한다. 새 프레임이 없으면 마지막 프레임을 재송출(연결 유지)한다.
+    """
 
     def __init__(
         self,
@@ -742,12 +775,35 @@ class SharedVideoTrack(VideoStreamTrack):
         self._pts = 0
         self._time_base = Fraction(1, 90000)
         self._pts_step = max(1, int(round(90000.0 / self._fps)))
+        self._min_interval = 1.0 / self._fps
+        # 새 프레임이 한참 안 오면 키프레임 유지를 위해 다시 보내야 하므로
+        # min_interval 의 몇 배까지만 대기한다.
+        self._wait_timeout = max(0.25, self._min_interval * 4.0)
+        self._last_send_t: float = 0.0
+        self._event: Optional[asyncio.Event] = None
 
     async def recv(self) -> av.VideoFrame:
         if self.readyState != "live":
             raise MediaStreamError
         try:
-            await asyncio.sleep(1.0 / self._fps)
+            if self._event is None:
+                self._event = self._shared.subscribe()
+
+            # 1) 최소 간격 보호 (캡처가 fps 보다 빠르게 push 해도 인코더 보호)
+            now = time.perf_counter()
+            if self._last_send_t > 0.0:
+                slack = self._min_interval - (now - self._last_send_t)
+                if slack > 0:
+                    await asyncio.sleep(slack)
+
+            # 2) 새 프레임 도착 대기 (timeout 안에 안 오면 마지막 프레임 재송출)
+            ev = self._event
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=self._wait_timeout)
+            except asyncio.TimeoutError:
+                pass
+            ev.clear()
+
             snap = self._shared.snapshot()
             if snap is not None and snap.size:
                 resized = _resize_bgr_max_side(snap, self._max_stream_side)
@@ -757,11 +813,22 @@ class SharedVideoTrack(VideoStreamTrack):
             vf.pts = self._pts
             vf.time_base = self._time_base
             self._pts += self._pts_step
+            self._last_send_t = time.perf_counter()
             return vf
         except MediaStreamError:
             raise
         except Exception:
             raise MediaStreamError from None
+
+    def stop(self) -> None:  # type: ignore[override]
+        ev = self._event
+        self._event = None
+        if ev is not None:
+            try:
+                self._shared.unsubscribe(ev)
+            except Exception:
+                pass
+        super().stop()
 
 
 class SharedAudioTrack(AudioStreamTrack):
