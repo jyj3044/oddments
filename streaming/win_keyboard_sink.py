@@ -25,6 +25,7 @@ VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
 VK_LMENU = 0xA4
 VK_RMENU = 0xA5
+VK_CAPITAL = 0x14
 
 _SUPPRESS_VKS = frozenset(
     {
@@ -34,6 +35,7 @@ _SUPPRESS_VKS = frozenset(
         VK_RCONTROL,
         VK_LMENU,
         VK_RMENU,
+        VK_CAPITAL,
     }
 )
 
@@ -44,6 +46,7 @@ _VK_TO_TOKEN = {
     VK_RCONTROL: "ctrl_r",
     VK_LMENU: "alt_l",
     VK_RMENU: "alt_r",
+    VK_CAPITAL: "caps_lock",
 }
 
 # SetWindowsHookEx 는 호출마다 새로 만든 WINFUNCTYPE 과 호환되지 않는다.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,21 @@ from .remote_log import log_remote_event
 from .web_stream import SharedVideoBuffer, SharedVideoTrack, _even_dims_bgr
 
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="remote-input")
+
+
+def _darwin_backing_scale() -> float:
+    """메인 디스플레이 Retina 배율. mss 는 물리 픽셀, Quartz 마우스는 보통 논리 포인트."""
+    if sys.platform != "darwin":
+        return 1.0
+    try:
+        from AppKit import NSScreen  # type: ignore[import-untyped]
+
+        scr = NSScreen.mainScreen()
+        if scr is not None:
+            return float(scr.backingScaleFactor())
+    except Exception:
+        pass
+    return 1.0
 
 
 def rtc_configuration_from_stun_turn(
@@ -91,8 +107,14 @@ def _prepare_frame(
 def _inject_input_message(
     raw: str,
     rect: tuple[int, int, int, int],
+    *,
+    pointer_scale: float = 1.0,
 ) -> None:
-    """JSON 한 줄을 파싱해 마우스·키보드를 주입한다."""
+    """JSON 한 줄을 파싱해 마우스·키보드를 주입한다.
+
+    pointer_scale: 맥 Retina 에서 mss/geom 이 물리 픽셀일 때 Quartz 포인터 좌표로 변환
+    (보통 2.0 → 나눔).
+    """
     try:
         msg = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -159,6 +181,8 @@ def _inject_input_message(
         "f10": Key.f10,
         "f11": Key.f11,
         "f12": Key.f12,
+        # 맥 한영(캡스락 길게 누르기 등)은 합성 이벤트에서 항상 재현되지는 않음.
+        "caps_lock": Key.caps_lock,
     }
 
     def _press_key(token: str, down: bool) -> None:
@@ -183,8 +207,15 @@ def _inject_input_message(
             return
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
-        ax = int(left + nx * float(w))
-        ay = int(top + ny * float(h))
+        ax_f = float(left) + nx * float(w)
+        ay_f = float(top) + ny * float(h)
+        ps = max(float(pointer_scale), 1e-6)
+        if sys.platform == "darwin" and ps > 1.01:
+            ax = int(ax_f / ps)
+            ay = int(ay_f / ps)
+        else:
+            ax = int(ax_f)
+            ay = int(ay_f)
         mouse.position = (ax, ay)
         return
 
@@ -252,10 +283,20 @@ def _dispatch_dc_payload(
     try:
         msg = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        _POOL.submit(_inject_input_message, raw, geom)
+        _POOL.submit(
+            _inject_input_message,
+            raw,
+            geom,
+            pointer_scale=srv._pointer_scale,
+        )
         return
     if not isinstance(msg, dict):
-        _POOL.submit(_inject_input_message, raw, geom)
+        _POOL.submit(
+            _inject_input_message,
+            raw,
+            geom,
+            pointer_scale=srv._pointer_scale,
+        )
         return
     t = str(msg.get("t", "")).lower()
     if t == "clip_get":
@@ -280,7 +321,12 @@ def _dispatch_dc_payload(
         text = str(msg.get("text", ""))
         _POOL.submit(_clipboard_write_text, text)
         return
-    _POOL.submit(_inject_input_message, raw, geom)
+    _POOL.submit(
+        _inject_input_message,
+        raw,
+        geom,
+        pointer_scale=srv._pointer_scale,
+    )
 
 
 class RemoteHostServer:
@@ -321,6 +367,8 @@ class RemoteHostServer:
         self._capture_lock = threading.Lock()
         self._geom: Optional[tuple[int, int, int, int]] = None
         self._meta_pending: set[object] = set()
+        # 맥 Retina: mss/monitor geom 은 물리 픽셀 → pynput 는 논리 포인트일 때 나눔.
+        self._pointer_scale: float = 1.0
 
     def _auth_accept(self, token_param: object | None) -> bool:
         exp = self._auth_token
@@ -340,6 +388,20 @@ class RemoteHostServer:
 
     def _push_frame(self, frame: np.ndarray) -> None:
         try:
+            if (
+                sys.platform == "darwin"
+                and self._geom is not None
+                and self._pointer_scale <= 1.01
+            ):
+                try:
+                    rh, rw = int(frame.shape[0]), int(frame.shape[1])
+                    _gl, _gt, gw, gh = self._geom
+                    if abs(rw - gw) <= 4 and abs(rh - gh) <= 4:
+                        s = _darwin_backing_scale()
+                        if s > 1.01:
+                            self._pointer_scale = s
+                except Exception:
+                    pass
             out = _prepare_frame(
                 frame,
                 capture_width=self.capture_width,

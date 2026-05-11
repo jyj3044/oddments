@@ -257,6 +257,8 @@ class RemoteClientProfile:
     host: str = ""
     port: int = 49152
     auth_token: str = ""
+    # True 이면 Windows 뷰어→macOS 호스트 시 Ctrl=Control, Win=⌥, Alt=⌘ 로 전송.
+    mac_modifier_remap: bool = False
 
 
 @dataclass
@@ -483,6 +485,9 @@ class AppState:
                 c.host = str(rc.get("host", c.host) or "")
                 c.port = _safe_u16_port(rc.get("port", c.port), c.port)
                 c.auth_token = str(rc.get("auth_token", c.auth_token) or "")
+                c.mac_modifier_remap = bool(
+                    rc.get("mac_modifier_remap", c.mac_modifier_remap)
+                )
 
     def _serialize_settings_dict(self) -> dict:
         det = self.settings.detection
@@ -545,6 +550,7 @@ class AppState:
                     "host": rc.host,
                     "port": rc.port,
                     "auth_token": rc.auth_token,
+                    "mac_modifier_remap": rc.mac_modifier_remap,
                 },
             },
         }

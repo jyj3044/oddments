@@ -270,6 +270,16 @@ def build_remote_settings(state: AppState) -> ft.Control:
         expand=True,
         on_change=lambda e: _persist_client_auth(state, e.control.value),
     )
+    mac_mod_switch = ft.Switch(
+        label="macOS 호스트용 수정자 매핑",
+        value=bool(cp.mac_modifier_remap),
+        tooltip=(
+            "켜면 원격 뷰어에서 Ctrl→Control, ⊞ Win→⌥ Option, Alt→⌘ Command 로 보냅니다."
+        ),
+        on_change=lambda e: _persist_mac_modifier_remap(
+            state, bool(getattr(e.control, "value", False))
+        ),
+    )
 
     def _open_viewer(_e: ft.ControlEvent) -> None:
         ok, err = state.save()
@@ -313,6 +323,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
                     vertical_alignment=ft.CrossAxisAlignment.START,
                     controls=[client_port, client_auth, open_btn],
                 ),
+                mac_mod_switch,
                 ft.Text(
                     "Flet 단일 프로세스는 다중 OS 창을 지원하지 않아, 뷰어는 두 번째 프로세스로 띄웁니다.",
                     style=body_md(),
@@ -474,6 +485,11 @@ def _persist_client_host(state: AppState, raw: str) -> None:
 def _persist_client_port(state: AppState, raw: str) -> None:
     p = _clamp_port_str(raw, state.settings.remote.client.port)
     state.settings.remote.client.port = p
+    state.save()
+
+
+def _persist_mac_modifier_remap(state: AppState, enabled: bool) -> None:
+    state.settings.remote.client.mac_modifier_remap = enabled
     state.save()
 
 

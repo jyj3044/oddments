@@ -524,11 +524,28 @@ def remote_viewer_main(page: ft.Page) -> None:
 
     # 원격 스트림 종횡비(호스트 메타 또는 첫 프레임). 입력 좌표 정규화에 사용.
     stream_wh = [1280.0, 720.0]
+    # 뷰포트(네비 제외 영역) 크기 — on_size_change 로 갱신. 픽셀 박스 레이아웃에 사용.
+    view_size = [1280.0, 720.0]
 
-    def _stream_aspect_ratio() -> float:
-        sw = max(1.0, float(stream_wh[0]))
-        sh = max(1.0, float(stream_wh[1]))
-        return sw / sh
+    def _contain_fit_disp_xy() -> tuple[float, float, float, float]:
+        """BoxFit.contain 과 동일: 표시 영역 (w,h) 및 좌상단 오프셋 (ox,oy)."""
+        cw = max(1.0, view_size[0])
+        ch = max(1.0, view_size[1])
+        sw = max(1.0, stream_wh[0])
+        sh = max(1.0, stream_wh[1])
+        ar_s = sw / sh
+        ar_c = cw / ch
+        if ar_c > ar_s:
+            disp_h = ch
+            disp_w = disp_h * ar_s
+            ox = (cw - disp_w) * 0.5
+            oy = 0.0
+        else:
+            disp_w = cw
+            disp_h = disp_w / ar_s
+            ox = 0.0
+            oy = (ch - disp_h) * 0.5
+        return max(1.0, disp_w), max(1.0, disp_h), ox, oy
 
     img_view = ft.Image(
         src=_REMOTE_PLACEHOLDER_DATA_URI,
@@ -547,25 +564,31 @@ def remote_viewer_main(page: ft.Page) -> None:
             ),
         ),
     )
-    # 종횡비 고정 박스 + CONTAIN → 창 비율과 무관하게 항상 전체 프레임 표시(레터박스).
+    # 픽셀 박스 + margin(ox,oy) = BoxFit.contain 과 동일 배치(세로·가로 중앙).
+    _dw, _dh, _ox, _oy = _contain_fit_disp_xy()
     remote_frame = ft.Container(
-        expand=True,
-        aspect_ratio=_stream_aspect_ratio(),
+        expand=False,
+        width=float(_dw),
+        height=float(_dh),
+        margin=ft.margin.only(left=float(_ox), top=float(_oy)),
         alignment=ft.Alignment.CENTER,
         bgcolor=T.SURFACE_BRIGHT,
         clip_behavior=ft.ClipBehavior.NONE,
         content=img_view,
     )
 
-    def _sync_remote_frame_aspect() -> None:
+    def _layout_remote_frame_pixels() -> None:
+        dw, dh, ox, oy = _contain_fit_disp_xy()
         try:
-            remote_frame.aspect_ratio = _stream_aspect_ratio()
+            remote_frame.width = float(dw)
+            remote_frame.height = float(dh)
+            remote_frame.margin = ft.margin.only(left=float(ox), top=float(oy))
         except Exception:
             pass
 
     def _schedule_remote_frame_aspect() -> None:
         async def _run() -> None:
-            _sync_remote_frame_aspect()
+            _layout_remote_frame_pixels()
             try:
                 remote_frame.update()
             except Exception:
@@ -578,28 +601,12 @@ def remote_viewer_main(page: ft.Page) -> None:
         except Exception:
             pass
 
-    view_size = [1280.0, 720.0]
     last_emit = [0.0]
     last_hover = [0.0]
 
     def _norm_xy(local_pos: object | None) -> tuple[float, float]:
         """뷰포트 로컬 좌표 → 호스트 기준 0..1. BoxFit.contain 레터박스 보정."""
-        cw = max(1.0, view_size[0])
-        ch = max(1.0, view_size[1])
-        sw = max(1.0, stream_wh[0])
-        sh = max(1.0, stream_wh[1])
-        ar_s = sw / sh
-        ar_c = cw / ch
-        if ar_c > ar_s:
-            disp_h = ch
-            disp_w = disp_h * ar_s
-            ox = (cw - disp_w) * 0.5
-            oy = 0.0
-        else:
-            disp_w = cw
-            disp_h = disp_w / ar_s
-            ox = 0.0
-            oy = (ch - disp_h) * 0.5
+        disp_w, disp_h, ox, oy = _contain_fit_disp_xy()
         if local_pos is None:
             return 0.5, 0.5
         try:
@@ -634,9 +641,34 @@ def remote_viewer_main(page: ft.Page) -> None:
             except Exception:
                 pass
 
+    def _remap_key_token_for_mac_host(tok: str) -> str:
+        """Windows → macOS 호스트 시 수정자 토큰 치환 (⊞→⌥, Alt→⌘, Ctrl 유지)."""
+        if not getattr(rc, "mac_modifier_remap", False):
+            return tok
+        if tok == "cmd":
+            return "alt_l"
+        if tok == "cmd_r":
+            return "alt_r"
+        if tok == "alt_l":
+            return "cmd"
+        if tok == "alt_r":
+            return "cmd_r"
+        return tok
+
+    def _send_remote_key(tok: str, down: bool) -> None:
+        if not tok:
+            return
+        _send_json(
+            {
+                "t": "key",
+                "k": _remap_key_token_for_mac_host(tok),
+                "down": down,
+            }
+        )
+
     def _send_mod_from_hook(tok: str, down: bool) -> None:
         """Windows LL 훅 스레드에서 호출 — RemoteViewerSession.send_json 이 thread-safe."""
-        _send_json({"t": "key", "k": tok, "down": down})
+        _send_remote_key(tok, down)
 
     async def _focus_remote_viewport() -> None:
         viewer_kb_capture[0] = True
@@ -685,7 +717,7 @@ def remote_viewer_main(page: ft.Page) -> None:
                         stream_wh[1] = float(max(1, int(sh)))
                 except (TypeError, ValueError):
                     pass
-                _sync_remote_frame_aspect()
+                _layout_remote_frame_pixels()
                 try:
                     if mw and mh:
                         res_line.value = f"{int(mw)}×{int(mh)}"
@@ -732,55 +764,6 @@ def remote_viewer_main(page: ft.Page) -> None:
         style=body_md(),
         color=T.ON_SURFACE_VARIANT,
     )
-    # True: 호버마다 move 전송. False: 버튼을 누른 동안만 move(드래그 유지).
-    hover_sync_enabled = [True]
-    remote_btn_mask = [0]
-    # True: 클릭 직전에 move 전송 → 호스트가 해당 좌표로 커서를 옮김(실사용). False: 순간이동 없음·위치 불일치.
-    click_coord_enabled = [True]
-
-    def _on_hover_sync_change(e: ft.ControlEvent) -> None:
-        try:
-            hover_sync_enabled[0] = bool(getattr(e.control, "value", True))
-        except Exception:
-            pass
-
-    def _on_click_coord_change(e: ft.ControlEvent) -> None:
-        try:
-            click_coord_enabled[0] = bool(getattr(e.control, "value", True))
-        except Exception:
-            pass
-
-    remote_mouse_hint = ft.Text(
-        "한 PC에서 호스트와 뷰어를 같이 쓰면, 원격 제어를 위해 클릭할 때마다 "
-        "좌표를 보내 물리 커서가 캡처 화면 쪽으로 움직입니다. 키보드만 확인할 때는 "
-        "아래를 조합해 보세요. 정확한 마우스 검증은 VM, 다른 PC, 또는 캡처를 다른 "
-        "모니터로 두는 구성이 안전합니다.",
-        style=label_md(),
-        color=T.ON_SURFACE_VARIANT,
-    )
-
-    hover_sync_switch = ft.Switch(
-        label="호버 시 원격 커서 이동",
-        value=True,
-        tooltip=(
-            "끄면 마우스만 지나갈 때는 원격 커서가 움직이지 않습니다. "
-            "드래그 중에는 계속 이동이 전송됩니다. 스크롤은 그대로입니다."
-        ),
-        on_change=_on_hover_sync_change,
-    )
-
-    click_coord_switch = ft.Switch(
-        label="클릭 시 화면 좌표 맞추기",
-        value=True,
-        tooltip=(
-            "끄면 클릭 직전에 좌표를 보내지 않아 같은 PC에서 커서가 캡처 화면으로 "
-            "점프하지 않습니다. 대신 클릭이 영상 속 위치와 맞지 않고(현재 OS 커서 "
-            "위치 기준) 드래그·정밀 조작은 기대할 수 없습니다. 키/버튼 수신 여부만 "
-            "볼 때 쓰세요."
-        ),
-        on_change=_on_click_coord_change,
-    )
-
     expanded_block = ft.Column(
         spacing=10,
         controls=[
@@ -788,9 +771,6 @@ def remote_viewer_main(page: ft.Page) -> None:
             sb_target,
             conn_status,
             res_line,
-            remote_mouse_hint,
-            hover_sync_switch,
-            click_coord_switch,
         ],
     )
 
@@ -847,6 +827,7 @@ def remote_viewer_main(page: ft.Page) -> None:
             page.update()
         except Exception:
             pass
+        _sync_view_layout()
 
     def _persist_remote_rail_width() -> None:
         try:
@@ -892,9 +873,52 @@ def remote_viewer_main(page: ft.Page) -> None:
             page.update()
         except Exception:
             pass
+        _sync_view_layout()
 
     toggle_rail_btn.on_click = _on_toggle_rail
     _sync_rail_layout()
+
+    def _remote_pane_chrome_w() -> float:
+        """사이드바 + 스플리터 (접힘 시 스플리터 숨김 → 폭 0)."""
+        try:
+            sw = float(sidebar_container.width or 0)
+        except Exception:
+            sw = float(rail_width_user[0])
+        split_w = 6.0 if rail_expanded[0] else 0.0
+        return max(0.0, sw + split_w)
+
+    def _viewport_size_from_window() -> tuple[float, float]:
+        """원격 영역만의 논리 크기. inner on_size_change 만으로는 창 확대 시 갱신이 누락될 수 있음."""
+        pw = ph = 0.0
+        try:
+            pw = float(page.width or 0)
+            ph = float(page.height or 0)
+        except Exception:
+            pass
+        if pw < 2 or ph < 2:
+            try:
+                win = getattr(page, "window", None)
+                if win is not None:
+                    pw = float(getattr(win, "width", 0) or 0)
+                    ph = float(getattr(win, "height", 0) or 0)
+            except Exception:
+                pass
+        if pw < 2 or ph < 2:
+            return max(1.0, view_size[0]), max(1.0, view_size[1])
+        chrome = _remote_pane_chrome_w()
+        cw = max(1.0, pw - chrome)
+        ch = max(1.0, ph)
+        return cw, ch
+
+    def _sync_view_layout() -> None:
+        cw, ch = _viewport_size_from_window()
+        view_size[0] = cw
+        view_size[1] = ch
+        _layout_remote_frame_pixels()
+        try:
+            remote_frame.update()
+        except Exception:
+            pass
 
     def _on_frame(rgb: np.ndarray) -> None:
         now = time.monotonic()
@@ -1016,6 +1040,7 @@ def remote_viewer_main(page: ft.Page) -> None:
             "Backspace": "backspace",
             "Delete": "delete",
             "Tab": "tab",
+            "Caps Lock": "caps_lock",
             " ": "space",
             "Arrow Left": "left",
             "Arrow Right": "right",
@@ -1046,18 +1071,17 @@ def remote_viewer_main(page: ft.Page) -> None:
             "alt_right": "alt_r",
             "meta_left": "cmd",
             "meta_right": "cmd_r",
+            "caps_lock": "caps_lock",
         }
         if low in aliases:
             return aliases[low]
         return low
 
-    def _on_vp_size(e: ft.LayoutSizeChangeEvent) -> None:
-        view_size[0] = max(1.0, float(e.width))
-        view_size[1] = max(1.0, float(e.height))
+    def _on_vp_size(_e: ft.LayoutSizeChangeEvent) -> None:
+        # 이벤트 값만 쓰면 창을 다시 키울 때 크기가 예전 최소값에 묶일 수 있음 → 창 기준 동기화.
+        _sync_view_layout()
 
     def _hover(_e: ft.PointerEvent) -> None:
-        if not hover_sync_enabled[0] and remote_btn_mask[0] == 0:
-            return
         now = time.monotonic()
         if now - last_hover[0] < 0.045:
             return
@@ -1066,20 +1090,13 @@ def remote_viewer_main(page: ft.Page) -> None:
         _send_json({"t": "move", "nx": nx, "ny": ny})
 
     def _tap_dn(e: ft.TapEvent, btn: str, down: bool) -> None:
-        bit = 1 if btn == "left" else (2 if btn == "right" else 4)
-        if bit:
-            if down:
-                remote_btn_mask[0] |= bit
-            else:
-                remote_btn_mask[0] &= ~bit
         if down:
             try:
                 page.run_task(_focus_remote_viewport)
             except Exception:
                 pass
         nx, ny = _norm_xy(getattr(e, "local_position", None))
-        if click_coord_enabled[0]:
-            _send_json({"t": "move", "nx": nx, "ny": ny})
+        _send_json({"t": "move", "nx": nx, "ny": ny})
         _send_json({"t": "btn", "btn": btn, "down": down})
 
     def _scroll_ev(e: ft.ScrollEvent) -> None:
@@ -1091,17 +1108,22 @@ def remote_viewer_main(page: ft.Page) -> None:
     def _kd(e: ft.KeyDownEvent) -> None:
         tok = _norm_key_token(e.key)
         if tok:
-            _send_json({"t": "key", "k": tok, "down": True})
+            _send_remote_key(tok, True)
 
     def _ku(e: ft.KeyUpEvent) -> None:
         tok = _norm_key_token(e.key)
         if tok:
-            _send_json({"t": "key", "k": tok, "down": False})
+            _send_remote_key(tok, False)
 
+    # 레터박스 오프셋은 remote_frame.margin(ox,oy) 로 직접 반영 (contain 과 좌표 일치).
     gd = ft.GestureDetector(
         expand=True,
         mouse_cursor=ft.MouseCursor.PRECISE,
-        content=remote_frame,
+        content=ft.Container(
+            expand=True,
+            clip_behavior=ft.ClipBehavior.NONE,
+            content=remote_frame,
+        ),
         on_hover=_hover,
         on_tap_down=lambda ev: _tap_dn(ev, "left", True),
         on_tap_up=lambda ev: _tap_dn(ev, "left", False),
@@ -1154,6 +1176,18 @@ def remote_viewer_main(page: ft.Page) -> None:
     )
     try:
         page.update()
+    except Exception:
+        pass
+
+    def _on_page_resize_remote(_e: object) -> None:
+        _sync_view_layout()
+
+    try:
+        page.on_resize = _on_page_resize_remote  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        _sync_view_layout()
     except Exception:
         pass
 
