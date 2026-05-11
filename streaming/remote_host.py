@@ -490,15 +490,6 @@ def _dispatch_dc_payload(
         )
         return
     t = str(msg.get("t", "")).lower()
-    if t == "resolution":
-        rawp = str(msg.get("preset", "")).strip()
-        if rawp:
-            preset = normalize_preset_id(
-                rawp,
-                fallback=srv._resolution_preset_id or "host_native",
-            )
-            srv._schedule_resolution_change(preset)
-        return
     if t == "clip_get":
 
         def _work() -> None:
@@ -580,7 +571,6 @@ class RemoteHostServer:
 
         self._capture: CaptureThread | None = None
         self._capture_lock = threading.Lock()
-        self._resolution_restart_lock = threading.Lock()
         self._geom: Optional[tuple[int, int, int, int]] = None
         self._meta_pending: set[object] = set()
         # 맥 Retina: mss/monitor geom 은 물리 픽셀 → pynput 는 논리 포인트일 때 나눔.
@@ -839,99 +829,6 @@ class RemoteHostServer:
         self._geom = geom
         self._capture_monitor_index = int(self.monitor_index)
 
-    def _blocking_restart_resolution(self, preset_id: str) -> None:
-        """세션 유지 상태에서 해상도(프리셋)만 교체. 짧은 끊김 허용."""
-        if not self._resolution_restart_lock.acquire(blocking=False):
-            try:
-                log_remote_event(
-                    "호스트: 해상도 변경이 이미 진행 중입니다. 새 요청은 건너뜁니다."
-                )
-            except Exception:
-                pass
-            return
-        try:
-            self._try_stop_physical_seal()
-            pid = normalize_preset_id(
-                preset_id,
-                fallback=self._resolution_preset_id or "host_native",
-            )
-            self._resolution_preset_id = pid
-            with self._capture_lock:
-                cap = self._capture
-                self._capture = None
-            if cap is not None:
-                try:
-                    cap.stop()
-                except Exception:
-                    pass
-                self._join_capture_thread(cap)
-            self._stop_darwin_audio()
-            if sys.platform == "darwin" and self._virtual_display_enabled:
-                self._release_virtual_display_session()
-            self._geom = None
-            self._pointer_scale = 1.0
-            try:
-                self._ensure_geom()
-                self._ensure_capture()
-                self._try_start_physical_seal()
-            except Exception as exc:
-                try:
-                    log_remote_event(
-                        f"호스트: 해상도 변경 실패 — {exc}", error=True
-                    )
-                except Exception:
-                    pass
-        finally:
-            self._resolution_restart_lock.release()
-
-    def _schedule_resolution_change(self, preset_id: str) -> None:
-        loop = self._loop
-        if loop is None:
-            return
-
-        async def _coro() -> None:
-            try:
-                exe_loop = asyncio.get_running_loop()
-                # DataChannel 처리와 같은 _POOL 을 쓰면 워커 고갈·경합이 날 수 있어
-                # 기본 스레드 풀에서 블로킹 재시작을 수행한다.
-                await exe_loop.run_in_executor(
-                    None,
-                    self._blocking_restart_resolution,
-                    preset_id,
-                )
-            except Exception as exc:
-                try:
-                    log_remote_event(
-                        f"호스트: 해상도 변경 비동기 작업 실패 — {exc}",
-                        error=True,
-                    )
-                except Exception:
-                    pass
-
-        def _log_resolution_future(fut: asyncio.Future) -> None:  # type: ignore[type-arg]
-            try:
-                fut.result()
-            except Exception as exc:
-                try:
-                    log_remote_event(
-                        f"호스트: 해상도 변경 코루틴 종료 오류 — {exc}",
-                        error=True,
-                    )
-                except Exception:
-                    pass
-
-        try:
-            fut = asyncio.run_coroutine_threadsafe(_coro(), loop)
-            fut.add_done_callback(_log_resolution_future)
-        except Exception as exc:
-            try:
-                log_remote_event(
-                    f"호스트: 해상도 변경 예약 실패 — {exc}",
-                    error=True,
-                )
-            except Exception:
-                pass
-
     def _darwin_audio_worker(self) -> None:
         try:
             import soundcard as sc  # type: ignore[import-untyped]
@@ -1100,6 +997,14 @@ class RemoteHostServer:
         self._ensure_geom()
         if not self._h264_patch_applied:
             self._h264_patch_applied = True
+            try:
+                from streaming.remote_h264_bitrate import (
+                    install_screen_share_h264_bitrate_patch,
+                )
+
+                install_screen_share_h264_bitrate_patch(fps=self.fps)
+            except Exception:
+                pass
             try:
                 from streaming.h264_hw_patch import install_h264_hardware_encoder
 

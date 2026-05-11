@@ -536,6 +536,9 @@ def remote_viewer_main(page: ft.Page) -> None:
     win_kbd_sink_stop: Callable[[], None] | None = None
     meta_from_host = [False]
     host_virtual_display = [False]
+    # 원격 뷰어 WebRTC 세션 중에는 /offer 시점 프리셋만 유효 — 드롭다운으로 중간 변경 불가.
+    rv_session_active = [False]
+    preset_dd_ref: list[ft.Dropdown | None] = [None]
     decode_dims_shown = [False]
     jpeg_temp_paths: list[str] = []
     first_video_logged = [False]
@@ -655,9 +658,31 @@ def remote_viewer_main(page: ft.Page) -> None:
             max(0.0, min(1.0, ny)),
         )
 
+    def _sync_preset_dd() -> None:
+        dd = preset_dd_ref[0]
+        if dd is None:
+            return
+        try:
+            dd.disabled = (not host_virtual_display[0]) or rv_session_active[0]
+        except Exception:
+            pass
+
+    def _rv_terminal_unlock_preset(msg: str) -> bool:
+        m = (msg or "").strip()
+        return (
+            m.startswith("영상 종료")
+            or m.startswith("신호 실패")
+            or m.startswith("피어: failed")
+            or m.startswith("피어: closed")
+            or m.startswith("피어: disconnected")
+        )
+
     def _emit_state(msg: str) -> None:
         async def _apply() -> None:
             conn_status.value = msg
+            if _rv_terminal_unlock_preset(msg):
+                rv_session_active[0] = False
+                _sync_preset_dd()
             try:
                 page.update()
             except Exception:
@@ -745,7 +770,7 @@ def remote_viewer_main(page: ft.Page) -> None:
                 mw = d.get("mon_w")
                 mh = d.get("mon_h")
                 host_virtual_display[0] = bool(d.get("virtual_display", False))
-                preset_dd.disabled = not host_virtual_display[0]
+                _sync_preset_dd()
                 pr = d.get("preset")
                 if isinstance(pr, str) and pr.strip():
                     lab = _preset_label_by_id.get(pr.strip())
@@ -806,11 +831,10 @@ def remote_viewer_main(page: ft.Page) -> None:
             state.save()
         except Exception:
             pass
-        _send_json({"t": "resolution", "preset": pid})
-        _emit_state(f"해상도 변경 요청: {lab}")
+        _emit_state(f"다음 연결(/offer) 시 적용: {lab}")
 
     preset_dd = ft.Dropdown(
-        label="호스트 해상도",
+        label="다음 연결 시 가상 해상도 (preset)",
         value=_preset_label_by_id.get(
             (rc.resolution_preset or "").strip(),
             PRESET_LABELS[0][1],
@@ -822,6 +846,7 @@ def remote_viewer_main(page: ft.Page) -> None:
         text_style=body_md(),
         label_style=label_md(),
     )
+    preset_dd_ref[0] = preset_dd
 
     sb_title = ft.Text("원격 뷰어", style=label_lg(), color=T.ON_SURFACE)
     sb_target = ft.Text(
@@ -838,7 +863,11 @@ def remote_viewer_main(page: ft.Page) -> None:
             res_line,
             preset_dd,
             ft.Text(
-                "가상 디스플레이 호스트에서만 해상도 변경이 적용됩니다.",
+                "가상 디스플레이 호스트는 연결 시(/offer) 요청한 preset 만 사용합니다. "
+                "세션 중에는 드롭다운이 비활성화됩니다. "
+                "해상도를 바꾼 뒤에는 끊고 다시 연결하세요. "
+                "큰 해상도는 캡처 픽셀 수가 늘어나지만 WebRTC H.264 비트레이트는 "
+                "대략 일정이라 화면이 흐릿·블록 노이즈처럼 보일 수 있습니다.",
                 style=body_md(),
                 color=T.ON_SURFACE_VARIANT,
             ),
@@ -1442,6 +1471,8 @@ def remote_viewer_main(page: ft.Page) -> None:
         offer_preset=(rc.resolution_preset or "").strip(),
     )
     session_ref["s"] = sess
+    rv_session_active[0] = sess is not None
+    _sync_preset_dd()
     if sess is None:
         try:
             log_remote_event("원격 뷰어: 백그라운드 세션 시작 실패", error=True)
@@ -1460,6 +1491,11 @@ def remote_viewer_main(page: ft.Page) -> None:
                 stop_sink()
             except Exception:
                 pass
+        rv_session_active[0] = False
+        try:
+            _sync_preset_dd()
+        except Exception:
+            pass
         try:
             log_remote_event("원격 뷰어: 창 종료")
         except Exception:
