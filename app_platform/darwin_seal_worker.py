@@ -201,39 +201,31 @@ def _make_seal_window(frame: object, level: int) -> None:
 
 def _build_seal_windows() -> None:
     app = NSApplication.sharedApplication()
-    app.activateIgnoringOtherOptions_(True)
+    try:
+        app.activateIgnoringOtherApps_(True)
+    except Exception:
+        pass
 
     level = _shielding_level()
-    print(f"build_seal: vid={_vid} level={level}", flush=True)
-
-    vd_rect = _cg_display_bounds(_vid)
-    print(f"build_seal: vd_rect={vd_rect}", flush=True)
 
     try:
         screens = list(NSScreen.screens() or [])
-    except Exception as e:
-        print(f"build_seal: NSScreen.screens 실패 {e}", flush=True)
+    except Exception:
         screens = []
 
-    print(f"build_seal: screen_count={len(screens)}", flush=True)
     covered = 0
     for scr in screens:
-        sn = _screen_number(scr)
-        sf = scr.frame()
-        is_vd = _screen_covers_virtual(scr)
-        print(f"build_seal: screen#={sn} frame={sf} is_vd={is_vd}", flush=True)
-        if is_vd:
+        if _screen_covers_virtual(scr):
             continue
-        _make_seal_window(sf, level)
+        _make_seal_window(scr.frame(), level)
         covered += 1
 
     if covered == 0:
         ms = NSScreen.mainScreen()
         if ms is not None and not _screen_covers_virtual(ms):
-            print("build_seal: fallback mainScreen", flush=True)
             _make_seal_window(ms.frame(), level)
 
-    print(f"build_seal: done covered={covered} windows={len(_windows)}", flush=True)
+    print(f"sealed: vid={_vid} covered={covered}", flush=True)
 
 
 # ── NSApplicationDidChangeScreenParametersNotification 처리 ──────────────────
@@ -241,7 +233,6 @@ def _build_seal_windows() -> None:
 
 class _ScreenChangeObserver(NSObject):
     def screenParametersChanged_(self, _notification: object) -> None:
-        print("screen_change: NSApplicationDidChangeScreenParametersNotification", flush=True)
         for w in list(_windows):
             try:
                 w.orderOut_(None)
@@ -250,7 +241,10 @@ class _ScreenChangeObserver(NSObject):
                 pass
         _windows.clear()
         _handlers.clear()
-        _build_seal_windows()
+        try:
+            _build_seal_windows()
+        except Exception as e:
+            print(f"rebuild_err: {type(e).__name__}: {e}", flush=True)
 
 
 _screen_observer: _ScreenChangeObserver | None = None
@@ -258,10 +252,16 @@ _screen_observer: _ScreenChangeObserver | None = None
 
 class _Launcher(NSObject):
     def launch_(self, _: object) -> None:
-        print("launcher: start", flush=True)
-        _register_screen_change_observer()
-        _build_seal_windows()
-        print("launcher: done", flush=True)
+        try:
+            _register_screen_change_observer()
+        except BaseException as e:
+            print(f"observer_err: {type(e).__name__}: {e}", flush=True)
+        try:
+            _build_seal_windows()
+        except BaseException as e:
+            import traceback as _tb
+            print(f"build_err: {type(e).__name__}: {e}", flush=True)
+            print(_tb.format_exc(), flush=True)
 
 
 def _register_screen_change_observer() -> None:

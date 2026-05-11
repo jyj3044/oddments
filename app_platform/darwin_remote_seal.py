@@ -78,11 +78,12 @@ def schedule_seal_show(
 
         try:
             proc = subprocess.Popen(
-                [sys.executable, str(_WORKER), str(vid)],
+                [sys.executable, "-u", str(_WORKER), str(vid)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 close_fds=True,
+                bufsize=0,
             )
         except Exception:
             _log.exception("darwin_remote_seal: subprocess 실행 실패")

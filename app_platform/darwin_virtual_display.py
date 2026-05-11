@@ -897,52 +897,108 @@ def restore_primary_display(old_main_id: int, vd_display_id: int) -> bool:
 
 
 def move_windows_to_display(target_display_id: int, exclude_pid: int = 0) -> int:
-    """물리 화면에 있는 앱 창을 ``target_display_id`` 디스플레이로 이동한다.
+    """타깃 디스플레이 밖에 있는 일반 앱 창을 타깃 디스플레이로 이동한다.
 
-    System Events AppleScript 를 통해 각 프로세스의 창 위치를 이동한다.
-    접근성(Accessibility) 권한이 필요하다.
+    호스트 앱의 접근성 권한으로 ``AXUIElement`` API 를 직접 호출한다.
+    Quartz Window List 에서 화면에 있는 앱 PID 를 모은 뒤, 각 앱의 AX 창들을 순회하며
+    위치가 타깃 디스플레이 밖이면 (vx+40, vy+40) 으로 이동시킨다.
 
-    ``exclude_pid`` 가 0 이 아니면 해당 PID 의 프로세스 창은 건너뛴다.
-    반환값: osascript 실행 성공 여부 (1=성공, 0=실패)
+    Returns:
+        이동한 창 개수.
     """
-    import subprocess as _sp
-
     rect = cg_display_bounds(target_display_id)
     if rect is None:
         return 0
-    vx, vy, vw, vh = (int(v) for v in rect)
+    vx, vy, vw, vh = (float(v) for v in rect)
 
-    # 창이 VD 밖에 있으면 VD 좌상단 근처로 이동
-    excl = f"and unix id is not {exclude_pid}" if exclude_pid else ""
-    script = f"""\
-tell application "System Events"
-    set vx to {vx}
-    set vy to {vy}
-    set vw to {vw}
-    set vh to {vh}
-    repeat with proc in (processes where visible is true and background only is false {excl})
-        try
-            repeat with win in windows of proc
-                try
-                    set {{wx, wy}} to position of win
-                    if (wx < vx) or (wx >= vx + vw) or (wy < vy) or (wy >= vy + vh) then
-                        set position of win to {{vx + 40, vy + 40}}
-                    end if
-                end try
-            end repeat
-        end try
-    end repeat
-end tell
-"""
     try:
-        _sp.run(
-            ["osascript", "-e", script],
-            timeout=8,
-            capture_output=True,
+        import Quartz  # type: ignore[import-untyped]
+    except ImportError:
+        return 0
+
+    try:
+        win_list = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
         )
-        return 1
     except Exception:
         return 0
+
+    pids: set[int] = set()
+    for info in win_list or []:
+        try:
+            if info.get("kCGWindowLayer", 999) != 0:
+                continue
+            pid = info.get("kCGWindowOwnerPID")
+            if pid is None:
+                continue
+            pid_i = int(pid)
+            if pid_i == exclude_pid:
+                continue
+            pids.add(pid_i)
+        except Exception:
+            pass
+
+    if not pids:
+        return 0
+
+    try:
+        from ApplicationServices import (  # type: ignore[import-untyped]
+            AXUIElementCopyAttributeValue,
+            AXUIElementCreateApplication,
+            AXUIElementSetAttributeValue,
+            AXValueCreate,
+            AXValueGetValue,
+            kAXErrorSuccess,
+            kAXPositionAttribute,
+            kAXValueCGPointType,
+            kAXWindowsAttribute,
+        )
+        from Quartz import CGPoint  # type: ignore[import-untyped]
+    except ImportError:
+        return 0
+
+    moved = 0
+    for pid in pids:
+        try:
+            app = AXUIElementCreateApplication(pid)
+            err, wins = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, None)
+            if err != kAXErrorSuccess or not wins:
+                continue
+            for win in wins:
+                try:
+                    err2, pos_val = AXUIElementCopyAttributeValue(
+                        win, kAXPositionAttribute, None
+                    )
+                    if err2 != kAXErrorSuccess or pos_val is None:
+                        continue
+                    ok, cur = AXValueGetValue(pos_val, kAXValueCGPointType, None)
+                    if not ok or cur is None:
+                        continue
+                    cx, cy = float(cur.x), float(cur.y)
+                    if vx <= cx < vx + vw and vy <= cy < vy + vh:
+                        continue
+                    new_point = CGPoint(vx + 40.0, vy + 40.0)
+                    new_val = AXValueCreate(kAXValueCGPointType, new_point)
+                    if new_val is None:
+                        continue
+                    AXUIElementSetAttributeValue(win, kAXPositionAttribute, new_val)
+                    moved += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        from streaming.remote_log import log_remote_event
+
+        log_remote_event(
+            f"호스트: 기존 창 VD 이동 — pids={len(pids)} moved={moved}"
+        )
+    except Exception:
+        pass
+    return moved
 
 
 __all__ = [
