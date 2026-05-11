@@ -1207,12 +1207,23 @@ class AppState:
                     acc_hint = None
                 else:
                     try:
-                        log_remote_event(
+                        msg = (
                             "원격 호스트: 접근성이 아직 허용되지 않았습니다. "
                             "원격 마우스·키보드 주입은 설정 후에 동작합니다."
                         )
+                        if hp.use_virtual_display:
+                            msg += (
+                                " 가상 디스플레이 모드에서는 물리 화면 봉인(전체 오버레이)도 "
+                                "접근성이 허용된 뒤에 표시되는 경우가 많습니다."
+                            )
+                        log_remote_event(msg)
                     except Exception:
                         pass
+                    if hp.use_virtual_display and acc_hint:
+                        acc_hint = (
+                            acc_hint
+                            + " (가상 디스플레이) 물리 화면 봉인은 접근성 허용 후 표시됩니다."
+                        )
         except Exception:
             acc_hint = None
         try:
@@ -1230,6 +1241,27 @@ class AppState:
                             "MAPLE_REMOTE_ALLOW_NO_PASSWORD=1 을 사용하세요."
                         )
             vd = bool(hp.use_virtual_display) if _sys.platform == "darwin" else False
+
+            seal_ui_runner = None
+            if _sys.platform == "darwin" and vd:
+
+                def seal_ui_runner(fn: Callable[[], None]) -> None:
+                    page = getattr(self, "page", None)
+                    run_task = getattr(page, "run_task", None) if page is not None else None
+                    if callable(run_task):
+
+                        async def _coro() -> None:
+                            fn()
+
+                        try:
+                            run_task(_coro)
+                            return
+                        except Exception:
+                            pass
+                    from app_platform.darwin_remote_seal import _schedule_on_main
+
+                    _schedule_on_main(fn)
+
             srv = RemoteHostServer(
                 host="0.0.0.0",
                 port=hp.listen_port,
@@ -1239,6 +1271,7 @@ class AppState:
                 h264_hardware_encode=hp.h264_hardware_encode,
                 virtual_display_enabled=vd,
                 darwin_audio_device=hp.darwin_audio_input,
+                seal_ui_runner=seal_ui_runner,
             )
             srv.start()
             self._remote_host = srv

@@ -13,6 +13,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional, TypeVar
 
+_SealUiFn = Callable[[], None]
+_SealUiRunner = Callable[[_SealUiFn], None]
+
 import mss
 import numpy as np
 from aiohttp import web
@@ -540,6 +543,7 @@ class RemoteHostServer:
         h264_hardware_encode: bool = False,
         virtual_display_enabled: bool = False,
         darwin_audio_device: str = "",
+        seal_ui_runner: Optional[_SealUiRunner] = None,
     ) -> None:
         self.host = str(host).strip() or "0.0.0.0"
         self.port = int(port)
@@ -558,6 +562,7 @@ class RemoteHostServer:
         # 클라이언트 /offer 의 preset 으로 갱신. 초기값은 host_native.
         self._resolution_preset_id = "host_native"
         self._darwin_audio_device = (darwin_audio_device or "").strip()
+        self._seal_ui_runner: Optional[_SealUiRunner] = seal_ui_runner
         self._vd_obj: object | None = None
         self._vd_display_id: int = 0
 
@@ -597,7 +602,7 @@ class RemoteHostServer:
                     pass
 
         try:
-            log_remote_event("호스트: 물리 화면에서 세션 끊기 요청")
+            log_remote_event("호스트: 물리 화면 봉인에서 세션 종료 요청")
         except Exception:
             pass
         try:
@@ -621,7 +626,11 @@ class RemoteHostServer:
             try:
                 from app_platform.darwin_remote_seal import schedule_seal_show
 
-                schedule_seal_show(vid, cb)
+                schedule_seal_show(
+                    vid,
+                    cb,
+                    ui_runner=self._seal_ui_runner,
+                )
             except Exception as exc:
                 try:
                     log_remote_event(
@@ -642,7 +651,7 @@ class RemoteHostServer:
         try:
             from app_platform.darwin_remote_seal import schedule_seal_hide
 
-            schedule_seal_hide()
+            schedule_seal_hide(ui_runner=self._seal_ui_runner)
         except Exception:
             pass
 
@@ -1323,6 +1332,9 @@ class RemoteHostServer:
         @pc.on("connectionstatechange")
         async def _on_state_change() -> None:
             st = pc.connectionState
+            if st == "connected":
+                # ICE 연결 직후 한 번 더 봉인(가상 디스플레이 + 물리 화면)을 건다.
+                self._try_start_physical_seal()
             if st in ("failed", "closed", "disconnected"):
                 self._pcs.discard(pc)
                 try:

@@ -158,8 +158,17 @@ def _hide_sync() -> None:
     _handler_retainer.clear()
 
 
-def schedule_seal_hide() -> None:
-    _schedule_on_main(_hide_sync)
+def schedule_seal_hide(
+    *,
+    ui_runner: Callable[[Callable[[], None]], None] | None = None,
+) -> None:
+    def _go() -> None:
+        _hide_sync()
+
+    if ui_runner is not None:
+        ui_runner(_go)
+    else:
+        _schedule_on_main(_go)
 
 
 def _build_seal_windows(virtual_display_id: int, on_disconnect: Callable[[], None]) -> None:
@@ -234,29 +243,51 @@ def _build_seal_windows(virtual_display_id: int, on_disconnect: Callable[[], Non
             bw = float(frame.size.width)
             bh = float(frame.size.height)
 
-            title = NSTextField.wrappingLabelWithString_(
-                "원격 제어 중입니다.\n이 화면에서는 조작할 수 없습니다.\n"
-                "작업은 가상 디스플레이(원격 클라이언트)에서 진행하세요."
-            )
-            title.setFont_(NSFont.systemFontOfSize_(22.0))
-            title.setTextColor_(NSColor.whiteColor())
-            title.setBackgroundColor_(NSColor.clearColor())
             try:
                 from AppKit import NSTextAlignmentCenter
 
-                title.setAlignment_(NSTextAlignmentCenter)
+                _align_center = NSTextAlignmentCenter
             except Exception:
-                title.setAlignment_(1)
-            title.setFrame_(NSMakeRect(40, bh * 0.55, bw - 80, bh * 0.35))
+                _align_center = 1
+
+            badge = NSTextField.labelWithString_("원격 중")
+            badge.setFont_(NSFont.boldSystemFontOfSize_(min(32.0, max(22.0, bw / 28.0))))
+            badge.setTextColor_(NSColor.whiteColor())
+            badge.setBackgroundColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.12, 0.08, 1.0)
+            )
+            try:
+                badge.setDrawsBackground_(True)
+                badge.setBezeled_(False)
+                badge.setBordered_(False)
+                badge.setEditable_(False)
+                badge.setSelectable_(False)
+            except Exception:
+                pass
+            badge.setAlignment_(_align_center)
+            badge_h = min(56.0, max(44.0, bh * 0.08))
+            badge.setFrame_(NSMakeRect(40.0, bh - badge_h - 36.0, bw - 80.0, badge_h))
+            cv.addSubview_(badge)
+
+            title = NSTextField.wrappingLabelWithString_(
+                "가상 디스플레이로 원격 호스트가 연결되었습니다.\n"
+                "이 물리 화면에서는 마우스·키보드로 조작할 수 없습니다.\n"
+                "작업은 원격 클라이언트(가상 디스플레이)에서 진행하세요."
+            )
+            title.setFont_(NSFont.systemFontOfSize_(20.0))
+            title.setTextColor_(NSColor.whiteColor())
+            title.setBackgroundColor_(NSColor.clearColor())
+            title.setAlignment_(_align_center)
+            title.setFrame_(NSMakeRect(40, bh * 0.42, bw - 80, bh * 0.38))
             cv.addSubview_(title)
 
             handler = _DisconnectHandler.alloc().initWithCallback_(on_disconnect)
             _handler_retainer.append(handler)
 
             btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(max(40.0, (bw - 220.0) * 0.5), 80.0, 220.0, 44.0)
+                NSMakeRect(max(40.0, (bw - 240.0) * 0.5), 72.0, 240.0, 48.0)
             )
-            btn.setTitle_("세션 끊기")
+            btn.setTitle_("세션 종료")
             btn.setBezelStyle_(NSBezelStyleRounded)
             btn.setTarget_(handler)
             btn.setAction_("fire:")
@@ -293,18 +324,43 @@ def _build_seal_windows(virtual_display_id: int, on_disconnect: Callable[[], Non
                 win.setReleasedWhenClosed_(False)
                 cv = win.contentView()
                 if cv is not None:
+                    fw = float(frame.size.width)
+                    fh = float(frame.size.height)
+                    fbadge = NSTextField.labelWithString_("원격 중")
+                    fbadge.setFont_(NSFont.boldSystemFontOfSize_(26.0))
+                    fbadge.setTextColor_(NSColor.whiteColor())
+                    fbadge.setBackgroundColor_(
+                        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.12, 0.08, 1.0)
+                    )
+                    try:
+                        fbadge.setDrawsBackground_(True)
+                        fbadge.setBezeled_(False)
+                        fbadge.setBordered_(False)
+                        fbadge.setEditable_(False)
+                        fbadge.setSelectable_(False)
+                    except Exception:
+                        pass
+                    try:
+                        from AppKit import NSTextAlignmentCenter
+
+                        fbadge.setAlignment_(NSTextAlignmentCenter)
+                    except Exception:
+                        fbadge.setAlignment_(1)
+                    fbadge.setFrame_(NSMakeRect(40, fh - 92, fw - 80, 48))
+                    cv.addSubview_(fbadge)
                     lab = NSTextField.wrappingLabelWithString_(
-                        "원격 봉인(폴백)\n세션 끊기 버튼으로 종료하세요."
+                        "원격 봉인(폴백)\n이 물리 화면은 조작할 수 없습니다.\n"
+                        "아래 버튼으로 원격 세션을 종료하세요."
                     )
                     lab.setTextColor_(NSColor.whiteColor())
-                    lab.setFrame_(NSMakeRect(40, frame.size.height * 0.5, frame.size.width - 80, 120))
+                    lab.setFrame_(NSMakeRect(40, fh * 0.38, fw - 80, fh * 0.35))
                     cv.addSubview_(lab)
                     handler = _DisconnectHandler.alloc().initWithCallback_(on_disconnect)
                     _handler_retainer.append(handler)
                     btn = NSButton.alloc().initWithFrame_(
-                        NSMakeRect(max(40, (frame.size.width - 220) * 0.5), 60, 220, 44)
+                        NSMakeRect(max(40, (fw - 240) * 0.5), 56, 240, 48)
                     )
-                    btn.setTitle_("세션 끊기")
+                    btn.setTitle_("세션 종료")
                     btn.setBezelStyle_(NSBezelStyleRounded)
                     btn.setTarget_(handler)
                     btn.setAction_("fire:")
@@ -319,13 +375,28 @@ def _build_seal_windows(virtual_display_id: int, on_disconnect: Callable[[], Non
 def schedule_seal_show(
     virtual_display_id: int,
     on_disconnect: Callable[[], None],
+    *,
+    ui_runner: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
     vid = int(virtual_display_id)
 
     def _go() -> None:
+        try:
+            from app_platform.darwin_accessibility import accessibility_trusted
+
+            if not accessibility_trusted():
+                _log.warning(
+                    "darwin_remote_seal: 접근성 미허용 — 물리 화면 봉인이 표시되지 않거나 "
+                    "다른 창에 가릴 수 있습니다. 시스템 설정 → 접근성에서 이 앱을 허용하세요."
+                )
+        except Exception:
+            pass
         _build_seal_windows(vid, on_disconnect)
 
-    _schedule_on_main(_go)
+    if ui_runner is not None:
+        ui_runner(_go)
+    else:
+        _schedule_on_main(_go)
 
 
 __all__ = [

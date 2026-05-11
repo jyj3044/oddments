@@ -12,6 +12,22 @@ _HINT = (
     "원격에서 마우스·키보드를 제어할 수 있습니다."
 )
 
+def accessibility_trusted() -> bool:
+    """접근성 신뢰 여부만 조회한다(시스템 프롬프트·설정 창을 띄우지 않음)."""
+    if sys.platform != "darwin":
+        return True
+    try:
+        import HIServices  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    apt = getattr(HIServices, "AXIsProcessTrusted", None)
+    if apt is None:
+        return False
+    try:
+        return bool(apt())
+    except Exception:
+        return False
+
 
 def open_accessibility_settings_pane() -> None:
     """접근성 설정 화면을 연다(프롬프트 API 실패·미설치 시 폴백)."""
