@@ -17,7 +17,6 @@ import numpy as np
 from aiohttp import web
 from aiortc import (
     RTCConfiguration,
-    RTCIceServer,
     RTCPeerConnection,
     RTCSessionDescription,
 )
@@ -133,29 +132,9 @@ def _resolve_pointer_scale(stored: float) -> float:
         return stored
 
 
-def rtc_configuration_from_stun_turn(
-    *,
-    stun_urls: str,
-    turn_uri: str,
-    turn_username: str,
-    turn_password: str,
-) -> RTCConfiguration:
-    servers: list[RTCIceServer] = []
-    raw = (stun_urls or "").replace(",", "\n")
-    for line in raw.splitlines():
-        u = line.strip()
-        if u:
-            servers.append(RTCIceServer(urls=[u]))
-    tu = (turn_uri or "").strip()
-    if tu:
-        servers.append(
-            RTCIceServer(
-                urls=[tu],
-                username=(turn_username or None),
-                credential=(turn_password or None),
-            )
-        )
-    return RTCConfiguration(iceServers=servers)
+def default_rtc_configuration() -> RTCConfiguration:
+    """STUN/TURN 없음 — 동일 LAN·포트포워딩 등 로컬 ICE 만 사용."""
+    return RTCConfiguration(iceServers=[])
 
 
 def _monitor_geometry(index: int) -> Optional[tuple[int, int, int, int]]:
@@ -517,13 +496,9 @@ class RemoteHostServer:
         port: int = 49152,
         fps: float = 30.0,
         monitor_index: int = 1,
-        capture_width: int = 0,
-        capture_height: int = 0,
-        rtc_configuration: RTCConfiguration | None = None,
         auth_token: str = "",
         h264_hardware_encode: bool = False,
         virtual_display_enabled: bool = False,
-        resolution_preset: str = "host_native",
         darwin_audio_device: str = "",
     ) -> None:
         self.host = str(host).strip() or "0.0.0.0"
@@ -531,15 +506,17 @@ class RemoteHostServer:
         self.fps = float(max(5.0, min(60.0, fps)))
         self.monitor_index = int(monitor_index)
         self._capture_monitor_index = int(monitor_index)
-        self.capture_width = max(0, int(capture_width))
-        self.capture_height = max(0, int(capture_height))
-        self._rtc_configuration = rtc_configuration or RTCConfiguration()
+        # 송출 픽셀 크기는 캡처(클라이언트 요청 가상 해상도 등)에 맡김. 별도 축소 없음.
+        self.capture_width = 0
+        self.capture_height = 0
+        self._rtc_configuration = default_rtc_configuration()
         self._auth_token = (auth_token or "").strip()
         self._h264_hardware_encode = bool(h264_hardware_encode)
         self._h264_patch_applied = False
 
         self._virtual_display_enabled = bool(virtual_display_enabled)
-        self._resolution_preset_id = (resolution_preset or "host_native").strip()
+        # 클라이언트 /offer 의 preset 으로 갱신. 초기값은 host_native.
+        self._resolution_preset_id = "host_native"
         self._darwin_audio_device = (darwin_audio_device or "").strip()
         self._vd_obj: object | None = None
         self._vd_display_id: int = 0
@@ -588,25 +565,35 @@ class RemoteHostServer:
             pass
 
     def _try_start_physical_seal(self) -> None:
+        """NSScreen 목록이 갱신된 뒤 봉인하도록 약간 지연한다."""
         if sys.platform != "darwin" or not self._virtual_display_enabled:
             return
         if int(self._vd_display_id) <= 0 or len(self._pcs) == 0:
             return
-        try:
-            from app_platform.darwin_remote_seal import schedule_seal_show
+        loop = self._loop
+        if loop is None:
+            return
+        vid = int(self._vd_display_id)
+        cb = self._request_disconnect_from_seal
 
-            schedule_seal_show(
-                int(self._vd_display_id),
-                self._request_disconnect_from_seal,
-            )
-        except Exception as exc:
+        def _fire() -> None:
             try:
-                log_remote_event(
-                    f"호스트: 물리 화면 봉인 표시 실패 — {exc}",
-                    error=True,
-                )
-            except Exception:
-                pass
+                from app_platform.darwin_remote_seal import schedule_seal_show
+
+                schedule_seal_show(vid, cb)
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: 물리 화면 봉인 표시 실패 — {exc}",
+                        error=True,
+                    )
+                except Exception:
+                    pass
+
+        try:
+            loop.call_later(0.48, _fire)
+        except Exception:
+            _fire()
 
     def _try_stop_physical_seal(self) -> None:
         if sys.platform != "darwin":
@@ -667,38 +654,77 @@ class RemoteHostServer:
             create_virtual_display,
         )
 
-        w, h = preset_dimensions(
+        requested = normalize_preset_id(
             self._resolution_preset_id,
-            host_native=_darwin_main_pixel_size,
+            fallback="host_native",
         )
-        w = max(320, int(w))
-        h = max(240, int(h))
-        try:
-            vd, did = create_virtual_display(w, h, refresh_hz=60.0)
-        except DarwinVirtualDisplayError as exc:
-            raise RuntimeError(str(exc)) from exc
-        self._vd_obj = vd
-        self._vd_display_id = int(did)
-        bx, by, bw, bh = cg_display_bounds(int(did))
-        left = int(round(bx))
-        top = int(round(by))
-        gw = max(1, int(round(bw)))
-        gh = max(1, int(round(bh)))
-        idx = _mss_index_for_rect(left, top, gw, gh)
-        if idx is None:
-            self._release_virtual_display_session()
-            raise RuntimeError(
-                "가상 디스플레이가 생성되었으나 mss 모니터 목록과 매칭되지 않았습니다."
+        chain = [requested]
+        if requested != "host_native":
+            chain.append("host_native")
+
+        last_err: BaseException | None = None
+        for attempt, pid in enumerate(chain):
+            self._resolution_preset_id = normalize_preset_id(pid, fallback="host_native")
+            w, h = preset_dimensions(
+                self._resolution_preset_id,
+                host_native=_darwin_main_pixel_size,
             )
-        self._capture_monitor_index = idx
-        self._geom = (left, top, gw, gh)
-        self._pointer_scale = 1.0
-        try:
-            log_remote_event(
-                f"호스트: 가상 디스플레이 {gw}×{gh} (mss #{idx}, CG ID {did})"
-            )
-        except Exception:
-            pass
+            w = max(320, int(w))
+            h = max(240, int(h))
+            try:
+                vd, did = create_virtual_display(w, h, refresh_hz=60.0)
+            except DarwinVirtualDisplayError as exc:
+                last_err = exc
+                if attempt == 0 and requested != "host_native":
+                    try:
+                        log_remote_event(
+                            f"호스트: 요청 해상도({requested}) 가상 디스플레이 생성 실패 — "
+                            f"호스트 해상도(host_native)로 재시도합니다. ({exc})"
+                        )
+                    except Exception:
+                        pass
+                continue
+
+            self._vd_obj = vd
+            self._vd_display_id = int(did)
+            bx, by, bw, bh = cg_display_bounds(int(did))
+            left = int(round(bx))
+            top = int(round(by))
+            gw = max(1, int(round(bw)))
+            gh = max(1, int(round(bh)))
+            idx = _mss_index_for_rect(left, top, gw, gh)
+            if idx is None:
+                self._release_virtual_display_session()
+                err = RuntimeError(
+                    "가상 디스플레이가 생성되었으나 mss 모니터 목록과 매칭되지 않았습니다."
+                )
+                last_err = err
+                if attempt == 0 and requested != "host_native":
+                    try:
+                        log_remote_event(
+                            "호스트: 요청 해상도 mss 매칭 실패 — host_native 로 재시도합니다.",
+                            error=True,
+                        )
+                    except Exception:
+                        pass
+                    continue
+                raise err
+
+            self._capture_monitor_index = idx
+            self._geom = (left, top, gw, gh)
+            self._pointer_scale = 1.0
+            try:
+                log_remote_event(
+                    f"호스트: 가상 디스플레이 {gw}×{gh} (mss #{idx}, CG ID {did}, "
+                    f"프리셋 «{self._resolution_preset_id}»)"
+                )
+            except Exception:
+                pass
+            return
+
+        raise RuntimeError(
+            str(last_err) if last_err else "가상 디스플레이를 만들 수 없습니다."
+        ) from last_err
 
     def _ensure_geom(self) -> None:
         if self._geom is not None:
@@ -1038,6 +1064,8 @@ class RemoteHostServer:
     def _run_loop(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        # /offer 가 startup 완료 전에 처리될 수 있으므로 루프 참조는 즉시 둔다.
+        self._loop = loop
         try:
             loop.run_until_complete(self._startup_async())
         except OSError as exc:
@@ -1055,7 +1083,6 @@ class RemoteHostServer:
                 pass
             self._loop = None
             return
-        self._loop = loop
         loop.run_forever()
         try:
             loop.run_until_complete(self._shutdown_async())
@@ -1114,19 +1141,25 @@ class RemoteHostServer:
                 content_type="application/json",
             )
 
-        # 클라이언트가 /offer 에 실은 preset 이 우선(가상 디스플레이는 여기서 크기 결정).
+        # 송출 해상도: 클라이언트 /offer 의 preset (없으면 호스트 사용 중 = host_native).
         raw_preset = params.get("preset")
         if raw_preset is None:
             raw_preset = params.get("resolution_preset")
         if isinstance(raw_preset, str) and raw_preset.strip():
             self._resolution_preset_id = normalize_preset_id(
                 raw_preset.strip(),
-                fallback=self._resolution_preset_id,
+                fallback="host_native",
             )
             try:
                 log_remote_event(
-                    f"호스트: 클라이언트 요청 해상도 프리셋 «{self._resolution_preset_id}»"
+                    f"호스트: 클라이언트 요청 해상도 «{self._resolution_preset_id}»"
                 )
+            except Exception:
+                pass
+        else:
+            self._resolution_preset_id = "host_native"
+            try:
+                log_remote_event("호스트: preset 없음 — host_native(메인 화면) 로 송출")
             except Exception:
                 pass
 
@@ -1228,5 +1261,5 @@ class RemoteHostServer:
 
 __all__ = [
     "RemoteHostServer",
-    "rtc_configuration_from_stun_turn",
+    "default_rtc_configuration",
 ]

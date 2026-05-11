@@ -137,7 +137,7 @@ try:
 except ImportError:
     WebStreamServer = None  # type: ignore[assignment]
 
-from streaming.remote_host import RemoteHostServer, rtc_configuration_from_stun_turn
+from streaming.remote_host import RemoteHostServer
 
 APP_NAME = "Oddments"
 SETTINGS_FILENAME = "oddments_settings.json"
@@ -238,21 +238,12 @@ class RemoteHostProfile:
     listen_port: int = 49152
     monitor_index: int = 1
     stream_fps: int = 30
-    # 0 = 인코더가 대상 화면의 네이티브 해상도를 그대로 쓰도록 둔다(스케일은 별도).
-    capture_width: int = 0
-    capture_height: int = 0
-    stun_urls: str = "stun:stun.l.google.com:19302"
-    turn_uri: str = ""
-    turn_username: str = ""
-    turn_password: str = ""
     # 비어 있으면 연결 시 비밀번호를 요구하지 않음. 설정 시 클라이언트와 동일해야 한다.
     auth_token: str = ""
     # True 이면 호스트 시작 시 NVENC/AMF/VideoToolbox 등을 시도하고, 없으면 libx264 유지.
     h264_hardware_encode: bool = False
     # macOS 호스트: CGVirtualDisplay 로 가상 모니터만 송출 (물리 모니터 미송출).
     use_virtual_display: bool = True
-    # streaming.remote_presets 의 preset id (기본 host_native = 메인 디스플레이와 동일 크기).
-    resolution_preset: str = "host_native"
     # macOS: 원격용 가상 입력 장치 이름 부분 문자열 (예: BlackHole). 비우면 BlackHole 자동 탐색.
     darwin_audio_input: str = ""
 
@@ -473,27 +464,12 @@ class AppState:
                     )
                 except (TypeError, ValueError):
                     h.stream_fps = 30
-                try:
-                    h.capture_width = int(rh.get("capture_width", h.capture_width) or 0)
-                except (TypeError, ValueError):
-                    h.capture_width = 0
-                try:
-                    h.capture_height = int(rh.get("capture_height", h.capture_height) or 0)
-                except (TypeError, ValueError):
-                    h.capture_height = 0
-                h.stun_urls = str(rh.get("stun_urls", h.stun_urls) or "")
-                h.turn_uri = str(rh.get("turn_uri", h.turn_uri) or "")
-                h.turn_username = str(rh.get("turn_username", h.turn_username) or "")
-                h.turn_password = str(rh.get("turn_password", h.turn_password) or "")
                 h.auth_token = str(rh.get("auth_token", h.auth_token) or "")
                 h.h264_hardware_encode = bool(
                     rh.get("h264_hardware_encode", h.h264_hardware_encode)
                 )
                 h.use_virtual_display = bool(
                     rh.get("use_virtual_display", h.use_virtual_display)
-                )
-                h.resolution_preset = str(
-                    rh.get("resolution_preset", h.resolution_preset) or "host_native"
                 )
                 h.darwin_audio_input = str(
                     rh.get("darwin_audio_input", h.darwin_audio_input) or ""
@@ -558,16 +534,9 @@ class AppState:
                     "listen_port": rh.listen_port,
                     "monitor_index": rh.monitor_index,
                     "stream_fps": rh.stream_fps,
-                    "capture_width": rh.capture_width,
-                    "capture_height": rh.capture_height,
-                    "stun_urls": rh.stun_urls,
-                    "turn_uri": rh.turn_uri,
-                    "turn_username": rh.turn_username,
-                    "turn_password": rh.turn_password,
                     "auth_token": rh.auth_token,
                     "h264_hardware_encode": rh.h264_hardware_encode,
                     "use_virtual_display": rh.use_virtual_display,
-                    "resolution_preset": rh.resolution_preset,
                     "darwin_audio_input": rh.darwin_audio_input,
                 },
                 "client": {
@@ -1260,25 +1229,15 @@ class AppState:
                             "설정에 입력하거나 개발용으로 환경변수 "
                             "MAPLE_REMOTE_ALLOW_NO_PASSWORD=1 을 사용하세요."
                         )
-            rtc_cfg = rtc_configuration_from_stun_turn(
-                stun_urls=hp.stun_urls,
-                turn_uri=hp.turn_uri,
-                turn_username=hp.turn_username,
-                turn_password=hp.turn_password,
-            )
             vd = bool(hp.use_virtual_display) if _sys.platform == "darwin" else False
             srv = RemoteHostServer(
                 host="0.0.0.0",
                 port=hp.listen_port,
                 fps=float(hp.stream_fps),
                 monitor_index=hp.monitor_index,
-                capture_width=hp.capture_width,
-                capture_height=hp.capture_height,
-                rtc_configuration=rtc_cfg,
                 auth_token=hp.auth_token,
                 h264_hardware_encode=hp.h264_hardware_encode,
                 virtual_display_enabled=vd,
-                resolution_preset=hp.resolution_preset,
                 darwin_audio_device=hp.darwin_audio_input,
             )
             srv.start()

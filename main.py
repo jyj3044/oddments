@@ -41,7 +41,6 @@ import flet as ft
 import numpy as np
 
 from streaming.remote_client import run_session_in_thread
-from streaming.remote_host import rtc_configuration_from_stun_turn
 from streaming.remote_log import log_remote_event
 from streaming.remote_presets import PRESET_LABELS
 
@@ -516,7 +515,6 @@ def remote_viewer_main(page: ft.Page) -> None:
     _install_error_routing(page)
 
     rc = state.settings.remote.client
-    hp = state.settings.remote.host
 
     try:
         _vh = (rc.host or "").strip() or "127.0.0.1"
@@ -1428,17 +1426,11 @@ def remote_viewer_main(page: ft.Page) -> None:
     except Exception:
         pass
 
-    rtc_cfg = rtc_configuration_from_stun_turn(
-        stun_urls=hp.stun_urls,
-        turn_uri=hp.turn_uri,
-        turn_username=hp.turn_username,
-        turn_password=hp.turn_password,
-    )
     host_addr = (rc.host or "").strip() or "127.0.0.1"
     _, sess = run_session_in_thread(
         signal_host=host_addr,
         signal_port=int(rc.port),
-        rtc_configuration=rtc_cfg,
+        rtc_configuration=None,
         on_frame=_on_frame,
         on_state=_emit_state,
         on_dc_json=_on_dc_json,

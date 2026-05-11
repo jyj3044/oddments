@@ -35,20 +35,6 @@ def _clamp_port_str(raw: str, default: int) -> int:
     return max(1, min(65535, p))
 
 
-def _clamp_dim_str(raw: str) -> int:
-    """0 이거나 빈 값은 네이티브; 그 외는 양수 상한만 둔다."""
-    s = str(raw).strip()
-    if not s:
-        return 0
-    try:
-        v = int(s)
-    except ValueError:
-        return 0
-    if v <= 0:
-        return 0
-    return min(v, 16384)
-
-
 def launch_remote_viewer_process() -> tuple[bool, str]:
     """별도 OS 창(Flet 프로세스)으로 원격 뷰어를 연다. 멀티윈도 미지원 분기."""
 
@@ -98,46 +84,6 @@ def build_remote_settings(state: AppState) -> ft.Control:
         value=bool(hp.h264_hardware_encode),
         on_change=lambda e: _persist_h264_hw(state, bool(e.control.value)),
     )
-    w_field = text_field(
-        label="송출 가로(px)",
-        value="" if hp.capture_width <= 0 else str(hp.capture_width),
-        hint="비우거나 0 = 원격 PC 해상도",
-        expand=True,
-        keyboard_type=ft.KeyboardType.NUMBER,
-        on_change=lambda e: _persist_host_dim_w(state, e.control.value),
-    )
-    h_field = text_field(
-        label="송출 세로(px)",
-        value="" if hp.capture_height <= 0 else str(hp.capture_height),
-        hint="비우거나 0 = 원격 PC 해상도",
-        expand=True,
-        keyboard_type=ft.KeyboardType.NUMBER,
-        on_change=lambda e: _persist_host_dim_h(state, e.control.value),
-    )
-    stun_field = text_field(
-        label="STUN (줄마다 하나)",
-        value=hp.stun_urls,
-        multiline=True,
-        height=120,
-        on_change=lambda e: _persist_host_stun(state, e.control.value),
-    )
-    turn_uri = text_field(
-        label="TURN URI (선택)",
-        value=hp.turn_uri,
-        hint="turn:… 또는 turns:…",
-        on_change=lambda e: _persist_turn(state, uri=e.control.value),
-    )
-    turn_user = text_field(
-        label="TURN 사용자",
-        value=hp.turn_username,
-        on_change=lambda e: _persist_turn(state, username=e.control.value),
-    )
-    turn_pass = text_field(
-        label="TURN 비밀번호",
-        value=hp.turn_password,
-        password=True,
-        on_change=lambda e: _persist_turn(state, password=e.control.value),
-    )
     host_auth = text_field(
         label="연결 비밀번호 (필수 · 맥 호스트)"
         if sys.platform == "darwin"
@@ -160,20 +106,6 @@ def build_remote_settings(state: AppState) -> ft.Control:
                 state, bool(getattr(e.control, "value", False))
             ),
         )
-        _preset_label_by_id = {k: lab for k, lab in PRESET_LABELS}
-        _preset_row_labels = [lab for _, lab in PRESET_LABELS]
-        _cur_preset_label = _preset_label_by_id.get(
-            hp.resolution_preset, PRESET_LABELS[0][1]
-        )
-        preset_dd = ft.Dropdown(
-            label="해상도 프리셋",
-            value=_cur_preset_label,
-            width=420,
-            options=[ft.dropdown.Option(lab) for lab in _preset_row_labels],
-            on_select=lambda e: _persist_resolution_preset_label(
-                state, str(getattr(e.control, "value", "") or "")
-            ),
-        )
         audio_vd_field = text_field(
             label="원격 오디오 입력 장치 (이름 일부)",
             value=hp.darwin_audio_input,
@@ -183,18 +115,20 @@ def build_remote_settings(state: AppState) -> ft.Control:
         )
         mac_controls = [
             vd_switch,
-            ft.Row(
-                spacing=T.SPACE_MD,
-                vertical_alignment=ft.CrossAxisAlignment.START,
-                controls=[preset_dd],
-            ),
             audio_vd_field,
             ft.Text(
                 "가상 디스플레이는 CGVirtualDisplay 비공개 API를 사용합니다. "
                 "오디오는 BlackHole 등 가상 입력으로 캡처합니다. "
-                "해상도는 클라이언트가 연결(/offer) 시 보낸 값이 우선이며, "
+                "송출 해상도는 클라이언트가 연결(/offer) 시 요청한 preset 이 적용되고, "
+                "생성에 실패하면 메인 화면 해상도(host_native)로 폴백합니다. "
                 "끊기면 가상 디스플레이가 정리됩니다. "
-                "원격 중에는 물리 화면에 반투명 봉인·세션 끊기 버튼이 덮입니다.",
+                "원격 중에는 물리 화면에 반투명 봉인·세션 끊기 버튼이 덮입니다. "
+                "다른 앱의 새 창 위치는 ‘키보드 포커스’와 무관한 경우가 많습니다. "
+                "많은 앱은 ‘메뉴 막대가 있는 디스플레이(주 디스플레이)’에 띄우고, "
+                "일부는 마우스 커서가 있는 화면을 씁니다. "
+                "원격으로 가상 쪽에만 포커스가 가 있어도, 주 디스플레이·커서가 물리면 물리에 뜰 수 있습니다. "
+                "시스템 설정 → 디스플레이 배열에서 흰색 막대(메뉴 막대)를 가상 디스플레이로 옮겨 주 디스플레이로 만들고, "
+                "가능하면 새 창을 열기 직전에 커서도 그 화면 위에 두면 기대에 가깝게 동작합니다.",
                 style=body_md(),
                 color=T.ON_SURFACE_VARIANT,
             ),
@@ -268,7 +202,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
         title="호스트 (이 PC에서 화면 공유)",
         icon=ft.Icons.CAST_CONNECTED,
         description="WebRTC(aiortc)로 영상을 송출하고 DataChannel 로 마우스·키보드를 받습니다. "
-        "외부망은 포트포워딩 또는 STUN/TURN 설정이 필요합니다.",
+        "STUN/TURN 은 사용하지 않습니다. 같은 네트워크 또는 포트 포워딩으로 접속하세요.",
         content=ft.Column(
             spacing=T.SPACE_MD,
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
@@ -284,17 +218,6 @@ def build_remote_settings(state: AppState) -> ft.Control:
                     "PyAV 에 해당 인코더가 포함되어 있어야 합니다. 없거나 실패 시 libx264 로 송출합니다.",
                     style=body_md(),
                     color=T.ON_SURFACE_VARIANT,
-                ),
-                ft.Row(
-                    spacing=T.SPACE_MD,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
-                    controls=[w_field, h_field],
-                ),
-                stun_field,
-                turn_uri,
-                ft.Row(
-                    spacing=T.SPACE_MD,
-                    controls=[turn_user, turn_pass],
                 ),
                 host_auth,
                 ft.Row(
@@ -340,7 +263,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
     )
     _cl_preset_label_by_id = {k: lab for k, lab in PRESET_LABELS}
     client_res_dd = ft.Dropdown(
-        label="연결 시 호스트 가상 해상도",
+        label="연결 시 요청할 가상 해상도 (/offer preset)",
         value=_cl_preset_label_by_id.get(
             (cp.resolution_preset or "").strip(),
             PRESET_LABELS[0][1],
@@ -466,7 +389,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
         controls=[
             ft.Text("Remote Desktop", style=headline_sm(), color=T.ON_SURFACE),
             ft.Text(
-                "맥 호스트는 가상 디스플레이 모드에서 물리 모니터 대신 지정 해상도만 송출합니다. "
+                "맥 가상 디스플레이: 송출 해상도는 클라이언트 설정의 preset 이 연결 시 적용됩니다. "
                 "그 외 OS 는 단일 모니터 인덱스 기준입니다.",
                 style=label_lg(),
                 color=T.ON_SURFACE_VARIANT,
@@ -508,38 +431,6 @@ def _persist_host_port(state: AppState, raw: str) -> None:
     state.save()
 
 
-def _persist_host_dim_w(state: AppState, raw: str) -> None:
-    state.settings.remote.host.capture_width = _clamp_dim_str(raw)
-    state.save()
-
-
-def _persist_host_dim_h(state: AppState, raw: str) -> None:
-    state.settings.remote.host.capture_height = _clamp_dim_str(raw)
-    state.save()
-
-
-def _persist_host_stun(state: AppState, raw: str) -> None:
-    state.settings.remote.host.stun_urls = str(raw)
-    state.save()
-
-
-def _persist_turn(
-    state: AppState,
-    *,
-    uri: str | None = None,
-    username: str | None = None,
-    password: str | None = None,
-) -> None:
-    h = state.settings.remote.host
-    if uri is not None:
-        h.turn_uri = str(uri)
-    if username is not None:
-        h.turn_username = str(username)
-    if password is not None:
-        h.turn_password = str(password)
-    state.save()
-
-
 def _persist_host_auth(state: AppState, raw: str) -> None:
     state.settings.remote.host.auth_token = str(raw)
     state.save()
@@ -548,14 +439,6 @@ def _persist_host_auth(state: AppState, raw: str) -> None:
 def _persist_use_virtual_display(state: AppState, enabled: bool) -> None:
     state.settings.remote.host.use_virtual_display = enabled
     state.save()
-
-
-def _persist_resolution_preset_label(state: AppState, label: str) -> None:
-    for k, lab in PRESET_LABELS:
-        if lab == label:
-            state.settings.remote.host.resolution_preset = k
-            state.save()
-            return
 
 
 def _persist_darwin_audio_input(state: AppState, raw: str) -> None:
