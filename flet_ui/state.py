@@ -1052,11 +1052,10 @@ class AppState:
                 pass
             return
         ok_down = self._arduino.send_virtual_key(vk, down=True)
-        ok_up = self._arduino.send_virtual_key(vk, down=False)
-        if ok_down and ok_up:
+        if ok_down:
             try:
                 log_arduino_notice(
-                    f"[FOCUS] {edge} → vk={vk} (0x{vk:02X}) DOWN+UP 전송 완료"
+                    f"[FOCUS] {edge} → vk={vk} (0x{vk:02X}) 전송 완료"
                 )
             except Exception:  # noqa: BLE001
                 pass
