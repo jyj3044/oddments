@@ -63,6 +63,7 @@ def schedule_seal_show(
     *,
     ui_runner: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
+    global _proc
     vid = int(virtual_display_id)
     if vid <= 0:
         _log.warning("darwin_remote_seal: virtual_display_id=%s 무시", vid)
@@ -87,7 +88,6 @@ def schedule_seal_show(
             _log.exception("darwin_remote_seal: subprocess 실행 실패")
             return
 
-        global _proc
         _proc = proc
 
     def _read_stdout() -> None:

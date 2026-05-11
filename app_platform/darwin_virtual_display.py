@@ -896,11 +896,61 @@ def restore_primary_display(old_main_id: int, vd_display_id: int) -> bool:
         return False
 
 
+def move_windows_to_display(target_display_id: int, exclude_pid: int = 0) -> int:
+    """물리 화면에 있는 앱 창을 ``target_display_id`` 디스플레이로 이동한다.
+
+    System Events AppleScript 를 통해 각 프로세스의 창 위치를 이동한다.
+    접근성(Accessibility) 권한이 필요하다.
+
+    ``exclude_pid`` 가 0 이 아니면 해당 PID 의 프로세스 창은 건너뛴다.
+    반환값: osascript 실행 성공 여부 (1=성공, 0=실패)
+    """
+    import subprocess as _sp
+
+    rect = cg_display_bounds(target_display_id)
+    if rect is None:
+        return 0
+    vx, vy, vw, vh = (int(v) for v in rect)
+
+    # 창이 VD 밖에 있으면 VD 좌상단 근처로 이동
+    excl = f"and unix id is not {exclude_pid}" if exclude_pid else ""
+    script = f"""\
+tell application "System Events"
+    set vx to {vx}
+    set vy to {vy}
+    set vw to {vw}
+    set vh to {vh}
+    repeat with proc in (processes where visible is true and background only is false {excl})
+        try
+            repeat with win in windows of proc
+                try
+                    set {{wx, wy}} to position of win
+                    if (wx < vx) or (wx >= vx + vw) or (wy < vy) or (wy >= vy + vh) then
+                        set position of win to {{vx + 40, vy + 40}}
+                    end if
+                end try
+            end repeat
+        end try
+    end repeat
+end tell
+"""
+    try:
+        _sp.run(
+            ["osascript", "-e", script],
+            timeout=8,
+            capture_output=True,
+        )
+        return 1
+    except Exception:
+        return 0
+
+
 __all__ = [
     "DarwinVirtualDisplayError",
     "cg_display_bounds",
     "cg_display_id_still_online",
     "create_virtual_display",
+    "move_windows_to_display",
     "release_virtual_display",
     "release_virtual_display_on_main_thread",
     "restore_primary_display",

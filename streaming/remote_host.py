@@ -668,11 +668,23 @@ class RemoteHostServer:
             if not self._pcs:
                 return
             try:
-                from app_platform.darwin_virtual_display import set_virtual_display_as_primary
+                from app_platform.darwin_virtual_display import (
+                    move_windows_to_display,
+                    set_virtual_display_as_primary,
+                )
 
                 old = set_virtual_display_as_primary(int(self._vd_display_id))
                 if old > 0:
                     self._vd_old_main_display_id = old
+                    # 디스플레이 재배치 후 기존 창이 물리 화면으로 이동하므로
+                    # 0.6s 뒤 VD 쪽으로 다시 이동시킨다.
+                    loop.call_later(
+                        0.6,
+                        lambda: move_windows_to_display(
+                            int(self._vd_display_id),
+                            exclude_pid=os.getpid(),
+                        ),
+                    )
             except Exception as exc:
                 try:
                     log_remote_event(
