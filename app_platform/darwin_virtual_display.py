@@ -896,7 +896,11 @@ def restore_primary_display(old_main_id: int, vd_display_id: int) -> bool:
         return False
 
 
-def move_windows_to_display(target_display_id: int, exclude_pid: int = 0) -> int:
+def move_windows_to_display(
+    target_display_id: int,
+    exclude_pid: int = 0,
+    verbose: bool = False,
+) -> int:
     """타깃 디스플레이 밖에 있는 일반 앱 창을 타깃 디스플레이로 이동한다.
 
     호스트 앱의 접근성 권한으로 ``AXUIElement`` API 를 직접 호출한다.
@@ -990,14 +994,15 @@ def move_windows_to_display(target_display_id: int, exclude_pid: int = 0) -> int
         except Exception:
             pass
 
-    try:
-        from streaming.remote_log import log_remote_event
+    if verbose or moved:
+        try:
+            from streaming.remote_log import log_remote_event
 
-        log_remote_event(
-            f"호스트: 기존 창 VD 이동 — pids={len(pids)} moved={moved}"
-        )
-    except Exception:
-        pass
+            log_remote_event(
+                f"호스트: 창 VD 이동 — pids={len(pids)} moved={moved}"
+            )
+        except Exception:
+            pass
     return moved
 
 

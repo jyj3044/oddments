@@ -431,6 +431,14 @@ def _inject_input_message(
             down = bool(msg.get("down", True))
         except Exception:
             down = True
+        # 진단: 한글 등 비-ASCII 키 수신 추적용.
+        try:
+            cps = [hex(ord(c)) for c in k]
+            log_remote_event(
+                f"호스트: 키 수신 k={k!r} cps={cps} down={down}"
+            )
+        except Exception:
+            pass
         _press_key(k, down)
 
 
@@ -556,8 +564,9 @@ class RemoteHostServer:
         self._seal_ui_runner: Optional[_SealUiRunner] = seal_ui_runner
         self._vd_obj: object | None = None
         self._vd_display_id: int = 0
-        # 봉인 표시 후 VD를 주 디스플레이로 전환할 때 저장하는 이전 주 디스플레이 ID (0 = 전환 안 됨).
-        self._vd_old_main_display_id: int = 0
+        # 봉인 동안 물리 화면에 등장한 일반 앱 창을 VD 로 끌어오는 polling 스레드.
+        self._corral_thread: threading.Thread | None = None
+        self._corral_stop_event: threading.Event | None = None
         # 가상 디스플레이 PyObjC 객체는 워커·호스트 루프에서 동시에 건드리면 이중 release 로 SIGSEGV 가 난다.
         self._vd_session_lock = threading.Lock()
         # vd 해제 시 워커 스택/클로저가 PyObjC 래퍼를 붙잡으면 GC 가 idle 워커에서 object_dealloc 하며 SIGSEGV 난다.
@@ -657,51 +666,77 @@ class RemoteHostServer:
                     )
                 except Exception:
                     pass
-            # 봉인 창이 표시된 뒤 VD를 주 디스플레이로 전환한다.
-            # (봉인 없이 먼저 전환하면 물리 모니터에 VD 내용이 보일 수 있음)
-            try:
-                loop.call_later(1.5, _swap_primary)
-            except Exception:
-                pass
-
-        def _swap_primary() -> None:
-            if not self._pcs:
-                return
-            try:
-                from app_platform.darwin_virtual_display import (
-                    move_windows_to_display,
-                    set_virtual_display_as_primary,
-                )
-
-                old = set_virtual_display_as_primary(int(self._vd_display_id))
-                if old > 0:
-                    self._vd_old_main_display_id = old
-                    # 디스플레이 재배치 후 기존 창이 물리 화면으로 이동하므로
-                    # 0.6s 뒤 VD 쪽으로 다시 이동시킨다.
-                    loop.call_later(
-                        0.6,
-                        lambda: move_windows_to_display(
-                            int(self._vd_display_id),
-                            exclude_pid=os.getpid(),
-                        ),
-                    )
-            except Exception as exc:
-                try:
-                    log_remote_event(
-                        f"호스트: VD 주 디스플레이 전환 실패 — {exc}",
-                        error=True,
-                    )
-                except Exception:
-                    pass
+            # 봉인 후 창 코랄(corral) 스레드 시작: 0.3s 간격 polling 으로
+            # 물리 화면에 등장한 일반 앱 창을 VD 로 이동시킨다.
+            self._start_window_corral_thread(vid)
 
         try:
             loop.call_later(0.48, _fire)
         except Exception:
             _fire()
 
+    def _start_window_corral_thread(self, vid: int) -> None:
+        """원격 세션 동안 0.3s 간격으로 물리 화면에 등장한 창을 VD 로 이동시킨다.
+
+        VD 주 디스플레이 전환을 하지 않는 대신 이 polling 으로 새 창과
+        활성화되는 기존 창을 자동으로 VD 쪽으로 끌어온다.
+        """
+        if sys.platform != "darwin":
+            return
+        if getattr(self, "_corral_thread", None) is not None:
+            return
+        stop_ev = threading.Event()
+        self._corral_stop_event = stop_ev
+        my_pid = os.getpid()
+
+        def _run() -> None:
+            try:
+                from app_platform.darwin_virtual_display import move_windows_to_display
+            except Exception:
+                return
+            total_moved = 0
+            iters = 0
+            while not stop_ev.is_set() and self._pcs and self._vd_display_id == vid:
+                try:
+                    moved = move_windows_to_display(vid, exclude_pid=my_pid)
+                    total_moved += int(moved or 0)
+                except Exception:
+                    pass
+                iters += 1
+                # 60 회(약 18s)마다 1회 요약 로그
+                if iters % 60 == 0:
+                    try:
+                        log_remote_event(
+                            f"호스트: 창 코랄 polling 누적 — iters={iters} moved={total_moved}"
+                        )
+                    except Exception:
+                        pass
+                stop_ev.wait(0.3)
+
+        t = threading.Thread(target=_run, name="vd-window-corral", daemon=True)
+        self._corral_thread = t
+        t.start()
+
+    def _stop_window_corral_thread(self) -> None:
+        ev = getattr(self, "_corral_stop_event", None)
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+        t = getattr(self, "_corral_thread", None)
+        if t is not None:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+        self._corral_thread = None
+        self._corral_stop_event = None
+
     def _try_stop_physical_seal(self) -> None:
         if sys.platform != "darwin":
             return
+        self._stop_window_corral_thread()
         try:
             log_remote_diag("호스트: 물리 화면 봉인 해제 — schedule_seal_hide 예약")
         except Exception:
@@ -782,21 +817,6 @@ class RemoteHostServer:
             old_id = int(self._vd_display_id)
             self._vd_obj = None
             self._vd_display_id = 0
-
-        old_main = self._vd_old_main_display_id
-        self._vd_old_main_display_id = 0
-        if old_main > 0:
-            try:
-                from app_platform.darwin_virtual_display import restore_primary_display
-
-                restore_primary_display(old_main, old_id)
-            except Exception as exc:
-                try:
-                    log_remote_event(
-                        f"호스트: 주 디스플레이 복원 실패 — {exc}", error=True
-                    )
-                except Exception:
-                    pass
 
         self._vd_release_complete_event.clear()
         try:
@@ -886,21 +906,6 @@ class RemoteHostServer:
             old_id = int(self._vd_display_id)
             self._vd_obj = None
             self._vd_display_id = 0
-
-        old_main = self._vd_old_main_display_id
-        self._vd_old_main_display_id = 0
-        if old_main > 0:
-            try:
-                from app_platform.darwin_virtual_display import restore_primary_display
-
-                restore_primary_display(old_main, old_id)
-            except Exception as exc:
-                try:
-                    log_remote_event(
-                        f"호스트: 주 디스플레이 복원 실패 — {exc}", error=True
-                    )
-                except Exception:
-                    pass
 
         import gc as _gc
 
