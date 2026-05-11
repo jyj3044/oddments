@@ -630,8 +630,22 @@ class RemoteHostServer:
                 except Exception:
                     pass
 
+        # NSScreen 목록·가상 디스플레이 등록 직후 첫 봉인이 빗나갈 수 있어 한 번 더 시도.
+        def _fire_retry() -> None:
+            try:
+                from app_platform.darwin_remote_seal import schedule_seal_show
+
+                schedule_seal_show(
+                    vid,
+                    cb,
+                    ui_runner=self._seal_ui_runner,
+                )
+            except Exception:
+                pass
+
         try:
             loop.call_later(0.48, _fire)
+            loop.call_later(1.65, _fire_retry)
         except Exception:
             _fire()
 

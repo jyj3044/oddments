@@ -1246,18 +1246,8 @@ class AppState:
             if _sys.platform == "darwin" and vd:
 
                 def seal_ui_runner(fn: Callable[[], None]) -> None:
-                    page = getattr(self, "page", None)
-                    run_task = getattr(page, "run_task", None) if page is not None else None
-                    if callable(run_task):
-
-                        async def _coro() -> None:
-                            fn()
-
-                        try:
-                            run_task(_coro)
-                            return
-                        except Exception:
-                            pass
+                    # NSWindow 는 AppKit 메인 스레드에서만 안전. Flet ``run_task`` 코루틴은
+                    # 그 보장이 없어 봉인이 안 뜨거나 무시될 수 있음 → 항상 CF 메인 루프로 보냄.
                     from app_platform.darwin_remote_seal import _schedule_on_main
 
                     _schedule_on_main(fn)

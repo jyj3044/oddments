@@ -46,7 +46,6 @@ import numpy as np
 
 from streaming.remote_client import run_session_in_thread
 from streaming.remote_log import log_remote_event
-from streaming.remote_presets import PRESET_LABELS
 
 from app_platform import ensure_pre_gui_init
 from app_platform.host import require_windows_admin_or_exit
@@ -535,10 +534,6 @@ def remote_viewer_main(page: ft.Page) -> None:
     video_shell_ref: list[ft.Container | None] = [None]
     win_kbd_sink_stop: Callable[[], None] | None = None
     meta_from_host = [False]
-    host_virtual_display = [False]
-    # 원격 뷰어 WebRTC 세션 중에는 /offer 시점 프리셋만 유효 — 드롭다운으로 중간 변경 불가.
-    rv_session_active = [False]
-    preset_dd_ref: list[ft.Dropdown | None] = [None]
     decode_dims_shown = [False]
     jpeg_temp_paths: list[str] = []
     first_video_logged = [False]
@@ -658,31 +653,9 @@ def remote_viewer_main(page: ft.Page) -> None:
             max(0.0, min(1.0, ny)),
         )
 
-    def _sync_preset_dd() -> None:
-        dd = preset_dd_ref[0]
-        if dd is None:
-            return
-        try:
-            dd.disabled = (not host_virtual_display[0]) or rv_session_active[0]
-        except Exception:
-            pass
-
-    def _rv_terminal_unlock_preset(msg: str) -> bool:
-        m = (msg or "").strip()
-        return (
-            m.startswith("영상 종료")
-            or m.startswith("신호 실패")
-            or m.startswith("피어: failed")
-            or m.startswith("피어: closed")
-            or m.startswith("피어: disconnected")
-        )
-
     def _emit_state(msg: str) -> None:
         async def _apply() -> None:
             conn_status.value = msg
-            if _rv_terminal_unlock_preset(msg):
-                rv_session_active[0] = False
-                _sync_preset_dd()
             try:
                 page.update()
             except Exception:
@@ -769,13 +742,6 @@ def remote_viewer_main(page: ft.Page) -> None:
                 meta_from_host[0] = True
                 mw = d.get("mon_w")
                 mh = d.get("mon_h")
-                host_virtual_display[0] = bool(d.get("virtual_display", False))
-                _sync_preset_dd()
-                pr = d.get("preset")
-                if isinstance(pr, str) and pr.strip():
-                    lab = _preset_label_by_id.get(pr.strip())
-                    if lab is not None:
-                        preset_dd.value = lab
                 # stream_w/h 는 디코드 프레임 기준 stream_wh 와 맞춘다. 메타만으로 덮으면 좌표가 어긋날 수 있다.
                 _sync_remote_video_rect()
                 try:
@@ -818,36 +784,6 @@ def remote_viewer_main(page: ft.Page) -> None:
     except (TypeError, ValueError):
         rail_width_user = [300.0]
 
-    _preset_label_by_id = {k: lab for k, lab in PRESET_LABELS}
-    _preset_id_by_label = {lab: k for k, lab in PRESET_LABELS}
-
-    def _on_viewer_preset_select(e: ft.ControlEvent) -> None:
-        lab = str(getattr(e.control, "value", "") or "")
-        pid = _preset_id_by_label.get(lab)
-        if not pid:
-            return
-        try:
-            state.settings.remote.client.resolution_preset = pid
-            state.save()
-        except Exception:
-            pass
-        _emit_state(f"다음 연결(/offer) 시 적용: {lab}")
-
-    preset_dd = ft.Dropdown(
-        label="다음 연결 시 가상 해상도 (preset)",
-        value=_preset_label_by_id.get(
-            (rc.resolution_preset or "").strip(),
-            PRESET_LABELS[0][1],
-        ),
-        width=int(min(280, max(200, rail_width_user[0] - 20))),
-        options=[ft.dropdown.Option(lab) for _, lab in PRESET_LABELS],
-        disabled=True,
-        on_select=_on_viewer_preset_select,
-        text_style=body_md(),
-        label_style=label_md(),
-    )
-    preset_dd_ref[0] = preset_dd
-
     sb_title = ft.Text("원격 뷰어", style=label_lg(), color=T.ON_SURFACE)
     sb_target = ft.Text(
         f"대상 {rc.host or '127.0.0.1'}:{rc.port}",
@@ -861,16 +797,6 @@ def remote_viewer_main(page: ft.Page) -> None:
             sb_target,
             conn_status,
             res_line,
-            preset_dd,
-            ft.Text(
-                "가상 디스플레이 호스트는 연결 시(/offer) 요청한 preset 만 사용합니다. "
-                "세션 중에는 드롭다운이 비활성화됩니다. "
-                "해상도를 바꾼 뒤에는 끊고 다시 연결하세요. "
-                "큰 해상도는 캡처 픽셀 수가 늘어나지만 WebRTC H.264 비트레이트는 "
-                "대략 일정이라 화면이 흐릿·블록 노이즈처럼 보일 수 있습니다.",
-                style=body_md(),
-                color=T.ON_SURFACE_VARIANT,
-            ),
         ],
     )
 
@@ -1471,8 +1397,6 @@ def remote_viewer_main(page: ft.Page) -> None:
         offer_preset=(rc.resolution_preset or "").strip(),
     )
     session_ref["s"] = sess
-    rv_session_active[0] = sess is not None
-    _sync_preset_dd()
     if sess is None:
         try:
             log_remote_event("원격 뷰어: 백그라운드 세션 시작 실패", error=True)
@@ -1491,11 +1415,6 @@ def remote_viewer_main(page: ft.Page) -> None:
                 stop_sink()
             except Exception:
                 pass
-        rv_session_active[0] = False
-        try:
-            _sync_preset_dd()
-        except Exception:
-            pass
         try:
             log_remote_event("원격 뷰어: 창 종료")
         except Exception:
