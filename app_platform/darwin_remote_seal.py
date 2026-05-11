@@ -81,7 +81,7 @@ def schedule_seal_show(
                 [sys.executable, str(_WORKER), str(vid)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=None,
+                stderr=subprocess.PIPE,
                 close_fds=True,
             )
         except Exception:
@@ -100,10 +100,31 @@ def schedule_seal_show(
                         on_disconnect()
                     except Exception:
                         _log.exception("darwin_remote_seal: on_disconnect 콜백 실패")
+                elif line:
+                    try:
+                        from streaming.remote_log import log_remote_event
+                        log_remote_event(f"봉인 worker: {line}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _read_stderr() -> None:
+        try:
+            assert proc.stderr is not None
+            for raw in proc.stderr:
+                line = raw.strip().decode("utf-8", errors="replace")
+                if line:
+                    try:
+                        from streaming.remote_log import log_remote_event
+                        log_remote_event(f"봉인 worker 오류: {line}", error=True)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
     threading.Thread(target=_read_stdout, daemon=True).start()
+    threading.Thread(target=_read_stderr, daemon=True).start()
 
     try:
         from streaming.remote_log import log_remote_event
