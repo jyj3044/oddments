@@ -671,6 +671,45 @@ def cg_display_bounds(display_id: int) -> tuple[float, float, float, float]:
     )
 
 
+def _cg_load_display_config_fns() -> object:
+    """CoreGraphics C 함수 중 PyObjC 가 래핑하지 않는 CGDisplayConfiguration API 를
+    ctypes 로 직접 로드한다.
+
+    PyObjC 의 Quartz 모듈은 ``CGBeginDisplayConfiguration`` 의 출력 파라미터를
+    ctypes 방식으로 처리하지 않으므로, ctypes.CDLL 을 통해 직접 바인딩한다.
+    """
+    _CG_PATH = (
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    )
+    cg = ctypes.CDLL(_CG_PATH)
+
+    cg.CGMainDisplayID.restype = ctypes.c_uint32
+    cg.CGMainDisplayID.argtypes = []
+
+    # CGError CGBeginDisplayConfiguration(CGDisplayConfigRef *config)
+    cg.CGBeginDisplayConfiguration.restype = ctypes.c_int32
+    cg.CGBeginDisplayConfiguration.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+
+    # CGError CGConfigureDisplayOrigin(CGDisplayConfigRef, CGDirectDisplayID, int32_t x, int32_t y)
+    cg.CGConfigureDisplayOrigin.restype = ctypes.c_int32
+    cg.CGConfigureDisplayOrigin.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    ]
+
+    # void CGCancelDisplayConfiguration(CGDisplayConfigRef)
+    cg.CGCancelDisplayConfiguration.restype = None
+    cg.CGCancelDisplayConfiguration.argtypes = [ctypes.c_void_p]
+
+    # CGError CGCompleteDisplayConfiguration(CGDisplayConfigRef, CGConfigureOption)
+    cg.CGCompleteDisplayConfiguration.restype = ctypes.c_int32
+    cg.CGCompleteDisplayConfiguration.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+
+    return cg
+
+
 def set_virtual_display_as_primary(vd_display_id: int) -> int:
     """가상 디스플레이를 주 디스플레이(origin 0,0)로 설정한다.
 
@@ -681,55 +720,111 @@ def set_virtual_display_as_primary(vd_display_id: int) -> int:
 
     반환값: 복원 시 사용할 이전 주 디스플레이 ID (성공), 0 (실패·변경 불필요).
     """
+    vid = int(vd_display_id)
+    if vid <= 0:
+        return 0
+    step = "init"
     try:
         import Quartz  # type: ignore[import-untyped]
 
-        vid = int(vd_display_id)
-        if vid <= 0:
-            return 0
+        step = "load_cg"
+        cg = _cg_load_display_config_fns()
 
-        old_main_id = int(Quartz.CGMainDisplayID())
+        step = "main_id"
+        old_main_id = int(cg.CGMainDisplayID())
         if old_main_id == vid:
             return 0  # 이미 주 디스플레이
 
+        step = "bounds"
         new_bounds = Quartz.CGDisplayBounds(vid)
-        old_new_x = int(new_bounds.origin.x)
-        old_new_y = int(new_bounds.origin.y)
-        new_main_w = int(new_bounds.size.width)
+        new_main_w = max(1, int(new_bounds.size.width))
 
-        config = ctypes.c_void_p()
-        err = Quartz.CGBeginDisplayConfiguration(ctypes.byref(config))
+        step = "begin_config"
+        config_ref = ctypes.c_void_p()
+        err = cg.CGBeginDisplayConfiguration(ctypes.byref(config_ref))
         if err != 0:
+            try:
+                from streaming.remote_log import log_remote_event
+                log_remote_event(
+                    f"호스트: 가상 디스플레이 주 설정 실패 — CGBeginDisplayConfiguration err={err}",
+                    error=True,
+                )
+            except Exception:
+                pass
             return 0
 
-        # 가상 디스플레이를 원점(0,0)으로 이동 → 주 디스플레이가 됨
-        err = Quartz.CGConfigureDisplayOrigin(config, vid, 0, 0)
+        step = "origin_vd"
+        err = cg.CGConfigureDisplayOrigin(
+            config_ref, ctypes.c_uint32(vid), ctypes.c_int32(0), ctypes.c_int32(0)
+        )
         if err != 0:
-            Quartz.CGCancelDisplayConfiguration(config)
+            cg.CGCancelDisplayConfiguration(config_ref)
+            try:
+                from streaming.remote_log import log_remote_event
+                log_remote_event(
+                    f"호스트: 가상 디스플레이 주 설정 실패 — CGConfigureDisplayOrigin(vd) err={err}",
+                    error=True,
+                )
+            except Exception:
+                pass
             return 0
 
-        # 기존 주 디스플레이를 가상 디스플레이 오른쪽으로 이동
-        err = Quartz.CGConfigureDisplayOrigin(config, old_main_id, new_main_w, 0)
+        step = "origin_old"
+        err = cg.CGConfigureDisplayOrigin(
+            config_ref,
+            ctypes.c_uint32(old_main_id),
+            ctypes.c_int32(new_main_w),
+            ctypes.c_int32(0),
+        )
         if err != 0:
-            Quartz.CGCancelDisplayConfiguration(config)
+            cg.CGCancelDisplayConfiguration(config_ref)
+            try:
+                from streaming.remote_log import log_remote_event
+                log_remote_event(
+                    f"호스트: 가상 디스플레이 주 설정 실패 — CGConfigureDisplayOrigin(old) err={err}",
+                    error=True,
+                )
+            except Exception:
+                pass
             return 0
 
-        # 현재 세션에만 적용 (kCGConfigureForSession = 1)
-        err = Quartz.CGCompleteDisplayConfiguration(config, 1)
+        step = "complete"
+        # kCGConfigureForSession = 1
+        err = cg.CGCompleteDisplayConfiguration(config_ref, ctypes.c_uint32(1))
         if err != 0:
+            try:
+                from streaming.remote_log import log_remote_event
+                log_remote_event(
+                    f"호스트: 가상 디스플레이 주 설정 실패 — CGCompleteDisplayConfiguration err={err}",
+                    error=True,
+                )
+            except Exception:
+                pass
             return 0
 
         try:
             from streaming.remote_log import log_remote_event
-
             log_remote_event(
-                f"호스트: 가상 디스플레이(id={vid})를 주 디스플레이로 전환 "
-                f"(이전 주={old_main_id}, 이전 위치=({old_new_x},{old_new_y}))"
+                f"호스트: 가상 디스플레이(id={vid})를 주 디스플레이로 전환 완료 "
+                f"(이전 주 디스플레이 id={old_main_id})"
             )
         except Exception:
             pass
         return old_main_id
-    except Exception:
+
+    except Exception as exc:
+        try:
+            from streaming.remote_log import log_remote_event
+            log_remote_event(
+                f"호스트: 가상 디스플레이 주 설정 예외 (step={step}) — "
+                f"{type(exc).__name__}: {exc}",
+                error=True,
+            )
+        except Exception:
+            print(
+                f"[darwin_vd] set_virtual_display_as_primary 예외 step={step}: {exc}",
+                flush=True,
+            )
         return 0
 
 
@@ -741,46 +836,63 @@ def restore_primary_display(old_main_id: int, vd_display_id: int) -> bool:
     """
     if old_main_id == 0:
         return True
+    vid = int(vd_display_id)
+    old_id = int(old_main_id)
+    step = "init"
     try:
         import Quartz  # type: ignore[import-untyped]
 
-        vid = int(vd_display_id)
-        old_id = int(old_main_id)
+        step = "load_cg"
+        cg = _cg_load_display_config_fns()
 
+        step = "bounds"
         vd_bounds = Quartz.CGDisplayBounds(vid)
-        vd_w = int(vd_bounds.size.width)
+        vd_w = max(1, int(vd_bounds.size.width))
 
-        config = ctypes.c_void_p()
-        err = Quartz.CGBeginDisplayConfiguration(ctypes.byref(config))
+        step = "begin_config"
+        config_ref = ctypes.c_void_p()
+        err = cg.CGBeginDisplayConfiguration(ctypes.byref(config_ref))
         if err != 0:
             return False
 
-        # 기존 주 디스플레이를 다시 (0,0)으로 복원
-        err = Quartz.CGConfigureDisplayOrigin(config, old_id, 0, 0)
+        step = "origin_old"
+        err = cg.CGConfigureDisplayOrigin(
+            config_ref, ctypes.c_uint32(old_id), ctypes.c_int32(0), ctypes.c_int32(0)
+        )
         if err != 0:
-            Quartz.CGCancelDisplayConfiguration(config)
+            cg.CGCancelDisplayConfiguration(config_ref)
             return False
 
-        # 가상 디스플레이는 기존 주 디스플레이 오른쪽으로
-        err = Quartz.CGConfigureDisplayOrigin(config, vid, vd_w, 0)
+        step = "origin_vd"
+        err = cg.CGConfigureDisplayOrigin(
+            config_ref,
+            ctypes.c_uint32(vid),
+            ctypes.c_int32(vd_w),
+            ctypes.c_int32(0),
+        )
         if err != 0:
-            Quartz.CGCancelDisplayConfiguration(config)
+            cg.CGCancelDisplayConfiguration(config_ref)
             return False
 
-        err = Quartz.CGCompleteDisplayConfiguration(config, 1)
+        step = "complete"
+        err = cg.CGCompleteDisplayConfiguration(config_ref, ctypes.c_uint32(1))
         if err != 0:
             return False
 
         try:
             from streaming.remote_log import log_remote_event
-
             log_remote_event(
-                f"호스트: 주 디스플레이 복원 (old_main={old_id}, vd={vid})"
+                f"호스트: 주 디스플레이 복원 완료 (old_main={old_id}, vd={vid})"
             )
         except Exception:
             pass
         return True
-    except Exception:
+
+    except Exception as exc:
+        print(
+            f"[darwin_vd] restore_primary_display 예외 step={step}: {exc}",
+            flush=True,
+        )
         return False
 
 

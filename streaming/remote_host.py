@@ -638,8 +638,20 @@ class RemoteHostServer:
             return
         vid = int(self._vd_display_id)
         cb = self._request_disconnect_from_seal
+        try:
+            log_remote_event(
+                f"호스트: 물리 화면 봉인 예약 (vid={vid}, 0.48s 후)"
+            )
+        except Exception:
+            pass
 
         def _fire() -> None:
+            try:
+                log_remote_event(
+                    f"호스트: 물리 화면 봉인 창 생성 시작 (vid={vid})"
+                )
+            except Exception:
+                pass
             try:
                 from app_platform.darwin_remote_seal import schedule_seal_show
 
@@ -648,6 +660,12 @@ class RemoteHostServer:
                     cb,
                     ui_runner=self._seal_ui_runner,
                 )
+                try:
+                    log_remote_event(
+                        f"호스트: 물리 화면 봉인 schedule_seal_show 완료 (vid={vid})"
+                    )
+                except Exception:
+                    pass
             except Exception as exc:
                 try:
                     log_remote_event(

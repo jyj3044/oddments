@@ -405,6 +405,13 @@ def schedule_seal_show(
 
     def _go() -> None:
         try:
+            from streaming.remote_log import log_remote_event
+            log_remote_event(
+                f"호스트: 물리 화면 봉인 창 생성 실행 중 (vid={vid}, 메인 스레드)"
+            )
+        except Exception:
+            pass
+        try:
             from app_platform.darwin_accessibility import accessibility_trusted
 
             if not accessibility_trusted():
@@ -412,10 +419,25 @@ def schedule_seal_show(
                     "darwin_remote_seal: 접근성 미허용 — 물리 화면 봉인이 표시되지 않거나 "
                     "다른 창에 가릴 수 있습니다. 시스템 설정 → 접근성에서 이 앱을 허용하세요."
                 )
+                try:
+                    from streaming.remote_log import log_remote_event
+                    log_remote_event(
+                        "호스트: 봉인 창 — 접근성 미허용 (창은 생성됨, 가릴 수 있음)",
+                        error=True,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
             _build_seal_windows(vid, on_disconnect)
+            try:
+                from streaming.remote_log import log_remote_event
+                log_remote_event(
+                    f"호스트: 물리 화면 봉인 창 생성 완료 (vid={vid})"
+                )
+            except Exception:
+                pass
         except Exception:
             import traceback as _tb
             _log.exception("darwin_remote_seal: _build_seal_windows 실패")
@@ -423,6 +445,14 @@ def schedule_seal_show(
                 f"[darwin_remote_seal] _build_seal_windows 실패 vid={vid}: {_tb.format_exc()}",
                 flush=True,
             )
+            try:
+                from streaming.remote_log import log_remote_event
+                log_remote_event(
+                    f"호스트: 봉인 창 생성 실패 — {_tb.format_exc()[-200:]}",
+                    error=True,
+                )
+            except Exception:
+                pass
 
     if ui_runner is not None:
         ui_runner(_go)
