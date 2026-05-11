@@ -36,10 +36,10 @@ def create_virtual_display(
 
     try:
         from objc import lookUpClass  # type: ignore[import-untyped]
-        from Cocoa import NSMakeSize  # type: ignore[import-untyped]
+        import Quartz  # type: ignore[import-untyped]
     except ImportError as e:
         raise DarwinVirtualDisplayError(
-            "PyObjC(Cocoa) 가 필요합니다. pip install pyobjc-framework-Cocoa"
+            "PyObjC(Quartz) 가 필요합니다. pip install pyobjc-framework-Quartz"
         ) from e
 
     CGVirtualDisplayDescriptor = lookUpClass("CGVirtualDisplayDescriptor")
@@ -68,7 +68,8 @@ def create_virtual_display(
     # 대략 96 DPI 물리 크기(mm)
     mm_w = max(10.0, w * 25.4 / 96.0)
     mm_h = max(10.0, h * 25.4 / 96.0)
-    desc.setSizeInMillimeters_(NSMakeSize(mm_w, mm_h))
+    # Cocoa/AppKit 은 메인 스레드 제약이 있을 수 있어 CGSize(Quartz)만 사용한다.
+    desc.setSizeInMillimeters_(Quartz.CGSizeMake(float(mm_w), float(mm_h)))
 
     vd = CGVirtualDisplay.alloc().initWithDescriptor_(desc)
     if vd is None:

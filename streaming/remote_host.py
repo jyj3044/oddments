@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import cv2
+import mss
 import numpy as np
 from aiohttp import web
 from aiortc import (
@@ -175,22 +176,53 @@ def _monitor_geometry(index: int) -> Optional[tuple[int, int, int, int]]:
 
 
 def _darwin_main_pixel_size() -> tuple[int, int]:
-    """메인 디스플레이 픽셀 크기 (가상 디스플레이 host_native 용)."""
+    """메인 디스플레이 픽셀 크기 (가상 디스플레이 host_native 용).
+
+    해상도 변경 작업은 ThreadPoolExecutor 등 **비 메인 스레드**에서 돌 수 있어
+    AppKit ``NSScreen`` 은 쓰지 않고 Quartz 만 사용한다.
+    """
     if sys.platform != "darwin":
         return 1920, 1080
     try:
-        from AppKit import NSScreen  # type: ignore[import-untyped]
+        import Quartz  # type: ignore[import-untyped]
 
-        scr = NSScreen.mainScreen()
-        if scr is None:
-            return 1920, 1080
-        f = scr.frame()
-        scale = float(scr.backingScaleFactor())
-        w = max(320, int(round(float(f.size.width) * scale)))
-        h = max(240, int(round(float(f.size.height) * scale)))
-        return w, h
+        mid = Quartz.CGMainDisplayID()
+        w = int(Quartz.CGDisplayPixelsWide(mid))
+        h = int(Quartz.CGDisplayPixelsHigh(mid))
+        return max(320, w), max(240, h)
     except Exception:
         return 1920, 1080
+
+
+def _mss_monitors_light() -> list[dict]:
+    """mss 세션을 한 번만 열어 모니터 목록을 가져온다.
+
+    ``enumerate_monitors()`` 는 호출마다 mss 컨텍스트를 새로 열어(Windows EDID 등 포함)
+    가상 디스플레이 매칭 재시도 시 짧은 시간에 수십 번 호출되면 전체 프로세스가 멈춘
+    것처럼 보일 수 있다(Flet UI ``Working…``).
+    """
+    out: list[dict] = []
+    try:
+        with mss.mss() as sct:
+            for i, mon in enumerate(sct.monitors):
+                if i == 0:
+                    continue
+                try:
+                    out.append(
+                        {
+                            "index": int(i),
+                            "left": int(mon.get("left", 0)),
+                            "top": int(mon.get("top", 0)),
+                            "width": int(mon.get("width", 0)),
+                            "height": int(mon.get("height", 0)),
+                            "name": None,
+                        }
+                    )
+                except (TypeError, ValueError, KeyError):
+                    continue
+    except Exception:
+        return []
+    return out
 
 
 def _mss_index_for_rect(
@@ -202,7 +234,7 @@ def _mss_index_for_rect(
     tol: int = 16,
 ) -> Optional[int]:
     """mss 모니터 목록에서 좌표가 일치하는 인덱스."""
-    for m in enumerate_monitors():
+    for m in _mss_monitors_light():
         try:
             if (
                 abs(int(m.get("left", 0)) - left) <= tol
@@ -473,8 +505,12 @@ def _dispatch_dc_payload(
         return
     t = str(msg.get("t", "")).lower()
     if t == "resolution":
-        preset = str(msg.get("preset", "")).strip()
-        if preset:
+        rawp = str(msg.get("preset", "")).strip()
+        if rawp:
+            preset = normalize_preset_id(
+                rawp,
+                fallback=srv._resolution_preset_id or "host_native",
+            )
             srv._schedule_resolution_change(preset)
         return
     if t == "clip_get":
@@ -558,6 +594,7 @@ class RemoteHostServer:
 
         self._capture: CaptureThread | None = None
         self._capture_lock = threading.Lock()
+        self._resolution_restart_lock = threading.Lock()
         self._geom: Optional[tuple[int, int, int, int]] = None
         self._meta_pending: set[object] = set()
         # 맥 Retina: mss/monitor geom 은 물리 픽셀 → pynput 는 논리 포인트일 때 나눔.
@@ -684,7 +721,16 @@ class RemoteHostServer:
         top = int(round(by))
         gw = max(1, int(round(bw)))
         gh = max(1, int(round(bh)))
-        idx = _mss_index_for_rect(left, top, gw, gh)
+        # OS 가 mss 목록에 반영되기까지 짧은 지연이 필요할 수 있다. 과도한 mss 재오픈은
+        # 같은 프로세스의 Flet UI 를 GIL·디스플레이 API 로 막을 수 있어 횟수·간격을 제한한다.
+        time.sleep(0.22)
+        idx: int | None = None
+        for attempt in range(10):
+            idx = _mss_index_for_rect(left, top, gw, gh)
+            if idx is not None:
+                break
+            if attempt < 9:
+                time.sleep(0.14)
         if idx is None:
             self._release_virtual_display_session()
             raise RuntimeError(
@@ -716,32 +762,48 @@ class RemoteHostServer:
 
     def _blocking_restart_resolution(self, preset_id: str) -> None:
         """세션 유지 상태에서 해상도(프리셋)만 교체. 짧은 끊김 허용."""
-        self._try_stop_physical_seal()
-        pid = (preset_id or "").strip() or "host_native"
-        self._resolution_preset_id = pid
-        with self._capture_lock:
-            cap = self._capture
-            self._capture = None
-        if cap is not None:
+        if not self._resolution_restart_lock.acquire(blocking=False):
             try:
-                cap.stop()
+                log_remote_event(
+                    "호스트: 해상도 변경이 이미 진행 중입니다. 새 요청은 건너뜁니다."
+                )
             except Exception:
                 pass
-            self._join_capture_thread(cap)
-        self._stop_darwin_audio()
-        if sys.platform == "darwin" and self._virtual_display_enabled:
-            self._release_virtual_display_session()
-        self._geom = None
-        self._pointer_scale = 1.0
+            return
         try:
-            self._ensure_geom()
-            self._ensure_capture()
-            self._try_start_physical_seal()
-        except Exception as exc:
+            self._try_stop_physical_seal()
+            pid = normalize_preset_id(
+                preset_id,
+                fallback=self._resolution_preset_id or "host_native",
+            )
+            self._resolution_preset_id = pid
+            with self._capture_lock:
+                cap = self._capture
+                self._capture = None
+            if cap is not None:
+                try:
+                    cap.stop()
+                except Exception:
+                    pass
+                self._join_capture_thread(cap)
+            self._stop_darwin_audio()
+            if sys.platform == "darwin" and self._virtual_display_enabled:
+                self._release_virtual_display_session()
+            self._geom = None
+            self._pointer_scale = 1.0
             try:
-                log_remote_event(f"호스트: 해상도 변경 실패 — {exc}", error=True)
-            except Exception:
-                pass
+                self._ensure_geom()
+                self._ensure_capture()
+                self._try_start_physical_seal()
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: 해상도 변경 실패 — {exc}", error=True
+                    )
+                except Exception:
+                    pass
+        finally:
+            self._resolution_restart_lock.release()
 
     def _schedule_resolution_change(self, preset_id: str) -> None:
         loop = self._loop
@@ -749,17 +811,47 @@ class RemoteHostServer:
             return
 
         async def _coro() -> None:
-            exe_loop = asyncio.get_running_loop()
-            await exe_loop.run_in_executor(
-                _POOL,
-                self._blocking_restart_resolution,
-                preset_id,
-            )
+            try:
+                exe_loop = asyncio.get_running_loop()
+                # DataChannel 처리와 같은 _POOL 을 쓰면 워커 고갈·경합이 날 수 있어
+                # 기본 스레드 풀에서 블로킹 재시작을 수행한다.
+                await exe_loop.run_in_executor(
+                    None,
+                    self._blocking_restart_resolution,
+                    preset_id,
+                )
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: 해상도 변경 비동기 작업 실패 — {exc}",
+                        error=True,
+                    )
+                except Exception:
+                    pass
+
+        def _log_resolution_future(fut: asyncio.Future) -> None:  # type: ignore[type-arg]
+            try:
+                fut.result()
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: 해상도 변경 코루틴 종료 오류 — {exc}",
+                        error=True,
+                    )
+                except Exception:
+                    pass
 
         try:
-            asyncio.run_coroutine_threadsafe(_coro(), loop)
-        except Exception:
-            pass
+            fut = asyncio.run_coroutine_threadsafe(_coro(), loop)
+            fut.add_done_callback(_log_resolution_future)
+        except Exception as exc:
+            try:
+                log_remote_event(
+                    f"호스트: 해상도 변경 예약 실패 — {exc}",
+                    error=True,
+                )
+            except Exception:
+                pass
 
     def _darwin_audio_worker(self) -> None:
         try:
