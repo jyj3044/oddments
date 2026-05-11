@@ -556,6 +556,8 @@ class RemoteHostServer:
         self._seal_ui_runner: Optional[_SealUiRunner] = seal_ui_runner
         self._vd_obj: object | None = None
         self._vd_display_id: int = 0
+        # 봉인 표시 후 VD를 주 디스플레이로 전환할 때 저장하는 이전 주 디스플레이 ID (0 = 전환 안 됨).
+        self._vd_old_main_display_id: int = 0
         # 가상 디스플레이 PyObjC 객체는 워커·호스트 루프에서 동시에 건드리면 이중 release 로 SIGSEGV 가 난다.
         self._vd_session_lock = threading.Lock()
         # vd 해제 시 워커 스택/클로저가 PyObjC 래퍼를 붙잡으면 GC 가 idle 워커에서 object_dealloc 하며 SIGSEGV 난다.
@@ -655,6 +657,30 @@ class RemoteHostServer:
                     )
                 except Exception:
                     pass
+            # 봉인 창이 표시된 뒤 VD를 주 디스플레이로 전환한다.
+            # (봉인 없이 먼저 전환하면 물리 모니터에 VD 내용이 보일 수 있음)
+            try:
+                loop.call_later(1.5, _swap_primary)
+            except Exception:
+                pass
+
+        def _swap_primary() -> None:
+            if not self._pcs:
+                return
+            try:
+                from app_platform.darwin_virtual_display import set_virtual_display_as_primary
+
+                old = set_virtual_display_as_primary(int(self._vd_display_id))
+                if old > 0:
+                    self._vd_old_main_display_id = old
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: VD 주 디스플레이 전환 실패 — {exc}",
+                        error=True,
+                    )
+                except Exception:
+                    pass
 
         try:
             loop.call_later(0.48, _fire)
@@ -745,6 +771,21 @@ class RemoteHostServer:
             self._vd_obj = None
             self._vd_display_id = 0
 
+        old_main = self._vd_old_main_display_id
+        self._vd_old_main_display_id = 0
+        if old_main > 0:
+            try:
+                from app_platform.darwin_virtual_display import restore_primary_display
+
+                restore_primary_display(old_main, old_id)
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: 주 디스플레이 복원 실패 — {exc}", error=True
+                    )
+                except Exception:
+                    pass
+
         self._vd_release_complete_event.clear()
         try:
             import gc as _gc
@@ -833,6 +874,21 @@ class RemoteHostServer:
             old_id = int(self._vd_display_id)
             self._vd_obj = None
             self._vd_display_id = 0
+
+        old_main = self._vd_old_main_display_id
+        self._vd_old_main_display_id = 0
+        if old_main > 0:
+            try:
+                from app_platform.darwin_virtual_display import restore_primary_display
+
+                restore_primary_display(old_main, old_id)
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: 주 디스플레이 복원 실패 — {exc}", error=True
+                    )
+                except Exception:
+                    pass
 
         import gc as _gc
 
