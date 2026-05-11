@@ -307,7 +307,10 @@ def _build_seal_windows(virtual_display_id: int, on_disconnect: Callable[[], Non
             cv.addSubview_(btn)
 
             win.setIgnoresMouseEvents_(False)
-            win.makeKeyAndOrderFront_(None)
+            win.setCanHide_(False)
+            win.setHidesOnDeactivate_(False)
+            # orderFrontRegardless: 앱이 active 상태가 아니어도 창을 최전면으로 올린다.
+            win.orderFrontRegardless()
             _windows.append(win)
             covered += 1
             _log.info(
@@ -316,7 +319,12 @@ def _build_seal_windows(virtual_display_id: int, on_disconnect: Callable[[], Non
                 frame,
             )
         except Exception:
+            import traceback as _tb
             _log.exception("darwin_remote_seal: 창 생성 실패")
+            print(
+                f"[darwin_remote_seal] 창 생성 실패: {_tb.format_exc()}",
+                flush=True,
+            )
 
     if covered == 0 and screens:
         ms = NSScreen.mainScreen()
@@ -378,7 +386,9 @@ def _build_seal_windows(virtual_display_id: int, on_disconnect: Callable[[], Non
                     btn.setTarget_(handler)
                     btn.setAction_("fire:")
                     cv.addSubview_(btn)
-                    win.makeKeyAndOrderFront_(None)
+                    win.setCanHide_(False)
+                    win.setHidesOnDeactivate_(False)
+                    win.orderFrontRegardless()
                     _windows.append(win)
                     _log.warning("darwin_remote_seal: 폴백으로 mainScreen 만 봉인")
             except Exception:
@@ -404,7 +414,15 @@ def schedule_seal_show(
                 )
         except Exception:
             pass
-        _build_seal_windows(vid, on_disconnect)
+        try:
+            _build_seal_windows(vid, on_disconnect)
+        except Exception:
+            import traceback as _tb
+            _log.exception("darwin_remote_seal: _build_seal_windows 실패")
+            print(
+                f"[darwin_remote_seal] _build_seal_windows 실패 vid={vid}: {_tb.format_exc()}",
+                flush=True,
+            )
 
     if ui_runner is not None:
         ui_runner(_go)

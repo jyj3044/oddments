@@ -10,6 +10,7 @@ descriptor 에 붙이고, ``CGVirtualDisplay`` 생성·모드 적용·``release`
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import threading
@@ -670,6 +671,119 @@ def cg_display_bounds(display_id: int) -> tuple[float, float, float, float]:
     )
 
 
+def set_virtual_display_as_primary(vd_display_id: int) -> int:
+    """가상 디스플레이를 주 디스플레이(origin 0,0)로 설정한다.
+
+    CGDisplayConfiguration 으로 가상 디스플레이를 (0,0) 위치로 옮기고
+    기존 주 디스플레이를 그 오른쪽으로 이동시킨다. macOS 는 origin (0,0) 을
+    가진 디스플레이를 주 디스플레이로 인식하므로, 이후 새 앱 창은
+    가상 디스플레이에 열린다.
+
+    반환값: 복원 시 사용할 이전 주 디스플레이 ID (성공), 0 (실패·변경 불필요).
+    """
+    try:
+        import Quartz  # type: ignore[import-untyped]
+
+        vid = int(vd_display_id)
+        if vid <= 0:
+            return 0
+
+        old_main_id = int(Quartz.CGMainDisplayID())
+        if old_main_id == vid:
+            return 0  # 이미 주 디스플레이
+
+        new_bounds = Quartz.CGDisplayBounds(vid)
+        old_new_x = int(new_bounds.origin.x)
+        old_new_y = int(new_bounds.origin.y)
+        new_main_w = int(new_bounds.size.width)
+
+        config = ctypes.c_void_p()
+        err = Quartz.CGBeginDisplayConfiguration(ctypes.byref(config))
+        if err != 0:
+            return 0
+
+        # 가상 디스플레이를 원점(0,0)으로 이동 → 주 디스플레이가 됨
+        err = Quartz.CGConfigureDisplayOrigin(config, vid, 0, 0)
+        if err != 0:
+            Quartz.CGCancelDisplayConfiguration(config)
+            return 0
+
+        # 기존 주 디스플레이를 가상 디스플레이 오른쪽으로 이동
+        err = Quartz.CGConfigureDisplayOrigin(config, old_main_id, new_main_w, 0)
+        if err != 0:
+            Quartz.CGCancelDisplayConfiguration(config)
+            return 0
+
+        # 현재 세션에만 적용 (kCGConfigureForSession = 1)
+        err = Quartz.CGCompleteDisplayConfiguration(config, 1)
+        if err != 0:
+            return 0
+
+        try:
+            from streaming.remote_log import log_remote_event
+
+            log_remote_event(
+                f"호스트: 가상 디스플레이(id={vid})를 주 디스플레이로 전환 "
+                f"(이전 주={old_main_id}, 이전 위치=({old_new_x},{old_new_y}))"
+            )
+        except Exception:
+            pass
+        return old_main_id
+    except Exception:
+        return 0
+
+
+def restore_primary_display(old_main_id: int, vd_display_id: int) -> bool:
+    """세션 종료 후 주 디스플레이를 원래대로 복원한다.
+
+    ``set_virtual_display_as_primary`` 의 반환값을 ``old_main_id`` 로 전달한다.
+    0 이면 변경이 없었으므로 즉시 True 를 반환한다.
+    """
+    if old_main_id == 0:
+        return True
+    try:
+        import Quartz  # type: ignore[import-untyped]
+
+        vid = int(vd_display_id)
+        old_id = int(old_main_id)
+
+        vd_bounds = Quartz.CGDisplayBounds(vid)
+        vd_w = int(vd_bounds.size.width)
+
+        config = ctypes.c_void_p()
+        err = Quartz.CGBeginDisplayConfiguration(ctypes.byref(config))
+        if err != 0:
+            return False
+
+        # 기존 주 디스플레이를 다시 (0,0)으로 복원
+        err = Quartz.CGConfigureDisplayOrigin(config, old_id, 0, 0)
+        if err != 0:
+            Quartz.CGCancelDisplayConfiguration(config)
+            return False
+
+        # 가상 디스플레이는 기존 주 디스플레이 오른쪽으로
+        err = Quartz.CGConfigureDisplayOrigin(config, vid, vd_w, 0)
+        if err != 0:
+            Quartz.CGCancelDisplayConfiguration(config)
+            return False
+
+        err = Quartz.CGCompleteDisplayConfiguration(config, 1)
+        if err != 0:
+            return False
+
+        try:
+            from streaming.remote_log import log_remote_event
+
+            log_remote_event(
+                f"호스트: 주 디스플레이 복원 (old_main={old_id}, vd={vid})"
+            )
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 __all__ = [
     "DarwinVirtualDisplayError",
     "cg_display_bounds",
@@ -677,4 +791,6 @@ __all__ = [
     "create_virtual_display",
     "release_virtual_display",
     "release_virtual_display_on_main_thread",
+    "restore_primary_display",
+    "set_virtual_display_as_primary",
 ]
