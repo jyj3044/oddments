@@ -581,6 +581,20 @@ class RemoteHostServer:
         self._vd_obj = None
         self._vd_display_id = 0
 
+    def _capture_join_timeout_sec(self) -> float:
+        """가상 디스플레이는 mss 스레드가 끝나기 전에 CGDisplay 를 닫으면 오류가 나기 쉬워 여유를 둔다."""
+        if sys.platform == "darwin" and self._virtual_display_enabled:
+            return 20.0
+        return 2.0
+
+    def _join_capture_thread(self, cap: CaptureThread | None) -> None:
+        if cap is None:
+            return
+        try:
+            cap.join(timeout=self._capture_join_timeout_sec())
+        except Exception:
+            pass
+
     def _ensure_geom_virtual_display(self) -> None:
         from app_platform.darwin_virtual_display import (
             DarwinVirtualDisplayError,
@@ -645,9 +659,9 @@ class RemoteHostServer:
         if cap is not None:
             try:
                 cap.stop()
-                cap.join(timeout=3.0)
             except Exception:
                 pass
+            self._join_capture_thread(cap)
         self._stop_darwin_audio()
         if sys.platform == "darwin" and self._virtual_display_enabled:
             self._release_virtual_display_session()
@@ -877,9 +891,9 @@ class RemoteHostServer:
                 pass
             try:
                 cap.stop()
-                cap.join(timeout=2.0)
             except Exception:
                 pass
+            self._join_capture_thread(cap)
         self._stop_darwin_audio()
         if sys.platform == "darwin" and self._virtual_display_enabled:
             self._release_virtual_display_session()
@@ -903,27 +917,36 @@ class RemoteHostServer:
         raise RuntimeError("원격 호스트 서버 시작 시간 초과.")
 
     def stop(self) -> None:
+        # 피어·트랙을 먼저 닫은 뒤 캡처를 멈추면(특히 가상 디스플레이) CG/mss 경합을 줄인다.
+        loop = self._loop
+        if loop is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
+                fut.result(timeout=12.0)
+            except Exception:
+                pass
+
         self._stop_darwin_audio()
-        cap = self._capture
-        self._capture = None
+
+        with self._capture_lock:
+            cap = self._capture
+            self._capture = None
         if cap is not None:
             try:
                 cap.stop()
-                cap.join(timeout=2.0)
             except Exception:
                 pass
+            self._join_capture_thread(cap)
+
         if sys.platform == "darwin" and self._virtual_display_enabled:
             self._release_virtual_display_session()
         self._geom = None
 
-        loop = self._loop
         if loop is not None:
-            fut = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
             try:
-                fut.result(timeout=5.0)
+                loop.call_soon_threadsafe(loop.stop)
             except Exception:
                 pass
-            loop.call_soon_threadsafe(loop.stop)
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=3.0)
         self._thread = None
@@ -1043,7 +1066,13 @@ class RemoteHostServer:
                     await pc.close()
                 except Exception:
                     pass
-                self._stop_capture_if_idle()
+                # cap.join()·가상 디스플레이 해제가 이벤트 루프를 막으면 ICE/트랙 정리와
+                # 겹쳐 예외·불안정이 난다 → 워커로 넘긴다.
+                try:
+                    exe_loop = asyncio.get_running_loop()
+                    await exe_loop.run_in_executor(None, self._stop_capture_if_idle)
+                except Exception:
+                    pass
 
         srv = self
 

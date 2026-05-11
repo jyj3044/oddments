@@ -13,6 +13,7 @@ import json
 import ssl
 import sys
 import threading
+from functools import partial
 import time
 from fractions import Fraction
 from pathlib import Path
@@ -651,15 +652,28 @@ class SharedVideoBuffer:
 
 
 class SharedAudioBuffer:
-    """오디오 캡처 스레드가 PCM 청크를 퍼블리시하는 구독형 버퍼."""
+    """오디오 캡처 스레드가 PCM 청크를 퍼블리시하는 구독형 버퍼.
+
+    ``asyncio.Queue`` 는 **이벤트 루프가 돌아가는 스레드**에서만 안전하다.
+    원격 호스트·웹 송출 모두 ``publish`` 를 **별도 오디오 캡처 스레드**에서 호출하므로
+    ``put_nowait`` 을 직접 쓰면 뷰어 종료·루프 정리 시점에 ``RuntimeError`` 등이 날 수 있다.
+    첫 ``subscribe`` 시점의 루프에 ``call_soon_threadsafe`` 로 넘긴다.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._queues: list[asyncio.Queue[np.ndarray]] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def subscribe(self) -> asyncio.Queue[np.ndarray]:
         q: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=8)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
         with self._lock:
+            if self._loop is None and loop is not None:
+                self._loop = loop
             self._queues.append(q)
         return q
 
@@ -668,19 +682,46 @@ class SharedAudioBuffer:
             if q in self._queues:
                 self._queues.remove(q)
 
-    def publish(self, chunk: np.ndarray) -> None:
-        with self._lock:
-            queues = list(self._queues)
-        for q in queues:
+    @staticmethod
+    def _put_chunk(q: asyncio.Queue[np.ndarray], chunk: np.ndarray) -> None:
+        try:
             if q.full():
                 try:
                     q.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
+            q.put_nowait(chunk)
+        except (asyncio.QueueFull, RuntimeError):
+            pass
+
+    def publish(self, chunk: np.ndarray) -> None:
+        with self._lock:
+            queues = list(self._queues)
+            loop = self._loop
+        if not queues:
+            return
+        try:
+            arr = np.asarray(chunk, dtype=np.float32).copy()
+        except Exception:
+            return
+
+        if loop is not None:
             try:
-                q.put_nowait(chunk)
-            except asyncio.QueueFull:
-                pass
+                running = loop.is_running()
+            except Exception:
+                running = False
+            if running:
+                for qq in queues:
+                    try:
+                        loop.call_soon_threadsafe(
+                            partial(SharedAudioBuffer._put_chunk, qq, arr)
+                        )
+                    except RuntimeError:
+                        pass
+                return
+
+        for qq in queues:
+            SharedAudioBuffer._put_chunk(qq, arr)
 
 
 class SharedVideoTrack(VideoStreamTrack):
