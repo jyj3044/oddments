@@ -1472,9 +1472,14 @@ def remote_viewer_main(page: ft.Page) -> None:
             )
 
             def _send_char_from_hook(ch: str) -> None:
-                """Windows WM_CHAR/WM_UNICHAR 훅 — IME 가 합성한 유니코드 문자(한글 등)를
-                호스트로 전송. 호스트는 ``CGEventKeyboardSetUnicodeString`` 으로 입력."""
+                """Windows WM_CHAR/WM_UNICHAR 훅 — ASCII 만 호스트로 보낸다.
+
+                한글 등 IME 확정 문자는 보내지 않고, 알파벳은 ``KeyboardListener`` 의
+                키 다운/업(영문 토큰)만 쓴다. macOS 호스트는 그 토큰을 물리 키로 주입해
+                한글 IME 가 2벌식처럼 받게 한다."""
                 if not ch or not viewer_kb_capture[0]:
+                    return
+                if not ch.isascii():
                     return
                 _send_json({"t": "char", "c": ch})
 

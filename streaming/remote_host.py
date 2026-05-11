@@ -58,8 +58,118 @@ _inject_failure_logged = False
 # 통과시키고 나머지(=사용자 키)는 차단할 수 있다.
 DARWIN_SYNTHETIC_USER_DATA: int = 0x4F44444D  # 'ODDM' (4 bytes ASCII)
 
-# macOS virtual keycodes (HIToolbox/Events.h) — 특수 토큰만 매핑한다.
-# 일반 ASCII/유니코드 문자는 vk=0 + CGEventKeyboardSetUnicodeString 으로 입력.
+# macOS virtual keycodes (HIToolbox/Events.h).
+# 특수 토큰은 _DARWIN_TOKEN_VK, 알파·숫자·일부 부호는 US 물리 키(_darwin_us_layout_physical_key).
+# 그 외 유니코드는 vk=0 + CGEventKeyboardSetUnicodeString.
+# US QWERTY 물리 키 (HIToolbox kVK_ANSI_*). 한글 IME 는 유니코드 주입이 아니라
+# 이 키코드로 보내야 2벌식처럼 r→ㄱ 이 된다.
+_DARWIN_US_LETTER_VK_LOWER: dict[str, int] = {
+    "a": 0,
+    "s": 1,
+    "d": 2,
+    "f": 3,
+    "h": 4,
+    "g": 5,
+    "z": 6,
+    "x": 7,
+    "c": 8,
+    "v": 9,
+    "b": 11,
+    "q": 12,
+    "w": 13,
+    "e": 14,
+    "r": 15,
+    "y": 16,
+    "t": 17,
+    "o": 31,
+    "u": 32,
+    "i": 34,
+    "p": 35,
+    "l": 37,
+    "j": 38,
+    "k": 40,
+    "n": 45,
+    "m": 46,
+}
+_DARWIN_US_DIGIT_VK: dict[str, int] = {
+    "1": 18,
+    "2": 19,
+    "3": 20,
+    "4": 21,
+    "5": 23,
+    "6": 22,
+    "7": 26,
+    "8": 28,
+    "9": 25,
+    "0": 29,
+}
+_DARWIN_US_PUNCT_VK: dict[str, tuple[int, bool]] = {
+    ",": (43, False),
+    ".": (47, False),
+    "/": (44, False),
+    ";": (41, False),
+    "'": (39, False),
+    "[": (33, False),
+    "]": (30, False),
+    "\\": (42, False),
+    "-": (27, False),
+    "=": (24, False),
+    "`": (50, False),
+}
+
+
+def _darwin_us_layout_physical_key(ch: str) -> tuple[int, bool] | None:
+    """한 글자에 대해 (가상 키코드, 해당 키 타이핑에 Shift 필요 여부). 없으면 None."""
+    if len(ch) != 1:
+        return None
+    if ch == " ":
+        return (49, False)
+    if ch == "\t":
+        return (48, False)
+    if ch in "\n\r":
+        return (36, False)
+    if ch.islower() and ch in _DARWIN_US_LETTER_VK_LOWER:
+        return (_DARWIN_US_LETTER_VK_LOWER[ch], False)
+    if ch.isupper() and "A" <= ch <= "Z":
+        lo = ch.lower()
+        if lo in _DARWIN_US_LETTER_VK_LOWER:
+            return (_DARWIN_US_LETTER_VK_LOWER[lo], True)
+    if ch in _DARWIN_US_DIGIT_VK:
+        return (_DARWIN_US_DIGIT_VK[ch], False)
+    if ch in _DARWIN_US_PUNCT_VK:
+        vk, sh = _DARWIN_US_PUNCT_VK[ch]
+        return (vk, sh)
+    return None
+
+
+def _darwin_post_physical_key_tap(vk: int, extra_shift: bool) -> bool:
+    """한 번의 키 다운+업 (수정자 마스크 + 선택적 Shift)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import Quartz  # type: ignore[import-untyped]
+    except Exception:
+        return False
+    try:
+        with _darwin_synth_mod_lock:
+            base = _darwin_synth_mod_mask
+        shift_bit = int(Quartz.kCGEventFlagMaskShift)
+        flags = base | (shift_bit if extra_shift else 0)
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, vk, down)
+            if ev is None:
+                return False
+            try:
+                Quartz.CGEventSetFlags(ev, flags)
+            except Exception:
+                pass
+            _darwin_post_event(ev)
+        return True
+    except Exception as exc:
+        _log_inject_failure_once(exc)
+        return False
+
+
 _DARWIN_TOKEN_VK: dict[str, int] = {
     "enter": 36, "return": 36,
     "tab": 48,
@@ -125,7 +235,7 @@ def _darwin_post_event(ev: object) -> None:
 
 
 def _darwin_press_token(token: str, down: bool) -> bool:
-    """macOS 자체 키 합성. token == 특수 키이면 vk 매핑, 그 외 문자열은 unicode 로.
+    """macOS 자체 키 합성. 특수 토큰·US 물리 키는 vk, 그 외 한 글자는 unicode.
 
     우리가 만든 모든 이벤트는 ``kCGEventSourceUserData = DARWIN_SYNTHETIC_USER_DATA``
     로 마킹된다 → 봉인 worker tap 에서 통과 식별 가능.
@@ -143,6 +253,11 @@ def _darwin_press_token(token: str, down: bool) -> bool:
     vk = _DARWIN_TOKEN_VK.get(low)
     if vk is None and len(token) == 1 and token == " ":
         vk = 49
+    extra_shift = False
+    if vk is None and len(token) == 1:
+        phys = _darwin_us_layout_physical_key(token)
+        if phys is not None:
+            vk, extra_shift = phys
     try:
         global _darwin_synth_mod_mask
         mbit = _darwin_modifier_flag(Quartz, low)
@@ -156,6 +271,8 @@ def _darwin_press_token(token: str, down: bool) -> bool:
                     _darwin_synth_mod_mask &= ~mbit
             else:
                 flags = _darwin_synth_mod_mask
+                if extra_shift:
+                    flags |= int(Quartz.kCGEventFlagMaskShift)
 
             if vk is not None:
                 ev = Quartz.CGEventCreateKeyboardEvent(None, vk, bool(down))
@@ -179,7 +296,7 @@ def _darwin_press_token(token: str, down: bool) -> bool:
 
 
 def _darwin_type_unicode(text: str) -> bool:
-    """``text`` 의 각 코드포인트를 unicode 키 down+up 으로 주입한다."""
+    """``text`` 를 한 글자씩 주입. US 레이아웃에 대응하는 ASCII 는 물리 키, 나머지는 unicode."""
     if sys.platform != "darwin" or not text:
         return False
     try:
@@ -187,9 +304,15 @@ def _darwin_type_unicode(text: str) -> bool:
     except Exception:
         return False
     try:
-        with _darwin_synth_mod_lock:
-            flags = _darwin_synth_mod_mask
         for ch in text:
+            phys = _darwin_us_layout_physical_key(ch)
+            if phys is not None:
+                vk, ex = phys
+                if not _darwin_post_physical_key_tap(vk, ex):
+                    return False
+                continue
+            with _darwin_synth_mod_lock:
+                flags = _darwin_synth_mod_mask
             ev_d = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
             if ev_d is not None:
                 try:
