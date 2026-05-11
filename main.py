@@ -45,7 +45,7 @@ import flet as ft
 import numpy as np
 
 from streaming.remote_client import run_session_in_thread
-from streaming.remote_log import log_remote_event
+from streaming.remote_log import log_remote_diag, log_remote_event
 
 from app_platform import ensure_pre_gui_init
 from app_platform.host import require_windows_admin_or_exit
@@ -767,6 +767,21 @@ def remote_viewer_main(page: ft.Page) -> None:
             pass
 
     def _send_json(payload: dict) -> None:
+        try:
+            t = str((payload or {}).get("t", ""))
+            if t == "key":
+                log_remote_diag(
+                    "클라이언트: DC 송신 key "
+                    f"k={payload.get('k')!r} down={payload.get('down')}"
+                )
+            elif t == "char":
+                c = payload.get("c", "")
+                log_remote_diag(
+                    "클라이언트: DC 송신 char "
+                    f"c={c!r} cps={[hex(ord(x)) for x in str(c)]}"
+                )
+        except Exception:
+            pass
         sess = session_ref["s"]
         if sess is not None:
             try:
@@ -1459,13 +1474,6 @@ def remote_viewer_main(page: ft.Page) -> None:
             def _send_char_from_hook(ch: str) -> None:
                 """Windows WM_CHAR/WM_UNICHAR 훅 — IME 가 합성한 유니코드 문자(한글 등)를
                 호스트로 전송. 호스트는 ``CGEventKeyboardSetUnicodeString`` 으로 입력."""
-                try:
-                    log_remote_event(
-                        f"클라이언트: WM_CHAR ch={ch!r} cps={[hex(ord(c)) for c in ch]} "
-                        f"capture={viewer_kb_capture[0]}"
-                    )
-                except Exception:
-                    pass
                 if not ch or not viewer_kb_capture[0]:
                     return
                 _send_json({"t": "char", "c": ch})

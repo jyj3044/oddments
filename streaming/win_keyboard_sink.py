@@ -11,6 +11,7 @@ Mac 호스트에서 한글 입력이 안 됨).
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from ctypes import wintypes
@@ -134,6 +135,43 @@ class _Sink:
 _state = _Sink()
 
 
+def _find_viewer_hwnd(window_title: str) -> int:
+    """뷰어 최상위 HWND — 정확한 제목 실패 시 같은 프로세스·가시 창 제목 부분일치."""
+    user32 = ctypes.windll.user32
+    want = (window_title or "").strip()
+    if not want:
+        return 0
+    hwnd = user32.FindWindowW(None, want)
+    if hwnd:
+        return int(hwnd)
+    my_pid = int(os.getpid())
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(h: int, _lp: int) -> bool:
+        if not user32.IsWindowVisible(h):
+            return True
+        cpid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(h, ctypes.byref(cpid))
+        if int(cpid.value) != my_pid:
+            return True
+        buf = ctypes.create_unicode_buffer(1024)
+        user32.GetWindowTextW(h, buf, 1024)
+        got = buf.value.strip()
+        if not got:
+            return True
+        a, b = want.lower(), got.lower()
+        if a == b or a in b or b in a:
+            found.append(int(h))
+            return False
+        return True
+
+    user32.EnumWindows(_enum, 0)
+    if found:
+        return found[0]
+    return 0
+
+
 def _foreground_matches_title(title: str) -> bool:
     if not title:
         return False
@@ -158,8 +196,9 @@ def _get_message_proc(
 ) -> int:
     """WH_GETMESSAGE 훅: WM_CHAR/WM_SYSCHAR/WM_UNICHAR/WM_IME_CHAR 가로채기.
 
-    포커스 윈도우가 우리 뷰어가 아닐 때는 건드리지 않는다 (foreground 검사).
-    수신한 character 를 ``send_char`` 콜백으로 호스트에 전달.
+    ``should_suppress`` 가 True 일 때(원격 뷰어 키 캡처) 유니코드 문자를
+    ``send_char`` 로 호스트에 전달. ASCII(WM_CHAR wp<0x80)는 KeyDown 경로와 중복되지
+    않게 여기서는 제외.
     """
     global _diag_seen_char, _diag_seen_unichar, _diag_seen_ime, _diag_seen_syschar
     global _diag_last_wp
@@ -180,10 +219,10 @@ def _get_message_proc(
                 elif m == WM_SYSCHAR:
                     _diag_seen_syschar += 1
                 _diag_last_wp = wp
-            if is_char_msg and _state.should_suppress() and _foreground_matches_title(
-                _state.window_title
-            ):
-                # ASCII 영역(0x00-0x7F) 은 KeyDown/KeyUp 경로로 별도 처리한다.
+            if is_char_msg and _state.should_suppress():
+                # 포커스 검사 생략: Flutter 뷰어에서 IME 가 보내는 WM_CHAR/WM_IME_CHAR 은
+                # 훅이 걸린 UI 스레드 큐에서만 오며, FindWindowW 제목 불일치로
+                # _foreground_matches_title 이 거짓이 되면 한글이 호스트에 안 간다.
                 if m == WM_UNICHAR:
                     try:
                         if wp >= 0x80:
@@ -298,14 +337,9 @@ def start_win_keyboard_sink(
     _state.msg_proc_ref = _GETMESSAGE_PROC(_get_message_proc)
 
     def _resolve_ui_tid() -> int:
-        """뷰어 윈도우의 실제 UI thread id 를 찾는다.
-
-        Flet/Flutter Windows shell 의 UI 스레드는 ``start_win_keyboard_sink`` 를
-        호출한 스레드와 다를 수 있다. 윈도우 타이틀로 우리 viewer HWND 를 찾고
-        ``GetWindowThreadProcessId`` 로 그 윈도우 소유 스레드 id 를 얻는다.
-        """
+        """뷰어 윈도우의 실제 UI thread id."""
         user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, str(window_title))
+        hwnd = _find_viewer_hwnd(window_title)
         if not hwnd:
             return 0
         pid = wintypes.DWORD(0)
@@ -356,7 +390,8 @@ def start_win_keyboard_sink(
 
                 if _state.msg_hook:
                     log_remote_event(
-                        f"클라이언트: WH_GETMESSAGE 설치 OK tid={ui_tid} title={window_title!r}"
+                        f"클라이언트: WH_GETMESSAGE 설치 OK tid={ui_tid} "
+                        f"hwnd={_find_viewer_hwnd(window_title)} title={window_title!r}"
                     )
                 else:
                     err = ctypes.windll.kernel32.GetLastError()

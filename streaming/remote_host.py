@@ -64,6 +64,7 @@ _DARWIN_TOKEN_VK: dict[str, int] = {
     "enter": 36, "return": 36,
     "tab": 48,
     "space": 49,
+    " ": 49,
     "delete": 51, "backspace": 51,
     "escape": 53, "esc": 53,
     "shift": 56, "shift_l": 56, "shift_r": 60,
@@ -77,6 +78,30 @@ _DARWIN_TOKEN_VK: dict[str, int] = {
     "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
     "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
 }
+
+# macOS 합성 키: 시스템 단축키(⌃Space 한영 등)는 각 CGEvent 의 flag 필드에
+# 현재 눌린 수정자가 반영되어야 인식된다. 클라이언트가 보내는 순서대로 mask 유지.
+_darwin_synth_mod_lock = threading.Lock()
+_darwin_synth_mod_mask: int = 0
+
+
+def _darwin_reset_synth_modifiers() -> None:
+    global _darwin_synth_mod_mask
+    with _darwin_synth_mod_lock:
+        _darwin_synth_mod_mask = 0
+
+
+def _darwin_modifier_flag(quartz: object, tok_lower: str) -> int | None:
+    """수정자 토큰이면 ``kCGEventFlagMask*`` 값. 아니면 None."""
+    if tok_lower in ("shift", "shift_l", "shift_r"):
+        return int(quartz.kCGEventFlagMaskShift)
+    if tok_lower in ("ctrl", "ctrl_l", "ctrl_r", "control", "control_l", "control_r"):
+        return int(quartz.kCGEventFlagMaskControl)
+    if tok_lower in ("cmd", "cmd_r", "meta", "meta_l", "meta_r", "win", "win_l", "win_r"):
+        return int(quartz.kCGEventFlagMaskCommand)
+    if tok_lower in ("alt", "alt_l", "alt_r", "option", "option_l", "option_r"):
+        return int(quartz.kCGEventFlagMaskAlternate)
+    return None
 
 
 def _darwin_post_event(ev: object) -> None:
@@ -112,21 +137,40 @@ def _darwin_press_token(token: str, down: bool) -> bool:
         import Quartz  # type: ignore[import-untyped]
     except Exception:
         return False
-    low = token.lower()
+    low = str(token).lower()
+    if low == "space":
+        low = " "
     vk = _DARWIN_TOKEN_VK.get(low)
+    if vk is None and len(token) == 1 and token == " ":
+        vk = 49
     try:
-        if vk is not None:
-            ev = Quartz.CGEventCreateKeyboardEvent(None, vk, bool(down))
+        global _darwin_synth_mod_mask
+        mbit = _darwin_modifier_flag(Quartz, low)
+        with _darwin_synth_mod_lock:
+            if mbit is not None:
+                if down:
+                    flags = _darwin_synth_mod_mask | mbit
+                    _darwin_synth_mod_mask |= mbit
+                else:
+                    flags = _darwin_synth_mod_mask
+                    _darwin_synth_mod_mask &= ~mbit
+            else:
+                flags = _darwin_synth_mod_mask
+
+            if vk is not None:
+                ev = Quartz.CGEventCreateKeyboardEvent(None, vk, bool(down))
+            elif token:
+                ev = Quartz.CGEventCreateKeyboardEvent(None, 0, bool(down))
+            else:
+                return False
             if ev is None:
                 return False
-            _darwin_post_event(ev)
-            return True
-        if not token:
-            return False
-        ev = Quartz.CGEventCreateKeyboardEvent(None, 0, bool(down))
-        if ev is None:
-            return False
-        Quartz.CGEventKeyboardSetUnicodeString(ev, len(token), token)
+            try:
+                Quartz.CGEventSetFlags(ev, flags)
+            except Exception:
+                pass
+            if vk is None:
+                Quartz.CGEventKeyboardSetUnicodeString(ev, len(token), token)
         _darwin_post_event(ev)
         return True
     except Exception as exc:
@@ -143,13 +187,23 @@ def _darwin_type_unicode(text: str) -> bool:
     except Exception:
         return False
     try:
+        with _darwin_synth_mod_lock:
+            flags = _darwin_synth_mod_mask
         for ch in text:
             ev_d = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
             if ev_d is not None:
+                try:
+                    Quartz.CGEventSetFlags(ev_d, flags)
+                except Exception:
+                    pass
                 Quartz.CGEventKeyboardSetUnicodeString(ev_d, len(ch), ch)
                 _darwin_post_event(ev_d)
             ev_u = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
             if ev_u is not None:
+                try:
+                    Quartz.CGEventSetFlags(ev_u, flags)
+                except Exception:
+                    pass
                 Quartz.CGEventKeyboardSetUnicodeString(ev_u, len(ch), ch)
                 _darwin_post_event(ev_u)
         return True
@@ -787,6 +841,10 @@ class RemoteHostServer:
 
         def _fire() -> None:
             try:
+                _darwin_reset_synth_modifiers()
+            except Exception:
+                pass
+            try:
                 from app_platform.darwin_remote_seal import schedule_seal_show
 
                 schedule_seal_show(vid, cb)
@@ -1006,6 +1064,10 @@ class RemoteHostServer:
             return
         self._stop_window_corral_thread()
         self._stop_key_block_thread()
+        try:
+            _darwin_reset_synth_modifiers()
+        except Exception:
+            pass
         try:
             log_remote_diag("호스트: 물리 화면 봉인 해제 — schedule_seal_hide 예약")
         except Exception:
