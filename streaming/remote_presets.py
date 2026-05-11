@@ -25,6 +25,18 @@ PRESET_LABELS: list[tuple[str, str]] = [
     ("uwqhd_21_9", "21:9 · 3440×1440"),
 ]
 
+VALID_PRESET_IDS: frozenset[str] = frozenset(RESOLUTION_PRESETS.keys())
+
+
+def normalize_preset_id(raw: object, *, fallback: str = "host_native") -> str:
+    """알려진 preset id 만 허용."""
+    if not isinstance(raw, str):
+        return fallback
+    s = raw.strip()
+    if s in VALID_PRESET_IDS:
+        return s
+    return fallback
+
 
 def preset_dimensions(
     preset_id: str,
@@ -47,5 +59,7 @@ def preset_dimensions(
 __all__ = [
     "PRESET_LABELS",
     "RESOLUTION_PRESETS",
+    "VALID_PRESET_IDS",
+    "normalize_preset_id",
     "preset_dimensions",
 ]

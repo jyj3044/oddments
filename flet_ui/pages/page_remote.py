@@ -191,7 +191,9 @@ def build_remote_settings(state: AppState) -> ft.Control:
             audio_vd_field,
             ft.Text(
                 "가상 디스플레이는 CGVirtualDisplay 비공개 API를 사용합니다. "
-                "오디오는 BlackHole 등 가상 입력으로 캡처합니다.",
+                "오디오는 BlackHole 등 가상 입력으로 캡처합니다. "
+                "해상도는 클라이언트가 연결(/offer) 시 보낸 값이 우선이며, "
+                "끊기면 가상 디스플레이가 정리됩니다.",
                 style=body_md(),
                 color=T.ON_SURFACE_VARIANT,
             ),
@@ -335,6 +337,19 @@ def build_remote_settings(state: AppState) -> ft.Control:
             state, bool(getattr(e.control, "value", False))
         ),
     )
+    _cl_preset_label_by_id = {k: lab for k, lab in PRESET_LABELS}
+    client_res_dd = ft.Dropdown(
+        label="연결 시 호스트 가상 해상도",
+        value=_cl_preset_label_by_id.get(
+            (cp.resolution_preset or "").strip(),
+            PRESET_LABELS[0][1],
+        ),
+        expand=True,
+        options=[ft.dropdown.Option(lab) for _, lab in PRESET_LABELS],
+        on_select=lambda e: _persist_client_resolution_preset(
+            state, str(getattr(e.control, "value", "") or "")
+        ),
+    )
 
     def _open_viewer(_e: ft.ControlEvent) -> None:
         ok, err = state.save()
@@ -378,6 +393,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
                     vertical_alignment=ft.CrossAxisAlignment.START,
                     controls=[client_port, client_auth, open_btn],
                 ),
+                client_res_dd,
                 mac_mod_switch,
                 ft.Text(
                     "Flet 단일 프로세스는 다중 OS 창을 지원하지 않아, 뷰어는 두 번째 프로세스로 띄웁니다.",
@@ -565,6 +581,14 @@ def _persist_client_port(state: AppState, raw: str) -> None:
 def _persist_mac_modifier_remap(state: AppState, enabled: bool) -> None:
     state.settings.remote.client.mac_modifier_remap = enabled
     state.save()
+
+
+def _persist_client_resolution_preset(state: AppState, label: str) -> None:
+    for k, lab in PRESET_LABELS:
+        if lab == label:
+            state.settings.remote.client.resolution_preset = k
+            state.save()
+            return
 
 
 __all__ = [

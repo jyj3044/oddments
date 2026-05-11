@@ -264,6 +264,8 @@ class RemoteClientProfile:
     host: str = ""
     port: int = 49152
     auth_token: str = ""
+    # 연결 시 /offer 에 실림. 가상 디스플레이 호스트가 이 프리셋으로 모니터를 연다.
+    resolution_preset: str = "host_native"
     # True 이면 Windows 뷰어→macOS 호스트 시 Ctrl=Control, Win=⌥, Alt=⌘ 로 전송.
     mac_modifier_remap: bool = False
 
@@ -501,6 +503,9 @@ class AppState:
                 c.host = str(rc.get("host", c.host) or "")
                 c.port = _safe_u16_port(rc.get("port", c.port), c.port)
                 c.auth_token = str(rc.get("auth_token", c.auth_token) or "")
+                c.resolution_preset = str(
+                    rc.get("resolution_preset", c.resolution_preset) or "host_native"
+                )
                 c.mac_modifier_remap = bool(
                     rc.get("mac_modifier_remap", c.mac_modifier_remap)
                 )
@@ -569,6 +574,7 @@ class AppState:
                     "host": rc.host,
                     "port": rc.port,
                     "auth_token": rc.auth_token,
+                    "resolution_preset": rc.resolution_preset,
                     "mac_modifier_remap": rc.mac_modifier_remap,
                 },
             },

@@ -43,6 +43,7 @@ import numpy as np
 from streaming.remote_client import run_session_in_thread
 from streaming.remote_host import rtc_configuration_from_stun_turn
 from streaming.remote_log import log_remote_event
+from streaming.remote_presets import PRESET_LABELS
 
 from app_platform import ensure_pre_gui_init
 from app_platform.host import require_windows_admin_or_exit
@@ -532,6 +533,7 @@ def remote_viewer_main(page: ft.Page) -> None:
     video_shell_ref: list[ft.Container | None] = [None]
     win_kbd_sink_stop: Callable[[], None] | None = None
     meta_from_host = [False]
+    host_virtual_display = [False]
     decode_dims_shown = [False]
     jpeg_temp_paths: list[str] = []
     first_video_logged = [False]
@@ -740,6 +742,13 @@ def remote_viewer_main(page: ft.Page) -> None:
                 meta_from_host[0] = True
                 mw = d.get("mon_w")
                 mh = d.get("mon_h")
+                host_virtual_display[0] = bool(d.get("virtual_display", False))
+                preset_dd.disabled = not host_virtual_display[0]
+                pr = d.get("preset")
+                if isinstance(pr, str) and pr.strip():
+                    lab = _preset_label_by_id.get(pr.strip())
+                    if lab is not None:
+                        preset_dd.value = lab
                 # stream_w/h 는 디코드 프레임 기준 stream_wh 와 맞춘다. 메타만으로 덮으면 좌표가 어긋날 수 있다.
                 _sync_remote_video_rect()
                 try:
@@ -782,6 +791,36 @@ def remote_viewer_main(page: ft.Page) -> None:
     except (TypeError, ValueError):
         rail_width_user = [300.0]
 
+    _preset_label_by_id = {k: lab for k, lab in PRESET_LABELS}
+    _preset_id_by_label = {lab: k for k, lab in PRESET_LABELS}
+
+    def _on_viewer_preset_select(e: ft.ControlEvent) -> None:
+        lab = str(getattr(e.control, "value", "") or "")
+        pid = _preset_id_by_label.get(lab)
+        if not pid:
+            return
+        try:
+            state.settings.remote.client.resolution_preset = pid
+            state.save()
+        except Exception:
+            pass
+        _send_json({"t": "resolution", "preset": pid})
+        _emit_state(f"해상도 변경 요청: {lab}")
+
+    preset_dd = ft.Dropdown(
+        label="호스트 해상도",
+        value=_preset_label_by_id.get(
+            (rc.resolution_preset or "").strip(),
+            PRESET_LABELS[0][1],
+        ),
+        width=int(min(280, max(200, rail_width_user[0] - 20))),
+        options=[ft.dropdown.Option(lab) for _, lab in PRESET_LABELS],
+        disabled=True,
+        on_select=_on_viewer_preset_select,
+        text_style=body_md(),
+        label_style=label_md(),
+    )
+
     sb_title = ft.Text("원격 뷰어", style=label_lg(), color=T.ON_SURFACE)
     sb_target = ft.Text(
         f"대상 {rc.host or '127.0.0.1'}:{rc.port}",
@@ -795,6 +834,12 @@ def remote_viewer_main(page: ft.Page) -> None:
             sb_target,
             conn_status,
             res_line,
+            preset_dd,
+            ft.Text(
+                "가상 디스플레이 호스트에서만 해상도 변경이 적용됩니다.",
+                style=body_md(),
+                color=T.ON_SURFACE_VARIANT,
+            ),
         ],
     )
 
@@ -1398,6 +1443,7 @@ def remote_viewer_main(page: ft.Page) -> None:
         on_state=_emit_state,
         on_dc_json=_on_dc_json,
         auth_token=(rc.auth_token or "").strip(),
+        offer_preset=(rc.resolution_preset or "").strip(),
     )
     session_ref["s"] = sess
     if sess is None:

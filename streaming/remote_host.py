@@ -25,7 +25,7 @@ from aiortc import (
 from capture.thread import CaptureThread, enumerate_monitors
 
 from .remote_log import log_remote_event
-from .remote_presets import preset_dimensions
+from .remote_presets import normalize_preset_id, preset_dimensions
 from .web_stream import (
     SharedAudioBuffer,
     SharedAudioTrack,
@@ -434,6 +434,18 @@ def _clipboard_write_text(text: str) -> None:
         pass
 
 
+def _host_warp_pointer_to_capture_center(srv: "RemoteHostServer") -> None:
+    """가상 디스플레이 원격 시 커서를 캡처 화면 안으로 옮겨 키 입력이 메인 화면에 가지 않게 한다."""
+    g = srv._geom
+    if g is None:
+        return
+    try:
+        raw = json.dumps({"t": "move", "nx": 0.5, "ny": 0.5})
+        _inject_input_message(raw, g, pointer_scale=srv._pointer_scale)
+    except Exception:
+        pass
+
+
 def _dispatch_dc_payload(
     srv: "RemoteHostServer",
     raw: str,
@@ -784,10 +796,18 @@ class RemoteHostServer:
 
     def _push_frame(self, frame: np.ndarray) -> None:
         try:
+            # CGVirtualDisplay(hiDPI=0) + mss 는 보통 1:1 픽셀. 여기서 Retina 보정을 켜면
+            # 마우스 좌표가 밀려 물리 모니터로 주입되는 경우가 있다.
+            _vd_active = (
+                sys.platform == "darwin"
+                and self._virtual_display_enabled
+                and self._vd_display_id > 0
+            )
             if (
                 sys.platform == "darwin"
                 and self._geom is not None
                 and self._pointer_scale <= 1.01
+                and not _vd_active
             ):
                 try:
                     rh, rw = int(frame.shape[0]), int(frame.shape[1])
@@ -821,6 +841,11 @@ class RemoteHostServer:
                         "stream_h": int(h),
                         "mon_w": mon_w,
                         "mon_h": mon_h,
+                        "virtual_display": bool(
+                            self._virtual_display_enabled
+                            and self._vd_display_id > 0
+                        ),
+                        "preset": self._resolution_preset_id,
                     },
                     ensure_ascii=False,
                 )
@@ -1032,6 +1057,22 @@ class RemoteHostServer:
                 content_type="application/json",
             )
 
+        # 클라이언트가 /offer 에 실은 preset 이 우선(가상 디스플레이는 여기서 크기 결정).
+        raw_preset = params.get("preset")
+        if raw_preset is None:
+            raw_preset = params.get("resolution_preset")
+        if isinstance(raw_preset, str) and raw_preset.strip():
+            self._resolution_preset_id = normalize_preset_id(
+                raw_preset.strip(),
+                fallback=self._resolution_preset_id,
+            )
+            try:
+                log_remote_event(
+                    f"호스트: 클라이언트 요청 해상도 프리셋 «{self._resolution_preset_id}»"
+                )
+            except Exception:
+                pass
+
         try:
             self._ensure_capture()
         except RuntimeError as exc:
@@ -1080,6 +1121,12 @@ class RemoteHostServer:
             if getattr(channel, "label", "") != "input":
                 return
             srv._meta_pending.add(channel)
+            if (
+                srv._virtual_display_enabled
+                and srv._vd_display_id > 0
+                and srv._geom is not None
+            ):
+                _POOL.submit(_host_warp_pointer_to_capture_center, srv)
 
             @channel.on("message")
             def _on_message(message: object) -> None:

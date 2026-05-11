@@ -77,6 +77,7 @@ class RemoteViewerSession:
         on_state: OnState | None = None,
         on_dc_json: OnDcJson | None = None,
         auth_token: str = "",
+        offer_preset: str = "",
     ) -> None:
         self._host = (signal_host or "").strip() or "127.0.0.1"
         self._port = int(signal_port)
@@ -85,6 +86,7 @@ class RemoteViewerSession:
         self._on_state = on_state
         self._on_dc_json = on_dc_json
         self._auth_token = (auth_token or "").strip()
+        self._offer_preset = (offer_preset or "").strip()
 
         self._pc: Optional[RTCPeerConnection] = None
         self._dc = None
@@ -151,6 +153,8 @@ class RemoteViewerSession:
         }
         if self._auth_token:
             post_body["token"] = self._auth_token
+        if self._offer_preset:
+            post_body["preset"] = self._offer_preset
 
         try:
             async with ClientSession(timeout=timeout) as session:
@@ -378,6 +382,7 @@ def run_session_in_thread(
     on_state: OnState | None = None,
     on_dc_json: OnDcJson | None = None,
     auth_token: str = "",
+    offer_preset: str = "",
 ) -> tuple[threading.Thread, Optional[RemoteViewerSession]]:
     holder: list[Optional[RemoteViewerSession]] = [None]
 
@@ -390,6 +395,7 @@ def run_session_in_thread(
             on_state=on_state,
             on_dc_json=on_dc_json,
             auth_token=auth_token,
+            offer_preset=offer_preset,
         )
         holder[0] = sess
 
