@@ -1489,7 +1489,7 @@ def remote_viewer_main(page: ft.Page) -> None:
             async def _kbd_sink_diag_loop() -> None:
                 import streaming.win_keyboard_sink as _wks
 
-                last_dump = (0, 0, 0, 0)
+                last_dump = (0, 0, 0, 0, 0)
                 while True:
                     await asyncio.sleep(3.0)
                     try:
@@ -1499,17 +1499,20 @@ def remote_viewer_main(page: ft.Page) -> None:
                             snap["unichar"],
                             snap["ime"],
                             snap["syschar"],
+                            snap["ime_comp"],
                         )
                         if cur != last_dump:
                             log_remote_event(
                                 f"클라이언트: kbd-sink snapshot "
                                 f"ll_hook={snap['ll_hook']} "
                                 f"msg_hook={snap['msg_hook']} "
+                                f"callwnd={snap['callwnd_hook']} "
                                 f"tid={snap['msg_thread_id']} "
                                 f"WM_CHAR={snap['char']} "
                                 f"WM_UNICHAR={snap['unichar']} "
                                 f"WM_IME_CHAR={snap['ime']} "
                                 f"WM_SYSCHAR={snap['syschar']} "
+                                f"WM_IME_COMP={snap['ime_comp']} "
                                 f"last_wp={hex(snap['last_wp'])}"
                             )
                             last_dump = cur

@@ -1,9 +1,9 @@
 """Windows 전용: 원격 뷰어가 입력 포커스를 가질 때 Win/Ctrl/Alt 가 로컬 OS 로
 전달되지 않도록 저수준 키보드 훅으로 가로채고, 동일 이벤트를 DataChannel 로 다시 보낸다.
 
-추가로 ``WH_GETMESSAGE`` 훅으로 ``WM_CHAR``/``WM_UNICHAR`` 메시지를 가로채
-한글 등 IME 가 합성한 유니코드 문자를 호스트로 전송한다 (raw 키 코드만으로는
-Mac 호스트에서 한글 입력이 안 됨).
+추가로 ``WH_GETMESSAGE`` 로 ``WM_CHAR`` 등, ``WH_CALLWNDPROC`` 로
+``WM_IME_COMPOSITION(GCS_RESULTSTR)``·``WM_IME_CHAR`` 를 가로채 한글 확정 문자를
+호스트로 보낸다 (Flutter 는 IME 를 큐가 아닌 ``SendMessage`` 경로로만 보내는 경우가 많다).
 
 삼키면 Flutter 로는 해당 VK 가 전달되지 않으므로, 훅 안에서만 ``send_fn`` 을 호출한다.
 """
@@ -19,6 +19,7 @@ from typing import Callable
 
 WH_KEYBOARD_LL = 13
 WH_GETMESSAGE = 3
+WH_CALLWNDPROC = 4
 HC_ACTION = 0
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
@@ -28,6 +29,9 @@ WM_CHAR = 0x0102
 WM_SYSCHAR = 0x0106
 WM_UNICHAR = 0x0109
 WM_IME_CHAR = 0x0286
+WM_IME_COMPOSITION = 0x010F
+# ImmGetCompositionString / WM_IME_COMPOSITION
+GCS_RESULTSTR = 0x0800
 PM_NOREMOVE = 0x0000
 
 VK_LWIN = 0x5B
@@ -74,6 +78,21 @@ _GETMESSAGE_PROC = ctypes.WINFUNCTYPE(
     wintypes.WPARAM,
     wintypes.LPARAM,
 )
+_CALLWNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t,
+    ctypes.c_int,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+
+
+class CWPSTRUCT(ctypes.Structure):
+    _fields_ = (
+        ("lParam", wintypes.LPARAM),
+        ("wParam", wintypes.WPARAM),
+        ("message", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+    )
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -105,11 +124,13 @@ class _Sink:
     __slots__ = (
         "hook",
         "msg_hook",
+        "callwnd_hook",
         "msg_thread_id",
         "thread",
         "stop",
         "proc_ref",
         "msg_proc_ref",
+        "callwnd_proc_ref",
         "should_suppress",
         "send_key",
         "send_char",
@@ -120,11 +141,13 @@ class _Sink:
     def __init__(self) -> None:
         self.hook: int = 0
         self.msg_hook: int = 0
+        self.callwnd_hook: int = 0
         self.msg_thread_id: int = 0
         self.thread: threading.Thread | None = None
         self.stop = threading.Event()
         self.proc_ref: object | None = None
         self.msg_proc_ref: object | None = None
+        self.callwnd_proc_ref: object | None = None
         self.should_suppress: Callable[[], bool] = lambda: False
         self.send_key: Callable[[str, bool], None] = lambda _t, _d: None
         self.send_char: Callable[[str], None] = lambda _c: None
@@ -188,7 +211,95 @@ _diag_seen_char = 0
 _diag_seen_unichar = 0
 _diag_seen_ime = 0
 _diag_seen_syschar = 0
+_diag_seen_ime_comp = 0
 _diag_last_wp = 0
+
+
+def _read_ime_result_string(hwnd: int) -> str:
+    """WM_IME_COMPOSITION(GCS_RESULTSTR) 시점의 확정 문자열 (한글 등)."""
+    try:
+        user32 = ctypes.windll.user32
+        imm32 = ctypes.WinDLL("imm32")
+        ImmGetContext = imm32.ImmGetContext
+        ImmReleaseContext = imm32.ImmReleaseContext
+        ImmGetCompositionStringW = imm32.ImmGetCompositionStringW
+        ImmGetContext.argtypes = [wintypes.HWND]
+        ImmGetContext.restype = wintypes.HANDLE
+        ImmReleaseContext.argtypes = [wintypes.HWND, wintypes.HANDLE]
+        ImmReleaseContext.restype = wintypes.BOOL
+        ImmGetCompositionStringW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        ImmGetCompositionStringW.restype = wintypes.LONG
+
+        rel_hwnd = wintypes.HWND(hwnd)
+        himc = ImmGetContext(rel_hwnd)
+        if not himc:
+            focus = int(user32.GetFocus() or 0)
+            if focus:
+                rel_hwnd = wintypes.HWND(focus)
+                himc = ImmGetContext(rel_hwnd)
+        if not himc:
+            return ""
+        try:
+            nbytes = int(
+                ImmGetCompositionStringW(
+                    himc, GCS_RESULTSTR, None, 0
+                )
+            )
+            if nbytes <= 0:
+                return ""
+            buf = ctypes.create_string_buffer(nbytes)
+            got = int(
+                ImmGetCompositionStringW(
+                    himc, GCS_RESULTSTR, buf, nbytes
+                )
+            )
+            if got <= 0:
+                return ""
+            raw = bytes(buf.raw[:got])
+            return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+        finally:
+            ImmReleaseContext(rel_hwnd, himc)
+    except Exception:
+        return ""
+
+
+def _call_wnd_proc(
+    n_code: int, w_param: wintypes.WPARAM, l_param: wintypes.LPARAM
+) -> int:
+    """WH_CALLWNDPROC: SendMessage 경로의 IME/문자 메시지 (Flutter 가 큐에 안 올릴 수 있음)."""
+    global _diag_seen_ime_comp
+    if n_code == HC_ACTION:
+        try:
+            cwp = ctypes.cast(l_param, ctypes.POINTER(CWPSTRUCT)).contents
+            m = int(cwp.message)
+            hwnd = int(cwp.hwnd)
+            wp = int(cwp.wParam)
+            lp = int(cwp.lParam)
+            if _state.should_suppress():
+                if m == WM_IME_COMPOSITION and (lp & GCS_RESULTSTR):
+                    _diag_seen_ime_comp += 1
+                    s = _read_ime_result_string(hwnd)
+                    if s:
+                        _state.send_char(s)
+                elif m == WM_IME_CHAR:
+                    ch = wp & 0xFFFF
+                    if ch >= 0x80:
+                        try:
+                            _state.send_char(chr(ch))
+                        except (ValueError, OverflowError):
+                            pass
+        except Exception:
+            pass
+    return int(
+        ctypes.windll.user32.CallNextHookEx(
+            _state.callwnd_hook, n_code, w_param, l_param
+        )
+    )
 
 
 def _get_message_proc(
@@ -271,8 +382,10 @@ def get_diag_snapshot() -> dict:
         "unichar": _diag_seen_unichar,
         "ime": _diag_seen_ime,
         "syschar": _diag_seen_syschar,
+        "ime_comp": _diag_seen_ime_comp,
         "last_wp": _diag_last_wp,
         "msg_hook": _state.msg_hook,
+        "callwnd_hook": _state.callwnd_hook,
         "msg_thread_id": _state.msg_thread_id,
         "ll_hook": _state.hook,
     }
@@ -335,6 +448,7 @@ def start_win_keyboard_sink(
     _state.stop.clear()
     _state.proc_ref = _LOWLEVEL_KEYBOARD_PROC(_low_level_proc)
     _state.msg_proc_ref = _GETMESSAGE_PROC(_get_message_proc)
+    _state.callwnd_proc_ref = _CALLWNDPROC(_call_wnd_proc)
 
     def _resolve_ui_tid() -> int:
         """뷰어 윈도우의 실제 UI thread id."""
@@ -384,6 +498,13 @@ def start_win_keyboard_sink(
                 ui_tid,
             )
             _state.msg_hook = int(msg_hook or 0)
+            cw_hook = user32.SetWindowsHookExW(
+                WH_CALLWNDPROC,
+                _state.callwnd_proc_ref,
+                None,
+                ui_tid,
+            )
+            _state.callwnd_hook = int(cw_hook or 0)
             _state.msg_thread_id = ui_tid
             try:
                 from .remote_log import log_remote_event
@@ -397,6 +518,16 @@ def start_win_keyboard_sink(
                     err = ctypes.windll.kernel32.GetLastError()
                     log_remote_event(
                         f"클라이언트: WH_GETMESSAGE 설치 실패 tid={ui_tid} GLE={err}",
+                        error=True,
+                    )
+                if _state.callwnd_hook:
+                    log_remote_event(
+                        f"클라이언트: WH_CALLWNDPROC 설치 OK tid={ui_tid} (IME GCS_RESULTSTR)"
+                    )
+                else:
+                    err = ctypes.windll.kernel32.GetLastError()
+                    log_remote_event(
+                        f"클라이언트: WH_CALLWNDPROC 설치 실패 tid={ui_tid} GLE={err}",
                         error=True,
                     )
             except Exception:
@@ -423,6 +554,9 @@ def start_win_keyboard_sink(
         if _state.msg_hook:
             user32.UnhookWindowsHookEx(_state.msg_hook)
             _state.msg_hook = 0
+        if _state.callwnd_hook:
+            user32.UnhookWindowsHookEx(_state.callwnd_hook)
+            _state.callwnd_hook = 0
         user32.UnhookWindowsHookEx(hook)
         _state.hook = 0
 
@@ -439,3 +573,4 @@ def stop_win_keyboard_sink() -> None:
     _state.stop = threading.Event()
     _state.proc_ref = None
     _state.msg_proc_ref = None
+    _state.callwnd_proc_ref = None
