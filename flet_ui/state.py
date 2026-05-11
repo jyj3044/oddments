@@ -1194,10 +1194,33 @@ class AppState:
         """송출 중이 아니고 마지막 호스트 시작이 실패한 경우(푸터 오류 표시)."""
         return self._remote_host is None and self._remote_host_last_error is not None
 
-    def start_remote_host(self) -> tuple[bool, str | None]:
+    def start_remote_host(self) -> tuple[bool, str | None, str | None]:
+        """성공 시 세 번째 값은 macOS 접근성 미허용 안내(있을 때만)."""
         if self._remote_host is not None:
-            return True, None
+            return True, None, None
         hp = self.settings.remote.host
+        acc_hint: str | None = None
+        try:
+            import sys as _sys
+
+            if _sys.platform == "darwin":
+                from app_platform.darwin_accessibility import (
+                    accessibility_trusted_after_prompt,
+                )
+
+                _trusted, acc_hint = accessibility_trusted_after_prompt()
+                if _trusted:
+                    acc_hint = None
+                else:
+                    try:
+                        log_remote_event(
+                            "원격 호스트: 접근성이 아직 허용되지 않았습니다. "
+                            "원격 마우스·키보드 주입은 설정 후에 동작합니다."
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            acc_hint = None
         try:
             rtc_cfg = rtc_configuration_from_stun_turn(
                 stun_urls=hp.stun_urls,
@@ -1232,9 +1255,9 @@ class AppState:
                 pass
             self._remote_host_last_error = str(exc)
             self._notify_state()
-            return False, str(exc)
+            return False, str(exc), None
         self._notify_state()
-        return True, None
+        return True, None, acc_hint
 
     def stop_remote_host(self) -> None:
         srv = self._remote_host

@@ -183,10 +183,12 @@ def build_remote_settings(state: AppState) -> ft.Control:
         host_status.value = "호스트 실행 중 (WebRTC)" if running else "호스트 중지됨"
 
     def _on_host_start(_e: ft.ControlEvent) -> None:
-        ok, err = state.start_remote_host()
+        ok, err, acc_hint = state.start_remote_host()
         pg = getattr(state, "page", None)
         if not ok and err and pg is not None:
             show_snack(pg, err, severity="warning")
+        elif ok and acc_hint and pg is not None:
+            show_snack(pg, acc_hint, severity="warning")
         _sync_host_row()
         if pg is not None:
             try:

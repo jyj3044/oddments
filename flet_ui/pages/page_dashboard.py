@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from typing import Callable
 
@@ -108,6 +109,11 @@ class _DashboardController:
         self._preview_thread: threading.Thread | None = None
         self._mounted = False
         self._last_seq: int = -1
+        # 미리보기마다 page.run_task 를 쌓으면 원격 뷰어 연결 등으로 CPU 가 오를 때
+        # 이벤트 루프에 작업이 밀려 Flet 이 Working… 에 가까운 멈춤을 보일 수 있다.
+        self._prev_lock = threading.Lock()
+        self._pending_preview_jpg: list[bytes | None] = [None]
+        self._preview_flush_scheduled = [False]
 
     def attach_preview(self, image: ft.Image) -> None:
         self._preview_image = image
@@ -153,6 +159,40 @@ class _DashboardController:
         except Exception:
             self._mounted = False
 
+    async def _flush_preview_frames(self) -> None:
+        page = self.page
+        if page is None:
+            self._preview_flush_scheduled[0] = False
+            return
+        try:
+            while self._mounted:
+                with self._prev_lock:
+                    data = self._pending_preview_jpg[0]
+                    self._pending_preview_jpg[0] = None
+                if data is None:
+                    break
+                img = self._preview_image
+                if img is None:
+                    break
+                try:
+                    img.src = data
+                    img.visible = True
+                    img.update()
+                except Exception:
+                    pass
+                await asyncio.sleep(0)
+        finally:
+            self._preview_flush_scheduled[0] = False
+            with self._prev_lock:
+                again = self._pending_preview_jpg[0] is not None
+            pg2 = self.page
+            if again and self._mounted and pg2 is not None:
+                self._preview_flush_scheduled[0] = True
+                try:
+                    pg2.run_task(self._flush_preview_frames)
+                except Exception:
+                    self._preview_flush_scheduled[0] = False
+
     def _tick(self) -> None:
         img = self._preview_image
         if not self._mounted or img is None or self.page is None:
@@ -188,15 +228,19 @@ class _DashboardController:
             return
         self._last_seq = seq
 
-        async def _apply(_img=img, _data=jpg) -> None:
-            try:
-                _img.src = _data
-                _img.visible = True
-                _img.update()
-            except Exception:
-                pass
-
-        self._schedule_ui(_apply)
+        with self._prev_lock:
+            self._pending_preview_jpg[0] = jpg
+        if self._preview_flush_scheduled[0]:
+            return
+        self._preview_flush_scheduled[0] = True
+        pg = self.page
+        if pg is None:
+            self._preview_flush_scheduled[0] = False
+            return
+        try:
+            pg.run_task(self._flush_preview_frames)
+        except Exception:
+            self._preview_flush_scheduled[0] = False
 
 
 def build_dashboard(state: AppState) -> ft.Control:

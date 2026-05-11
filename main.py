@@ -24,6 +24,18 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
+import certifi
+import ssl
+
+# python.org macOS 빌드 등에서 기본 CA가 비어 Flet 데스크톱 첫 실행 시
+# 클라이언트 다운로드(urllib)가 SSL 검증 실패하는 경우를 방지합니다.
+_ssl_ca = certifi.where()
+os.environ.setdefault("SSL_CERT_FILE", _ssl_ca)
+os.environ.setdefault("REQUESTS_CA_BUNDLE", _ssl_ca)
+ssl._create_default_https_context = lambda cafile=_ssl_ca: ssl.create_default_context(
+    cafile=cafile
+)
+
 import cv2
 import flet as ft
 import numpy as np
@@ -920,9 +932,79 @@ def remote_viewer_main(page: ft.Page) -> None:
         except Exception:
             pass
 
+    # 영상 프레임마다 page.run_task 를 쌓으면(특히 큰 base64 + page.update) GIL 이 오래
+    # 잡혀 같은 프로세스의 WebRTC(aiortc) 스레드가 굶어 피어가 끊길 수 있다.
+    _rv_pending_lock = threading.Lock()
+    _rv_pending_jpeg: list[bytes | None] = [None]
+    _rv_flush_scheduled = [False]
+
+    async def _apply_img_bytes(data: bytes) -> None:
+        """JPEG 바이트를 이미지 컨트롤에 반영. 전체 page.update 는 가능한 생략한다."""
+        tmp_path: str | None = None
+        data_uri = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(data).decode("ascii")
+        )
+        try:
+            img_view.src = data_uri
+        except Exception:
+            try:
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix="odd_rv_",
+                    suffix=".jpg",
+                    dir=tempfile.gettempdir(),
+                )
+                try:
+                    os.write(fd, data)
+                finally:
+                    os.close(fd)
+                img_view.src = (
+                    Path(tmp_path).resolve().as_uri()
+                    + f"#t={time.time_ns()}"
+                )
+                jpeg_temp_paths.append(tmp_path)
+                while len(jpeg_temp_paths) > _REMOTE_VIEW_TEMP_KEEP:
+                    old = jpeg_temp_paths.pop(0)
+                    try:
+                        os.unlink(old)
+                    except OSError:
+                        pass
+            except Exception:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                return
+        try:
+            img_view.update()
+        except Exception:
+            pass
+        await asyncio.sleep(0)
+
+    async def _flush_rv_frames() -> None:
+        try:
+            while True:
+                with _rv_pending_lock:
+                    chunk = _rv_pending_jpeg[0]
+                    _rv_pending_jpeg[0] = None
+                if chunk is None:
+                    break
+                await _apply_img_bytes(chunk)
+        finally:
+            _rv_flush_scheduled[0] = False
+            with _rv_pending_lock:
+                again = _rv_pending_jpeg[0] is not None
+            if again:
+                _rv_flush_scheduled[0] = True
+                try:
+                    page.run_task(_flush_rv_frames)
+                except Exception:
+                    _rv_flush_scheduled[0] = False
+
     def _on_frame(rgb: np.ndarray) -> None:
         now = time.monotonic()
-        if now - last_emit[0] < 0.030:
+        if now - last_emit[0] < 0.040:
             return
         last_emit[0] = now
         try:
@@ -974,60 +1056,15 @@ def remote_viewer_main(page: ft.Page) -> None:
                 pass
 
         blob = jpeg_bytes
-
-        async def _apply_img(_data: bytes = blob) -> None:
-            """데스크톱 Flet 에서 raw bytes src 가 빈 화면으로 남는 경우가 있어
-            data:image/jpeg;base64 로 넘긴다. 실패 시 임시 파일 URI.
-            """
-            tmp_path: str | None = None
-            data_uri = (
-                "data:image/jpeg;base64,"
-                + base64.b64encode(_data).decode("ascii")
-            )
-            try:
-                img_view.src = data_uri
-            except Exception:
-                try:
-                    fd, tmp_path = tempfile.mkstemp(
-                        prefix="odd_rv_",
-                        suffix=".jpg",
-                        dir=tempfile.gettempdir(),
-                    )
-                    try:
-                        os.write(fd, _data)
-                    finally:
-                        os.close(fd)
-                    img_view.src = (
-                        Path(tmp_path).resolve().as_uri()
-                        + f"#t={time.time_ns()}"
-                    )
-                    jpeg_temp_paths.append(tmp_path)
-                    while len(jpeg_temp_paths) > _REMOTE_VIEW_TEMP_KEEP:
-                        old = jpeg_temp_paths.pop(0)
-                        try:
-                            os.unlink(old)
-                        except OSError:
-                            pass
-                except Exception:
-                    if tmp_path:
-                        try:
-                            os.unlink(tmp_path)
-                        except OSError:
-                            pass
-                    return
-            try:
-                img_view.update()
-            except Exception:
-                pass
-            try:
-                page.update()
-            except Exception:
-                pass
-
+        with _rv_pending_lock:
+            _rv_pending_jpeg[0] = blob
+        if _rv_flush_scheduled[0]:
+            return
+        _rv_flush_scheduled[0] = True
         try:
-            page.run_task(_apply_img)
+            page.run_task(_flush_rv_frames)
         except Exception:
-            pass
+            _rv_flush_scheduled[0] = False
 
     def _norm_key_token(raw: str) -> str:
         if not raw:
@@ -1083,7 +1120,8 @@ def remote_viewer_main(page: ft.Page) -> None:
 
     def _hover(_e: ft.PointerEvent) -> None:
         now = time.monotonic()
-        if now - last_hover[0] < 0.045:
+        # macOS 등에서 합성 커서 이동 비용·권한 이슈를 줄이기 위해 호버 전송 상한을 낮춤.
+        if now - last_hover[0] < 0.065:
             return
         last_hover[0] = now
         nx, ny = _norm_xy(getattr(_e, "local_position", None))

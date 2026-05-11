@@ -13,6 +13,7 @@ rapidocr-onnxruntime>=1.2.3; python_version >= "3.13"
 pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'
 # 맥 Retina: NSScreen.backingScaleFactor (원격 마우스 좌표 보정)
 pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'
+pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'
 pyserial>=3.5
 pynput>=1.7.6
 aiohttp>=3.10.0

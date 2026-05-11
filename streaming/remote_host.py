@@ -28,6 +28,47 @@ from .web_stream import SharedVideoBuffer, SharedVideoTrack, _even_dims_bgr
 
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="remote-input")
 
+# pynput 컨트롤러는 프로세스당 하나만 쓴다. 매 DataChannel 메시지마다 새로 만들면
+# 특히 macOS Quartz 경로에서 호버 폭주 시 멈춤·지연을 유발하기 쉽다.
+_pynput_singleton_lock = threading.Lock()
+_mouse_controller: object | None = None
+_kbd_controller: object | None = None
+_move_dedup_lock = threading.Lock()
+_last_move_pixel: list[tuple[int, int] | None] = [None]
+_inject_failure_logged = False
+
+
+def _pynput_mouse_keyboard() -> tuple[object, object]:
+    global _mouse_controller, _kbd_controller
+    with _pynput_singleton_lock:
+        if _mouse_controller is None:
+            from pynput.keyboard import Controller as KbdCtrl  # type: ignore[import-untyped]
+            from pynput.mouse import Controller as MouseCtrl  # type: ignore[import-untyped]
+
+            _mouse_controller = MouseCtrl()
+            _kbd_controller = KbdCtrl()
+        return _mouse_controller, _kbd_controller
+
+
+def _log_inject_failure_once(exc: BaseException) -> None:
+    global _inject_failure_logged
+    if _inject_failure_logged:
+        return
+    _inject_failure_logged = True
+    hint = ""
+    if sys.platform == "darwin":
+        hint = (
+            " 시스템 설정 → 개인 정보 보호 및 보안 → 접근성에서 이 앱(또는 터미널/"
+            "Python)을 허용했는지 확인하세요. 화면 녹화 권한도 원격 호스트에 필요합니다."
+        )
+    try:
+        log_remote_event(
+            f"원격 입력 주입 실패 ({type(exc).__name__}: {exc}).{hint}",
+            error=True,
+        )
+    except Exception:
+        pass
+
 
 def _darwin_backing_scale() -> float:
     """메인 디스플레이 Retina 배율. mss 는 물리 픽셀, Quartz 마우스는 보통 논리 포인트."""
@@ -125,13 +166,11 @@ def _inject_input_message(
     left, top, w, h = rect
     try:
         from pynput.keyboard import Key  # type: ignore[import-untyped]
-        from pynput.keyboard import Controller as KbdCtrl
-        from pynput.mouse import Button, Controller as MouseCtrl
+        from pynput.mouse import Button  # type: ignore[import-untyped]
     except ImportError:
         return
 
-    mouse = MouseCtrl()
-    kbd = KbdCtrl()
+    mouse, kbd = _pynput_mouse_keyboard()
 
     special = {
         "enter": Key.enter,
@@ -194,10 +233,13 @@ def _inject_input_message(
             key_obj = special.get(tok.lower())
         if key_obj is None:
             return
-        if down:
-            kbd.press(key_obj)
-        else:
-            kbd.release(key_obj)
+        try:
+            if down:
+                kbd.press(key_obj)
+            else:
+                kbd.release(key_obj)
+        except Exception as exc:
+            _log_inject_failure_once(exc)
 
     if t == "move":
         try:
@@ -216,7 +258,15 @@ def _inject_input_message(
         else:
             ax = int(ax_f)
             ay = int(ay_f)
-        mouse.position = (ax, ay)
+        pix = (ax, ay)
+        with _move_dedup_lock:
+            if _last_move_pixel[0] == pix:
+                return
+            _last_move_pixel[0] = pix
+        try:
+            mouse.position = pix
+        except Exception as exc:
+            _log_inject_failure_once(exc)
         return
 
     if t == "btn":
@@ -231,10 +281,13 @@ def _inject_input_message(
             "middle": Button.middle,
         }
         b = bmap.get(btn, Button.left)
-        if down:
-            mouse.press(b)
-        else:
-            mouse.release(b)
+        try:
+            if down:
+                mouse.press(b)
+            else:
+                mouse.release(b)
+        except Exception as exc:
+            _log_inject_failure_once(exc)
         return
 
     if t == "scroll":
@@ -243,7 +296,10 @@ def _inject_input_message(
             dy = int(msg.get("dy", 0))
         except (TypeError, ValueError):
             return
-        mouse.scroll(dx, dy)
+        try:
+            mouse.scroll(dx, dy)
+        except Exception as exc:
+            _log_inject_failure_once(exc)
         return
 
     if t == "key":
