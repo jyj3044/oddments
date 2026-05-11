@@ -28,7 +28,7 @@ from aiortc import (
 from capture.thread import CaptureThread, enumerate_monitors
 
 from .pil_bgr import resize_bgr
-from .remote_log import log_remote_event
+from .remote_log import log_remote_diag, log_remote_event
 from .remote_presets import normalize_preset_id, preset_dimensions
 from .rtc_ice import rtc_configuration_from_stun_turn
 from .web_stream import (
@@ -556,6 +556,18 @@ class RemoteHostServer:
         self._seal_ui_runner: Optional[_SealUiRunner] = seal_ui_runner
         self._vd_obj: object | None = None
         self._vd_display_id: int = 0
+        # 가상 디스플레이 PyObjC 객체는 워커·호스트 루프에서 동시에 건드리면 이중 release 로 SIGSEGV 가 난다.
+        self._vd_session_lock = threading.Lock()
+        # vd 해제 시 워커 스택/클로저가 PyObjC 래퍼를 붙잡으면 GC 가 idle 워커에서 object_dealloc 하며 SIGSEGV 난다.
+        # 참조는 여기만 두고 해제·del 은 호스트 aiohttp 스레드 메서드에서만 한다.
+        # 메인 루프에서 vd.release() 가 끝나기 전에 새 CGVirtualDisplay 를 만들면 초기화 실패가 난다.
+        self._vd_release_complete_event = threading.Event()
+        self._vd_release_complete_event.set()
+
+        # _startup_async 성공·실패를 start() 에 알린다.
+        # 성공 시 set(), 실패(OSError 등) 시 _startup_error 에 예외를 담고 set().
+        self._startup_done = threading.Event()
+        self._startup_error: Exception | None = None
 
         self.video = SharedVideoBuffer()
         self.audio = SharedAudioBuffer()
@@ -568,6 +580,8 @@ class RemoteHostServer:
         self._pcs: set[RTCPeerConnection] = set()
         self._runner: web.AppRunner | None = None
         self._site: web.BaseSite | None = None
+        # 피어 끊김 시 idle 정리(executor + finalize) 겹침 방지 — asyncio.Lock 은 루프 기동 후 설정.
+        self._peer_disconnect_lock: asyncio.Lock | None = None
 
         self._capture: CaptureThread | None = None
         self._capture_lock = threading.Lock()
@@ -577,6 +591,16 @@ class RemoteHostServer:
         self._pointer_scale: float = 1.0
         # _prepare_frame·짝수 맞춤 후 송출 버퍼 (뷰어 정규화와 주입 스팬 일치)
         self._last_frame_wh: tuple[int, int] = (0, 0)
+        # /offer 용: 피어 종료 정리(최대 ~15s VD 해제 대기)와 같은 풀을 쓰면
+        # 빠르게 들어갔다 나갔다 할 때 워커가 고갈되어 ``/offer 수신`` 만 찍히고 멈춘다.
+        self._host_executor = ThreadPoolExecutor(
+            max_workers=8,
+            thread_name_prefix="odd-remote-offer",
+        )
+        self._cleanup_executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="odd-remote-idle",
+        )
 
     def _request_disconnect_from_seal(self) -> None:
         """물리 화면 오버레이 '세션 끊기' — AppKit 메인 스레드에서 호출될 수 있음."""
@@ -653,11 +677,21 @@ class RemoteHostServer:
         if sys.platform != "darwin":
             return
         try:
+            log_remote_diag("호스트: 물리 화면 봉인 해제 — schedule_seal_hide 예약")
+        except Exception:
+            pass
+        try:
             from app_platform.darwin_remote_seal import schedule_seal_hide
 
             schedule_seal_hide(ui_runner=self._seal_ui_runner)
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                log_remote_diag(
+                    f"호스트: schedule_seal_hide 실패 — {type(exc).__name__}: {exc}",
+                    error=True,
+                )
+            except Exception:
+                pass
 
     def _auth_accept(self, token_param: object | None) -> bool:
         exp = self._auth_token
@@ -676,9 +710,10 @@ class RemoteHostServer:
             return False
 
     def _invoke_on_host_loop(self, fn: Callable[[], _T], *, timeout: float = 120.0) -> _T:
-        """CGVirtualDisplay 생성·해제는 aiohttp 이벤트 루프 스레드에서만 호출한다.
+        """호스트 aiohttp 이벤트 루프 스레드에서만 실행해야 하는 작업용.
 
-        run_in_executor 워커에서 vd.release 하면 세그폴트가 날 수 있어 직렬화한다.
+        CGVirtualDisplay 생성 등은 이 스레드에서 직렬화한다. 해제는
+        ``release_virtual_display_on_main_thread`` 로 메인 큐에서 처리한다.
         """
         loop = self._loop
         if loop is None or not loop.is_running():
@@ -697,24 +732,142 @@ class RemoteHostServer:
         loop.call_soon_threadsafe(_wrapper)
         return fut.result(timeout=timeout)
 
-    def _release_virtual_display_session(self) -> None:
-        if self._vd_obj is None:
-            return
 
-        def _go() -> None:
-            try:
-                from app_platform.darwin_virtual_display import release_virtual_display
+    async def _release_virtual_display_session_async(self) -> bool:
+        """가상 디스플레이 해제(피어 idle 정리 전용, asyncio 호스트 루프에서만 호출).
 
-                release_virtual_display(self._vd_obj)
-            except Exception:
-                pass
+        PyObjC 는 alloc+init 반환값을 내부적으로 retain 하므로 명시적 vd.release() 를
+        호출하면 retain count 가 2→1 이 될 뿐 dealloc 이 실행되지 않는다. 게다가
+        ``Oddments-RemoteHost`` 스레드에서 로컬 변수 ``vd`` 가 스코프를 벗어나면 PyObjC 가
+        한 번 더 [vd release] 를 호출해 SIGSEGV 가 난다(더블 릴리스).
+        모든 Python 참조를 해제하고 gc.collect() 를 호출해 PyObjC 가 [vd release] 를
+        단 한 번 자동 호출하도록 한다 → retain count 0 → dealloc → WindowServer 등록 해제.
+        """
+        if sys.platform != "darwin" or not self._virtual_display_enabled:
+            return True
+        with self._vd_session_lock:
+            vd = self._vd_obj
+            if vd is None:
+                try:
+                    log_remote_diag("호스트: VD 세션 해제(async) — 해제할 객체 없음(스킵)")
+                except Exception:
+                    pass
+                return True
+            old_id = int(self._vd_display_id)
             self._vd_obj = None
             self._vd_display_id = 0
 
-        if sys.platform == "darwin" and self._virtual_display_enabled:
-            self._invoke_on_host_loop(_go)
-        else:
-            _go()
+        self._vd_release_complete_event.clear()
+        try:
+            import gc as _gc
+
+            from app_platform.darwin_virtual_display import cg_display_id_still_online
+
+            try:
+                log_remote_diag(
+                    f"호스트: VD 세션 해제(async) — Py 참조 해제 CG ID {old_id}"
+                )
+            except Exception:
+                pass
+            vd = None
+            _gc.collect()
+            try:
+                log_remote_diag("호스트: VD 세션 해제(async) — Py 참조 해제·gc 완료")
+            except Exception:
+                pass
+
+            if cg_display_id_still_online(old_id) is True:
+                for _ in range(30):
+                    await asyncio.sleep(0.1)
+                    if cg_display_id_still_online(old_id) is not True:
+                        break
+            try:
+                log_remote_diag(
+                    f"호스트: VD 세션 해제(async) — 완료 "
+                    f"cg_id={old_id} "
+                    f"online={cg_display_id_still_online(old_id)!r}"
+                )
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            try:
+                log_remote_diag(
+                    f"호스트: VD 세션 해제(async) 예외 — {type(exc).__name__}: {exc}",
+                    error=True,
+                )
+            except Exception:
+                pass
+            return False
+        finally:
+            vd = None  # noqa: F841 — drop any remaining reference
+            try:
+                self._vd_release_complete_event.set()
+            except Exception:
+                pass
+
+    async def _idle_finalize_darwin_vd_on_host_loop(self) -> None:
+        """darwin+VD: executor 봉인 이후 geom·메타까지 마친다."""
+        await self._release_virtual_display_session_async()
+        self._geom = None
+        try:
+            log_remote_diag("호스트: idle finalize — self._geom = None 적용 (async VD 경로)")
+        except Exception:
+            pass
+        try:
+            n_meta = len(self._meta_pending)
+            self._meta_pending.clear()
+            try:
+                log_remote_diag(
+                    f"호스트: idle finalize — DataChannel 메타 대기 목록 비움 "
+                    f"({n_meta}개 제거)"
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _release_virtual_display_session(self) -> None:
+        """가상 디스플레이 세션을 한 번만 해제한다.
+
+        ``_vd_obj`` 참조는 ``_vd_session_lock`` 으로 한 번만 떼어낸다.
+        명시적 vd.release() 대신 Python 참조를 모두 해제하고 gc.collect() 로 PyObjC 의
+        자동 [vd release] 를 유도한다(더블 릴리스로 인한 SIGSEGV 방지).
+        """
+        with self._vd_session_lock:
+            vd = self._vd_obj
+            if vd is None:
+                try:
+                    log_remote_diag("호스트: VD 세션 해제 — 해제할 객체 없음(스킵)")
+                except Exception:
+                    pass
+                return
+            old_id = int(self._vd_display_id)
+            self._vd_obj = None
+            self._vd_display_id = 0
+
+        import gc as _gc
+
+        try:
+            log_remote_diag(
+                f"호스트: VD 세션 해제 — Py 참조 해제 CG ID {old_id}"
+            )
+        except Exception:
+            pass
+        self._vd_release_complete_event.clear()
+        try:
+            vd = None
+            _gc.collect()
+            try:
+                log_remote_diag("호스트: VD 세션 해제 — Py 참조 해제·gc 완료")
+            except Exception:
+                pass
+        finally:
+            vd = None  # noqa: F841
+            try:
+                self._vd_release_complete_event.set()
+            except Exception:
+                pass
 
     def _capture_join_timeout_sec(self) -> float:
         """가상 디스플레이는 mss 스레드가 끝나기 전에 CGDisplay 를 닫으면 오류가 나기 쉬워 여유를 둔다."""
@@ -752,18 +905,31 @@ class RemoteHostServer:
             )
             w, h = preset_dimensions(
                 self._resolution_preset_id,
-                host_native=_darwin_main_pixel_size(),
+                host_native=_darwin_main_pixel_size,
             )
             w = max(320, int(w))
             h = max(240, int(h))
+
+            # Event.wait 는 호스트 aiohttp 스레드에서 실행되면 안 된다. 루프가 멈추면 피어 종료 후
+            # ``_stop_capture_if_idle_finalize`` 가 실행되지 않아 VD 해제·completion set 과 교착하고,
+            # 원격 재연결 시 /offer 가 영구히 막히며 호스트 중지도 되지 않는다.
+            if self._thread is not None and threading.current_thread() is self._thread:
+                raise RuntimeError(
+                    "내부 오류: 가상 디스플레이 준비는 호스트 asyncio 스레드에서 호출할 수 없습니다."
+                )
+            if not self._vd_release_complete_event.wait(timeout=60.0):
+                raise DarwinVirtualDisplayError(
+                    "이전 가상 디스플레이 해제 대기 시간 초과"
+                )
 
             def _create_vd(
                 ww: int = w,
                 hh: int = h,
             ) -> tuple[float, float, float, float]:
                 vd, did = create_virtual_display(ww, hh, refresh_hz=60.0)
-                self._vd_obj = vd
-                self._vd_display_id = int(did)
+                with self._vd_session_lock:
+                    self._vd_obj = vd
+                    self._vd_display_id = int(did)
                 return cg_display_bounds(int(did))
 
             try:
@@ -1050,45 +1216,176 @@ class RemoteHostServer:
             self._capture.start()
         self._start_darwin_audio()
 
+    def _stop_capture_if_idle_blocking(self) -> None:
+        """워커 스레드 전용: 캡처 중지·조인·오디오 중지(블로킹).
+
+        가상 디스플레이(PyObjC)는 여기서 건드리지 않는다. 해제는
+        ``_stop_capture_if_idle_finalize`` 가 스레드 풀에서 호출된다.
+        """
+        try:
+            with self._capture_lock:
+                if len(self._pcs) > 0:
+                    try:
+                        log_remote_diag(
+                            f"호스트: idle blocking 생략 — 재연결된 피어 있음 "
+                            f"({len(self._pcs)}개)"
+                        )
+                    except Exception:
+                        pass
+                    return
+                cap = self._capture
+                self._capture = None
+            if cap is None:
+                try:
+                    log_remote_diag(
+                        "호스트: idle blocking — 활성 CaptureThread 없음, "
+                        "stop/join 생략"
+                    )
+                except Exception:
+                    pass
+            if cap is not None:
+                try:
+                    log_remote_event("호스트: 뷰어 없음 — 캡처 중지")
+                except Exception:
+                    pass
+                try:
+                    log_remote_diag(
+                        "호스트: idle blocking — CaptureThread.stop() 호출"
+                    )
+                except Exception:
+                    pass
+                try:
+                    cap.stop()
+                except Exception:
+                    pass
+                try:
+                    log_remote_diag(
+                        "호스트: idle blocking — CaptureThread.join 대기 "
+                        f"(timeout {self._capture_join_timeout_sec():.0f}s)"
+                    )
+                except Exception:
+                    pass
+                self._join_capture_thread(cap)
+                try:
+                    log_remote_diag("호스트: idle blocking — CaptureThread.join 반환")
+                except Exception:
+                    pass
+            try:
+                log_remote_diag("호스트: idle blocking — _stop_darwin_audio")
+            except Exception:
+                pass
+            self._stop_darwin_audio()
+        except BaseException as exc:
+            try:
+                log_remote_event(
+                    f"호스트: 뷰어 종료 후 캡처 정리 중 오류 — {type(exc).__name__}: {exc}",
+                    error=True,
+                )
+            except Exception:
+                pass
+
+    def _stop_capture_if_idle_finalize(self, *, defer_darwin_vd: bool = False) -> None:
+        """스레드 풀 워커에서 호출: VD·geom·봉인·메타.
+
+        ``defer_darwin_vd=True`` 이면 맥 가상 디스플레이 모드에서 봉인 해제만 하고
+        즉시 반환한다. VD 해제·geom·메타는 asyncio 루프에서
+        :meth:`_idle_finalize_darwin_vd_on_host_loop` 로 이어서 처리한다(메인 스레드
+        교착·타임아웃 방지).
+
+        조인 도중 새 피어가 붙었을 수 있으므로 피어 수를 다시 확인한다.
+        """
+        try:
+            with self._capture_lock:
+                if len(self._pcs) > 0:
+                    try:
+                        log_remote_diag(
+                            "호스트: idle finalize 생략 — 조인 중 새 피어 연결됨 "
+                            f"({len(self._pcs)}개)"
+                        )
+                    except Exception:
+                        pass
+                    return
+            if sys.platform == "darwin" and self._virtual_display_enabled:
+                try:
+                    log_remote_diag(
+                        "호스트: idle finalize 시작 "
+                        "(맥 가상 디스플레이: 봉인 해제 → VD 해제 → geom 초기화)"
+                    )
+                except Exception:
+                    pass
+                # 봉인 해제가 CG/스크린 상태를 건드릴 수 있어 VD release 전에 둔다.
+                self._try_stop_physical_seal()
+                if defer_darwin_vd:
+                    try:
+                        log_remote_diag(
+                            "호스트: idle finalize — VD·geom·메타는 "
+                            "호스트 asyncio 코루틴에서 처리"
+                        )
+                    except Exception:
+                        pass
+                    return
+                try:
+                    log_remote_diag(
+                        "호스트: idle finalize — _release_virtual_display_session()"
+                    )
+                except Exception:
+                    pass
+                self._release_virtual_display_session()
+                self._geom = None
+                try:
+                    log_remote_diag("호스트: idle finalize — self._geom = None 적용")
+                except Exception:
+                    pass
+            else:
+                try:
+                    log_remote_diag(
+                        "호스트: idle finalize — 비 VD 모드: 봉인 해제만"
+                    )
+                except Exception:
+                    pass
+                self._try_stop_physical_seal()
+            try:
+                n_meta = len(self._meta_pending)
+                self._meta_pending.clear()
+                try:
+                    log_remote_diag(
+                        f"호스트: idle finalize — DataChannel 메타 대기 목록 비움 "
+                        f"({n_meta}개 제거)"
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except BaseException as exc:
+            try:
+                log_remote_event(
+                    f"호스트: 뷰어 종료 후 마무리 중 오류 — {type(exc).__name__}: {exc}",
+                    error=True,
+                )
+            except Exception:
+                pass
+
     def _stop_capture_if_idle(self) -> None:
-        """활성 피어가 없으면 캡처를 멈춰 CPU 를 돌려준다."""
-        with self._capture_lock:
-            if len(self._pcs) > 0:
-                return
-            cap = self._capture
-            self._capture = None
-        if cap is not None:
-            try:
-                log_remote_event("호스트: 뷰어 없음 — 캡처 중지")
-            except Exception:
-                pass
-            try:
-                cap.stop()
-            except Exception:
-                pass
-            self._join_capture_thread(cap)
-        self._stop_darwin_audio()
-        if sys.platform == "darwin" and self._virtual_display_enabled:
-            self._release_virtual_display_session()
-            self._geom = None
-        self._try_stop_physical_seal()
+        """활성 피어가 없으면 캡처를 멈춘다(호스트 스레드에서 호출할 때 동기 전체)."""
+        self._stop_capture_if_idle_blocking()
+        self._stop_capture_if_idle_finalize()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
 
+        self._startup_done.clear()
+        self._startup_error = None
         self._thread = threading.Thread(
             target=self._run_loop,
             daemon=True,
             name="Oddments-RemoteHost",
         )
         self._thread.start()
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if self._loop is not None:
-                return
-            time.sleep(0.03)
-        raise RuntimeError("원격 호스트 서버 시작 시간 초과.")
+        if not self._startup_done.wait(timeout=15.0):
+            raise RuntimeError("원격 호스트 서버 시작 시간 초과.")
+        if self._startup_error is not None:
+            raise self._startup_error
 
     def stop(self) -> None:
         # 피어·트랙을 먼저 닫은 뒤 캡처를 멈추면(특히 가상 디스플레이) CG/mss 경합을 줄인다.
@@ -1113,7 +1410,17 @@ class RemoteHostServer:
             self._join_capture_thread(cap)
 
         if sys.platform == "darwin" and self._virtual_display_enabled:
+            try:
+                log_remote_diag(
+                    "호스트: RemoteHostServer.stop() — 가상 디스플레이 세션 해제 호출"
+                )
+            except Exception:
+                pass
             self._release_virtual_display_session()
+        try:
+            log_remote_diag("호스트: RemoteHostServer.stop() — _geom 초기화·봉인 해제")
+        except Exception:
+            pass
         self._geom = None
         self._try_stop_physical_seal()
 
@@ -1126,18 +1433,19 @@ class RemoteHostServer:
             self._thread.join(timeout=3.0)
         self._thread = None
         self._loop = None
+        self._startup_done.clear()
+        self._startup_error = None
         self._pcs.clear()
 
     def _run_loop(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        # /offer 가 startup 완료 전에 처리될 수 있으므로 루프 참조는 즉시 둔다.
         self._loop = loop
         try:
             loop.run_until_complete(self._startup_async())
-        except OSError as exc:
+        except Exception as exc:
             try:
-                print(f"[원격호스트] 바인드 실패 {self.host}:{self.port}: {exc}", flush=True)
+                print(f"[원격호스트] 시작 실패 {self.host}:{self.port}: {exc}", flush=True)
             except OSError:
                 pass
             try:
@@ -1149,7 +1457,10 @@ class RemoteHostServer:
             except Exception:
                 pass
             self._loop = None
+            self._startup_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            self._startup_done.set()
             return
+        self._startup_done.set()
         loop.run_forever()
         try:
             loop.run_until_complete(self._shutdown_async())
@@ -1172,6 +1483,7 @@ class RemoteHostServer:
             reuse_address=True,
         )
         await self._site.start()
+        self._peer_disconnect_lock = asyncio.Lock()
         try:
             log_remote_event(
                 f"호스트: 신호 서버 대기 http://{self.host}:{self.port}/offer"
@@ -1181,6 +1493,12 @@ class RemoteHostServer:
 
     async def _shutdown_async(self) -> None:
         pcs = list(self._pcs)
+        try:
+            log_remote_diag(
+                f"호스트: _shutdown_async — 활성 피어 {len(pcs)}개 닫기 예약"
+            )
+        except Exception:
+            pass
         self._pcs.clear()
         for pc in pcs:
             try:
@@ -1194,9 +1512,41 @@ class RemoteHostServer:
                 pass
         self._runner = None
         self._site = None
+        for attr in ("_host_executor", "_cleanup_executor"):
+            ex = getattr(self, attr, None)
+            if ex is not None:
+                setattr(self, attr, None)
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    try:
+                        ex.shutdown(wait=False)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
     async def _handle_offer(self, req: web.Request) -> web.Response:
-        params = await req.json()
+        t_offer = time.perf_counter()
+        try:
+            log_remote_diag("호스트: /offer 수신")
+        except Exception:
+            pass
+        try:
+            params = await req.json()
+        except Exception as exc:
+            try:
+                log_remote_diag(
+                    f"호스트: /offer JSON 파싱 실패 — {type(exc).__name__}: {exc}",
+                    error=True,
+                )
+            except Exception:
+                pass
+            return web.Response(
+                status=400,
+                text=json.dumps({"error": "invalid json"}),
+                content_type="application/json",
+            )
         if not self._auth_accept(params.get("token")):
             try:
                 log_remote_event("호스트: /offer 인증 실패", error=True)
@@ -1230,11 +1580,12 @@ class RemoteHostServer:
             except Exception:
                 pass
 
+        loop = asyncio.get_running_loop()
         try:
-            self._ensure_capture()
-        except RuntimeError as exc:
+            await loop.run_in_executor(self._host_executor, self._ensure_capture)
+        except Exception as exc:
             try:
-                log_remote_event(f"호스트: 캡처 불가 — {exc}", error=True)
+                log_remote_diag(f"호스트: 캡처 불가 — {exc}", error=True)
             except Exception:
                 pass
             return web.Response(
@@ -1242,6 +1593,13 @@ class RemoteHostServer:
                 text=json.dumps({"error": str(exc)}, ensure_ascii=False),
                 content_type="application/json",
             )
+
+        try:
+            log_remote_diag(
+                f"호스트: /offer 캡처 준비 완료 ({time.perf_counter() - t_offer:.2f}s)"
+            )
+        except Exception:
+            pass
 
         offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
@@ -1251,10 +1609,27 @@ class RemoteHostServer:
         @pc.on("connectionstatechange")
         async def _on_state_change() -> None:
             st = pc.connectionState
+            try:
+                log_remote_diag(
+                    f"호스트: WebRTC connectionstatechange → «{st}» "
+                    f"(등록된 피어 {len(self._pcs)}개)"
+                )
+            except Exception:
+                pass
             if st == "connected":
                 # ICE 연결 직후 한 번 더 봉인(가상 디스플레이 + 물리 화면)을 건다.
                 self._try_start_physical_seal()
             if st in ("failed", "closed", "disconnected"):
+                # closed·disconnected 가 연달아 오면 idle 정리가 두 번 돌아 각각 ~15s 걸린다.
+                if pc not in self._pcs:
+                    try:
+                        log_remote_diag(
+                            "호스트: 원격 종료 처리 생략 — 이미 제거된 피어 "
+                            f"(상태 «{st}», 중복 이벤트)"
+                        )
+                    except Exception:
+                        pass
+                    return
                 self._pcs.discard(pc)
                 try:
                     log_remote_event(
@@ -1264,16 +1639,91 @@ class RemoteHostServer:
                 except Exception:
                     pass
                 try:
-                    await pc.close()
+                    log_remote_diag(
+                        f"호스트: 원격 종료 — pc.close() 및 idle 정리 예약 "
+                        f"(남은 피어 {len(self._pcs)}개)"
+                    )
                 except Exception:
                     pass
-                # cap.join()·가상 디스플레이 해제가 이벤트 루프를 막으면 ICE/트랙 정리와
-                # 겹쳐 예외·불안정이 난다 → 워커로 넘긴다.
                 try:
-                    exe_loop = asyncio.get_running_loop()
-                    await exe_loop.run_in_executor(None, self._stop_capture_if_idle)
-                except Exception:
-                    pass
+                    await pc.close()
+                except Exception as exc:
+                    try:
+                        log_remote_diag(
+                            f"호스트: pc.close() 예외 — {type(exc).__name__}: {exc}"
+                        )
+                    except Exception:
+                        pass
+                # cap.join() 은 워커로, PyObjC 해제는 이 루프에서. 피어 여러 개가 동시에
+                # 끊기면 finalize 가 겹치지 않도록 락으로 직렬화한다.
+                try:
+                    lock = self._peer_disconnect_lock
+                    if lock is None:
+                        lock = asyncio.Lock()
+                        self._peer_disconnect_lock = lock
+                    async with lock:
+                        t_idle = time.perf_counter()
+                        try:
+                            log_remote_diag(
+                                "호스트: 피어 정리 시작 (idle) — "
+                                "cleanup_executor 로 blocking → finalize"
+                            )
+                        except Exception:
+                            pass
+                        exe_loop = asyncio.get_running_loop()
+                        try:
+                            log_remote_diag(
+                                "호스트: 런인 실행기 await "
+                                "_stop_capture_if_idle_blocking …"
+                            )
+                        except Exception:
+                            pass
+                        await exe_loop.run_in_executor(
+                            self._cleanup_executor,
+                            self._stop_capture_if_idle_blocking,
+                        )
+                        try:
+                            log_remote_diag(
+                                "호스트: 피어 정리 blocking 완료 "
+                                f"({time.perf_counter() - t_idle:.2f}s)"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            log_remote_diag(
+                                "호스트: 런인 실행기 await "
+                                "_stop_capture_if_idle_finalize …"
+                            )
+                        except Exception:
+                            pass
+                        if sys.platform == "darwin" and self._virtual_display_enabled:
+                            await exe_loop.run_in_executor(
+                                self._cleanup_executor,
+                                lambda: self._stop_capture_if_idle_finalize(
+                                    defer_darwin_vd=True
+                                ),
+                            )
+                            await self._idle_finalize_darwin_vd_on_host_loop()
+                        else:
+                            await exe_loop.run_in_executor(
+                                self._cleanup_executor,
+                                self._stop_capture_if_idle_finalize,
+                            )
+                        try:
+                            log_remote_diag(
+                                "호스트: 피어 정리 finalize 완료 "
+                                f"({time.perf_counter() - t_idle:.2f}s)"
+                            )
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    try:
+                        log_remote_diag(
+                            f"호스트: 피어 정리 예외 — {type(exc).__name__}: {exc}",
+                            error=True,
+                        )
+                    except Exception:
+                        pass
 
         srv = self
 
@@ -1318,6 +1768,10 @@ class RemoteHostServer:
         try:
             log_remote_event(
                 f"호스트: SDP 답변 전송 (활성 피어 {len(self._pcs)})"
+            )
+            log_remote_diag(
+                f"호스트: /offer 완료·SDP 전송 "
+                f"(경과 {time.perf_counter() - t_offer:.2f}s)"
             )
         except Exception:
             pass

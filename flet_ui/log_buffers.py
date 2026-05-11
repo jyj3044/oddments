@@ -6,7 +6,10 @@
 * 메모리 ``deque`` (최대 500줄) 에 보관 — 페이지 재방문 시 그대로 표시.
 * 일자별 파일 ``logs/{kind}-YYYYMMDD.log`` 에 추가 기록.
 * 에러 전용으로 같은 날짜의 ``logs/{kind}_error-YYYYMMDD.log`` 에 한 줄을 즉시 추가할 수 있다.
-* 앱 진단 ``log_app_event(..., ERROR|CRITICAL)`` 는 ``app_error-YYYYMMDD.log`` 에도 동일 본문을 남긴다.
+* 앱 진단 ``log_app_event(...)`` 는 ``app-*.log`` / (심각도 높을 때) ``app_error-*.log`` 에 남기고,
+  ``WARN``/``ERROR``/``CRITICAL`` 은 메모리 ``app`` 버퍼에도 넣어 Log 페이지 「앱」 탭에 표시한다.
+* ``faulthandler`` 는 ``logs/python-faulthandler-YYYYMMDD.log`` 에 덤프한다(세그폴트 등 네이티브 크래시 시
+  Python 스택 추적에 도움; ``excepthook`` 으로는 잡히지 않는다).
 * 1시간마다 ``LOG_RETENTION_DAYS`` (기본 2일) 보다 오래된 로그 파일 자동 삭제.
 
 페이지(``page_ocr``, ``page_arduino``, ``page_web``) 들은 더 이상 소스 큐를
@@ -20,6 +23,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import sys
 import threading
 import time
@@ -96,6 +100,11 @@ def append_sidecar_error_file(kind: str, message: str) -> None:
                 f.write(f"[{ts}] {clean}\n")
         except OSError:
             pass
+    if kind == "app":
+        try:
+            get_log_store().app.push_many([f"[{ts}] {clean}"])
+        except Exception:
+            pass
 
 
 class LogBuffer:
@@ -155,7 +164,7 @@ class LogBuffer:
 
 
 class LogStore:
-    """OCR/Arduino/Web/Remote 네 버퍼를 묶고 백그라운드 드레인 + 파일 영속화를 담당.
+    """OCR/Arduino/Web/Remote/App 다섯 버퍼를 묶고 백그라운드 드레인 + 파일 영속화를 담당.
 
     에러 부가 파일(``{kind}_error-*.log``, ``app_error-*.log``)은 각 로깅 API 가 직접 쓴다.
     """
@@ -165,6 +174,7 @@ class LogStore:
         self.arduino = LogBuffer("arduino")
         self.web = LogBuffer("web")
         self.remote = LogBuffer("remote")
+        self.app = LogBuffer("app")
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -293,7 +303,7 @@ class LogStore:
             except OSError:
                 continue
 
-    # ─── 앱 레벨 진단 로그 (UI 버퍼와 무관, 파일에만 기록) ──────────────
+    # ─── 앱 레벨 진단 로그 (파일 + 심각도 높은 항목은 app 메모리 버퍼) ─────
     def log_app_event(
         self,
         level: str,
@@ -305,7 +315,7 @@ class LogStore:
 
         ``ERROR``/``CRITICAL`` 이면 동일 내용을 ``logs/app_error-YYYYMMDD.log`` 에도 남긴다.
 
-        UI 의 LogConsole 에는 표시하지 않는다(별도 화면이 없음). 단순 파일 진단용.
+        ``WARN``/``ERROR``/``CRITICAL`` 은 Log 페이지 「앱」 탭용 메모리 버퍼에도 한 줄 요약을 넣는다.
         ``level`` 은 ``INFO``/``WARN``/``ERROR`` 등 자유 문자열. ``detail`` 이
         주어지면 다음 줄들에 ``    | `` prefix 로 들여쓰기해 traceback 같은 멀티라인을
         읽기 쉽게 정렬한다.
@@ -339,10 +349,56 @@ class LogStore:
                         pass
             except OSError:
                 pass
+        if lvl in ("WARN", "ERROR", "CRITICAL"):
+            ui_line = f"[{ts}] {lvl} {head}"
+            if detail:
+                d0 = str(detail).strip().splitlines()
+                if d0:
+                    tail = d0[0].replace("\r", " ").replace("\n", " ")
+                    if len(tail) > 400:
+                        tail = tail[:397] + "…"
+                    ui_line = f"{ui_line}  |  {tail}"
+            try:
+                self.app.push_many([ui_line])
+            except Exception:
+                pass
 
 
 _store: Optional[LogStore] = None
 _store_lock = threading.Lock()
+_faulthandler_fp: Optional[object] = None
+_faulthandler_lock = threading.Lock()
+
+
+def _ensure_faulthandler() -> None:
+    """세그폴트 등 치명적 신호 시 모든 스레드의 Python 스택을 로그 파일에 남긴다."""
+    global _faulthandler_fp
+    with _faulthandler_lock:
+        if _faulthandler_fp is not None:
+            return
+        try:
+            d = _log_dir_path()
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"python-faulthandler-{datetime.now():%Y%m%d}.log"
+            fp = path.open("a", encoding="utf-8", buffering=1)
+        except OSError:
+            return
+        try:
+            faulthandler.enable(fp)
+        except Exception:
+            try:
+                fp.close()
+            except Exception:
+                pass
+            return
+        _faulthandler_fp = fp
+        try:
+            fp.write(
+                f"faulthandler enabled at {datetime.now().isoformat(timespec='seconds')}\n"
+            )
+            fp.flush()
+        except Exception:
+            pass
 
 
 def get_log_store() -> LogStore:
@@ -352,6 +408,7 @@ def get_log_store() -> LogStore:
     global _store
     with _store_lock:
         if _store is None:
+            _ensure_faulthandler()
             _store = LogStore()
             _store.start()
         elif _store._thread is None or not _store._thread.is_alive():
@@ -369,6 +426,19 @@ def shutdown_log_store() -> None:
                 s.stop()
             except Exception:
                 pass
+
+
+def reset_app_log() -> None:
+    """앱/전역 로그 메모리 버퍼만 비운다(파일은 건드리지 않음)."""
+    global _store
+    with _store_lock:
+        s = _store
+        if s is None:
+            return
+        try:
+            s.app.clear()
+        except Exception:
+            pass
 
 
 def log_app_event(
@@ -393,6 +463,7 @@ __all__ = [
     "LogStore",
     "append_sidecar_error_file",
     "get_log_store",
+    "reset_app_log",
     "shutdown_log_store",
     "log_app_event",
     "MAX_LOG_LINES",

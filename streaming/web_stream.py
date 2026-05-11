@@ -23,7 +23,7 @@ import av
 import numpy as np
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
+from aiortc.mediastreams import AudioStreamTrack, MediaStreamError, VideoStreamTrack
 
 from .pil_bgr import resize_bgr
 from .web_log import log_web_event
@@ -744,17 +744,24 @@ class SharedVideoTrack(VideoStreamTrack):
         self._pts_step = max(1, int(round(90000.0 / self._fps)))
 
     async def recv(self) -> av.VideoFrame:
-        await asyncio.sleep(1.0 / self._fps)
-        snap = self._shared.snapshot()
-        if snap is not None and snap.size:
-            resized = _resize_bgr_max_side(snap, self._max_stream_side)
-            self._last = np.ascontiguousarray(_even_dims_bgr(resized))
-        rgb = np.ascontiguousarray(self._last[:, :, ::-1])
-        vf = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-        vf.pts = self._pts
-        vf.time_base = self._time_base
-        self._pts += self._pts_step
-        return vf
+        if self.readyState != "live":
+            raise MediaStreamError
+        try:
+            await asyncio.sleep(1.0 / self._fps)
+            snap = self._shared.snapshot()
+            if snap is not None and snap.size:
+                resized = _resize_bgr_max_side(snap, self._max_stream_side)
+                self._last = np.ascontiguousarray(_even_dims_bgr(resized))
+            rgb = np.ascontiguousarray(self._last[:, :, ::-1])
+            vf = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            vf.pts = self._pts
+            vf.time_base = self._time_base
+            self._pts += self._pts_step
+            return vf
+        except MediaStreamError:
+            raise
+        except Exception:
+            raise MediaStreamError from None
 
 
 class SharedAudioTrack(AudioStreamTrack):
@@ -768,25 +775,32 @@ class SharedAudioTrack(AudioStreamTrack):
         self._pts = 0
 
     async def recv(self) -> av.AudioFrame:
+        if self.readyState != "live":
+            raise MediaStreamError
         # 오디오 loopback 실패·지연 시 큐가 비면 MediaStreamError 로 세션이 끊겨 영상도 까맣게 보일 수 있음 → 무음 유지
         try:
-            chunk = await asyncio.wait_for(self._q.get(), timeout=1.0)
-        except asyncio.TimeoutError:
-            chunk = np.zeros((960, 2), dtype=np.float32)
-        if chunk.ndim != 2 or chunk.shape[1] != 2:
-            chunk = np.zeros((960, 2), dtype=np.float32)
-        pcm = np.clip(chunk, -1.0, 1.0)
-        # 모노 Opus: Safari·모바일 WebRTC 호환에 유리
-        mono = np.mean(pcm, axis=1)
-        pcm_s16 = (mono * 32767.0).astype(np.int16)
-        af = av.AudioFrame.from_ndarray(
-            pcm_s16.reshape(1, -1), format="s16", layout="mono"
-        )
-        af.sample_rate = self._sample_rate
-        af.pts = self._pts
-        af.time_base = Fraction(1, self._sample_rate)
-        self._pts += int(pcm_s16.shape[0])
-        return af
+            try:
+                chunk = await asyncio.wait_for(self._q.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                chunk = np.zeros((960, 2), dtype=np.float32)
+            if chunk.ndim != 2 or chunk.shape[1] != 2:
+                chunk = np.zeros((960, 2), dtype=np.float32)
+            pcm = np.clip(chunk, -1.0, 1.0)
+            # 모노 Opus: Safari·모바일 WebRTC 호환에 유리
+            mono = np.mean(pcm, axis=1)
+            pcm_s16 = (mono * 32767.0).astype(np.int16)
+            af = av.AudioFrame.from_ndarray(
+                pcm_s16.reshape(1, -1), format="s16", layout="mono"
+            )
+            af.sample_rate = self._sample_rate
+            af.pts = self._pts
+            af.time_base = Fraction(1, self._sample_rate)
+            self._pts += int(pcm_s16.shape[0])
+            return af
+        except MediaStreamError:
+            raise
+        except Exception:
+            raise MediaStreamError from None
 
     def stop(self) -> None:  # type: ignore[override]
         self._shared.unsubscribe(self._q)

@@ -46,9 +46,20 @@ from detection.ocr_diag import (
 )
 from streaming.remote_log import (
     drain_remote_log_lines,
+    log_remote_diag,
     log_remote_event,
     reset_remote_log,
 )
+
+def _vd_test_log(msg: str, *, error: bool = False) -> None:
+    """VD 테스트 생성·해제 진단(항상 remote 즉시 로그)."""
+    try:
+        log_remote_diag(msg, error=error)
+    except Exception:
+        pass
+
+
+
 from streaming.web_log import drain_web_log_lines, log_web_event, reset_web_log
 
 if sys.platform == "win32":
@@ -309,6 +320,18 @@ class AppState:
         self._remote_host = None
         # 호스트 시작 실패 시에만 설정. 성공·중지 시 None.
         self._remote_host_last_error: str | None = None
+        # macOS: 원격 설정 화면에서 CGVirtualDisplay 생성·해제만 따로 시험할 때 사용.
+        self._vd_test_display: tuple[object, int] | None = None
+        self._vd_test_busy = False
+        # ``create_virtual_display`` 는 락을 오래 잡으면 안 된다. UI ``run_task`` 가
+        # ``vd_test_display_active`` 등으로 같은 락을 기다리며 Flet 이 Working… 처럼 멈춘다.
+        self._vd_test_creating = False
+        # 직전 VD 테스트 해제의 CGDirectDisplayID(로그·선택 안정화에만 사용).
+        self._vd_test_last_released_cg_id: int | None = None
+        # ``CGVirtualDisplayDescriptor`` 시리얼 — 해제 직후 재생성 시 WindowServer 가
+        # 동일 디스크립터를 거부하는 것을 줄이기 위해 생성할 때마다 증가.
+        self._vd_test_descriptor_serial = 0
+        self._vd_test_lock = threading.Lock()
 
         # 공인 IPv4 조회 결과 캐시(60초). URL 복사 같은 빈번한 호출에서 매번
         # 외부 HTTP 요청을 날리지 않게 한다.
@@ -1184,6 +1207,384 @@ class AppState:
     def remote_host_active(self) -> bool:
         return self._remote_host is not None
 
+    def vd_test_display_active(self) -> bool:
+        with self._vd_test_lock:
+            return self._vd_test_display is not None
+
+    def vd_test_release_in_progress(self) -> bool:
+        with self._vd_test_lock:
+            return self._vd_test_busy
+
+    def vd_test_create_in_progress(self) -> bool:
+        with self._vd_test_lock:
+            return self._vd_test_creating
+
+    def vd_test_create_display(self) -> tuple[bool, str]:
+        """CGVirtualDisplay(1280×720) 테스트 생성. 호스트 미가동·VD 설정 ON 일 때만.
+
+        Flet ``on_click`` 은 Cocoa 메인에서 돈다. ``create_virtual_display`` 가 메인에서
+        런루프를 돌리며 대기하면 해제 시 예약된 PyObjC 정리와 겹쳐 SIGSEGV 가 날 수 있어,
+        UI에서는 이 메서드를 **백그라운드 스레드**에서 호출한다(``page_remote``).
+
+        CG ``create_virtual_display`` 호출은 ``_vd_test_lock`` 밖에서 한다. 락을 쥔 채
+        WindowServer 가 막히면 UI 쪽 ``run_task`` 가 같은 락에서 대기해 Flet 이
+        Working… 처럼 멈춘다.
+        """
+        if sys.platform != "darwin":
+            _vd_test_log("VD테스트 생성 | 거부: macOS 아님", error=True)
+            return False, "macOS에서만 사용할 수 있습니다."
+        if not self.settings.remote.host.use_virtual_display:
+            _vd_test_log(
+                "VD테스트 생성 | 거부: 가상 디스플레이만 송출 설정 OFF",
+                error=True,
+            )
+            return (
+                False,
+                "「가상 디스플레이만 송출」을 켠 뒤에만 테스트할 수 있습니다.",
+            )
+        if self._remote_host is not None:
+            _vd_test_log(
+                "VD테스트 생성 | 거부: 원격 호스트 동작 중",
+                error=True,
+            )
+            return False, "원격 호스트를 먼저 중지한 뒤 테스트하세요."
+        with self._vd_test_lock:
+            if self._vd_test_busy:
+                _vd_test_log(
+                    "VD테스트 생성 | 거부: _vd_test_busy=True (해제 진행 중)",
+                    error=True,
+                )
+                return (
+                    False,
+                    "VD 테스트 해제가 진행 중입니다. 완료된 뒤에 다시 시도하세요.",
+                )
+            if self._vd_test_display is not None:
+                _vd_test_log(
+                    "VD테스트 생성 | 거부: 이미 테스트 VD 있음 (_vd_test_display 비어 있지 않음)",
+                    error=True,
+                )
+                return False, "이미 테스트 디스플레이가 있습니다. 먼저 해제하세요."
+            if self._vd_test_creating:
+                _vd_test_log(
+                    "VD테스트 생성 | 거부: _vd_test_creating=True (다른 생성 진행 중)",
+                    error=True,
+                )
+                return (
+                    False,
+                    "VD 테스트 생성이 이미 진행 중입니다. 완료될 때까지 기다려 주세요.",
+                )
+            self._vd_test_creating = True
+            self._vd_test_descriptor_serial += 1
+            desc_serial = self._vd_test_descriptor_serial
+
+        _vd_test_log(
+            "VD테스트 생성 | 락 해제 후 create_virtual_display 호출 "
+            f"serial={desc_serial} thr={threading.current_thread().name!s}"
+        )
+        vd: object | None = None
+        did = 0
+        try:
+            from app_platform.darwin_virtual_display import (
+                create_virtual_display,
+            )
+
+            t0 = time.monotonic()
+            try:
+                vd, did = create_virtual_display(
+                    1280,
+                    720,
+                    refresh_hz=60.0,
+                    name=f"Oddments VD Test ({desc_serial})",
+                    descriptor_serial=desc_serial,
+                    descriptor_product_id=desc_serial,
+                )
+            except Exception:
+                _vd_test_log(
+                    "VD테스트 생성 | create_virtual_display 예외 "
+                    f"ms={(time.monotonic() - t0) * 1000.0:.1f}",
+                    error=True,
+                )
+                raise
+            _vd_test_log(
+                "VD테스트 생성 | create_virtual_display 정상 반환 "
+                f"cg_id={did} ms={(time.monotonic() - t0) * 1000.0:.1f}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            with self._vd_test_lock:
+                self._vd_test_creating = False
+            try:
+                log_remote_diag(f"VD테스트 생성 실패: {exc!r}", error=True)
+            except Exception:
+                pass
+            return False, f"생성 실패: {exc}"
+
+        with self._vd_test_lock:
+            self._vd_test_creating = False
+            if self._vd_test_display is not None:
+                _vd_test_log(
+                    "VD테스트 생성 | 경합: 저장 전에 이미 display 있음 → 신규 vd Py 참조 해제",
+                    error=True,
+                )
+                try:
+                    import gc as _gc
+                    vd = None
+                    _gc.collect()
+                except Exception as drop_exc:
+                    _vd_test_log(
+                        f"VD테스트 생성 | 경합 vd 해제 예외 {drop_exc!r}",
+                        error=True,
+                    )
+                return (
+                    False,
+                    "다른 생성이 먼저 반영되었습니다. 필요하면 다시 시도하세요.",
+                )
+            self._vd_test_display = (vd, did)
+            self._vd_test_last_released_cg_id = None
+        try:
+            log_remote_diag(f"VD테스트 생성 | 상태 저장 완료 cg_id={did}")
+        except Exception:
+            pass
+        try:
+            log_remote_event(f"VD 테스트: 생성됨 (CG ID {did})")
+        except Exception:
+            pass
+        return (
+            True,
+            f"가상 디스플레이가 추가되었습니다 (CG ID {did}). "
+            "시스템 설정 → 디스플레이에서 확인하세요.",
+        )
+
+    def vd_test_release_display(
+        self,
+        *,
+        after_busy: Callable[[], None] | None = None,
+    ) -> tuple[bool, str]:
+        """테스트용 CGVirtualDisplay 해제.
+
+        Flet ``on_click`` 은 UI(메인) 스레드의 asyncio 콜백에서 돈다. 이 상태에서
+        ``run_sync_on_main_dispatch_queue`` 를 호출하면 ``NSThread.isMainThread()`` 가
+        참이라 **같은 스택에서 즉시** ``release()`` 가 재진입 실행되어 PyObjC
+        ``object_dealloc`` SIGSEGV 가 난다. 해제 본문은 **짧은 전용 스레드**에서 호출해
+        ``dispatch_sync`` / NSOperation 메인 경로로만 ``release()`` 를 돌린다.
+
+        호출 스레드가 Cocoa 메인인 채 이 함수 안의 ``Thread.join`` 까지 기다리면,
+        메인이 막혀 메인 큐에 예약한 해제 블록이 실행되지 않아 **교착·시간 초과**가 난다.
+        UI에서는 이 메서드 호출 전체를 백그라운드 스레드에서 돌리고 완료 후
+        ``page.run_task`` 로 스낵·컨트롤을 갱신한다(``page_remote`` 의 VD 테스트 해제).
+
+        ``_vd_test_display`` 는 실제 ``release()`` 가 성공한 뒤에만 비운다. 해제 직전에
+        비우면 UI·상태가 OS보다 앞서가거나, CG 온라인 검증 지연만으로 실패로 처리되어
+        재생성이 꼬일 수 있다. ``after_busy`` 는 ``_vd_test_busy`` 가 켜진 직후
+        (내부 워커가 막히기 전) UI에 「해제 중」을 반영하기 위해 선택적으로 호출한다.
+
+        해제 본체는 전용 워커 스레드에서 실행된다. PyObjC 는 ``alloc().initWithDescriptor_()``
+        반환값을 자체적으로 retain 하므로 명시적 ``vd.release()`` 는 retain count 를 2→1 로만
+        줄여 dealloc 이 실행되지 않는다. 대신 Python 참조(``_vd_test_display``, ``box``)를
+        모두 해제한 뒤 ``gc.collect()`` 를 호출해 PyObjC 가 ``[vd release]`` 를 자동으로
+        호출하도록 한다 → retain count 0 → dealloc → WindowServer 등록 해제.
+        """
+        if sys.platform != "darwin":
+            _vd_test_log("VD테스트 해제 | 거부: macOS 아님", error=True)
+            return False, "macOS에서만 사용할 수 있습니다."
+        if self._remote_host is not None:
+            _vd_test_log(
+                "VD테스트 해제 | 거부: 원격 호스트 동작 중",
+                error=True,
+            )
+            return False, "원격 호스트를 먼저 중지한 뒤 테스트 해제하세요."
+        with self._vd_test_lock:
+            if self._vd_test_busy:
+                _vd_test_log(
+                    "VD테스트 해제 | 거부: _vd_test_busy=True",
+                    error=True,
+                )
+                return False, "이전 해제가 진행 중입니다. 잠시 후 다시 시도하세요."
+            t = self._vd_test_display
+            if t is None:
+                _vd_test_log(
+                    "VD테스트 해제 | 거부: _vd_test_display 없음",
+                    error=True,
+                )
+                return False, "해제할 테스트 디스플레이가 없습니다."
+            self._vd_test_busy = True
+
+        if after_busy is not None:
+            try:
+                after_busy()
+            except Exception:
+                pass
+
+        did = int(t[1])
+        box: list[object | None] = [t[0]]
+        del t
+        _vd_test_log(
+            "VD테스트 해제 | 인입(락 밖) "
+            f"cg_id={did} thr={threading.current_thread().name!s}"
+        )
+
+        outcome: list[tuple[bool, bool, str, str] | None] = [None]
+
+        def _worker() -> None:
+            err_note = [""]
+            ran_ok = False
+            verify_note = ""
+            try:
+                try:
+                    log_remote_diag(
+                        "VD테스트 해제 | worker 시작 "
+                        f"cg_id={did} thr={threading.current_thread().name!s}"
+                    )
+                except Exception:
+                    pass
+                import gc
+
+                from app_platform.darwin_virtual_display import (
+                    cg_display_id_still_online,
+                )
+
+                # PyObjC 가 alloc+init 반환값을 retain 하고 있으므로 명시적 vd.release()
+                # 를 호출하면 retain count 가 2→1 이 될 뿐 dealloc 이 실행되지 않는다.
+                # Python 참조를 모두 해제하면 PyObjC 가 자동으로 [vd release] 를 호출해
+                # retain count 가 0 이 되어 dealloc → WindowServer 등록 해제가 실행된다.
+                _vd_test_log("VD테스트 해제 | Py 참조 해제 시작")
+                with self._vd_test_lock:
+                    self._vd_test_display = None
+                box[0] = None
+                gc.collect()
+                ran_ok = True
+                _vd_test_log("VD테스트 해제 | Py 참조 해제 완료 (gc.collect)")
+
+                st = cg_display_id_still_online(did)
+                _vd_test_log(
+                    f"VD테스트 해제 | cg_display_id_still_online 즉시 "
+                    f"cg_id={did} st={st!r}"
+                )
+                if st is True:
+                    poll_n = 0
+                    for _ in range(30):
+                        time.sleep(0.1)
+                        poll_n += 1
+                        s = cg_display_id_still_online(did)
+                        if s is not True:
+                            _vd_test_log(
+                                "VD테스트 해제 | cg_online 폴링 종료 "
+                                f"cg_id={did} iters={poll_n} st={s!r}"
+                            )
+                            break
+                    else:
+                        _vd_test_log(
+                            "VD테스트 해제 | cg_online 폴링 끝까지 온라인 "
+                            f"cg_id={did} iters={poll_n}"
+                        )
+                        verify_note = (
+                            "release 후에도 CG 디스플레이가 온라인입니다. "
+                            "잠시 후에도 남으면 앱을 종료한 뒤 시스템 설정을 확인하세요."
+                        )
+                elif st is not True:
+                    _vd_test_log(
+                        "VD테스트 해제 | cg_online 즉시 오프라인/알수없음 "
+                        f"cg_id={did} st={st!r}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                err_note[0] = str(exc)
+                _vd_test_log(f"VD테스트 해제 | worker try 블록 예외 {exc!r}", error=True)
+
+            success_state = bool(ran_ok and not err_note[0])
+
+            finalize_err = ""
+            finalize_ok = True
+            if ran_ok and success_state:
+                try:
+                    with self._vd_test_lock:
+                        self._vd_test_display = None
+                        self._vd_test_busy = False
+                        self._vd_test_last_released_cg_id = did
+                except Exception as exc:
+                    finalize_ok = False
+                    finalize_err = (
+                        f"상태 정리 실패: {exc!r}. "
+                        "잠시 후 「VD 테스트 해제」를 다시 시도하세요."
+                    )
+                    try:
+                        log_remote_diag(f"VD테스트 해제 | worker finalize 예외 {exc!r}")
+                    except Exception:
+                        pass
+                    try:
+                        with self._vd_test_lock:
+                            self._vd_test_busy = False
+                    except Exception:
+                        pass
+                try:
+                    time.sleep(0.18)
+                except Exception:
+                    pass
+            else:
+                with self._vd_test_lock:
+                    self._vd_test_busy = False
+                _vd_test_log(
+                    f"VD테스트 해제 | finalize 스킵(ran_ok={ran_ok} success_state="
+                    f"{success_state}) err_note={err_note[0]!r}",
+                    error=bool(err_note[0]),
+                )
+
+            ok_user = bool(success_state and finalize_ok)
+            _vd_test_log(
+                "VD테스트 해제 | worker 요약 "
+                f"ok_user={ok_user} ran_ok={ran_ok} success_state={success_state} "
+                f"finalize_ok={finalize_ok} err_exc={err_note[0]!r} "
+                f"finalize_err={finalize_err!r} verify_note={verify_note!r}"
+            )
+            outcome[0] = (
+                ran_ok,
+                ok_user,
+                err_note[0] or finalize_err,
+                verify_note,
+            )
+
+        th = threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="oddments-vd-test-release",
+        )
+        th.start()
+        th.join(timeout=90.0)
+        if th.is_alive():
+            _vd_test_log(
+                "VD테스트 해제 | oddments-vd-test-release 스레드 join 90초 타임아웃",
+                error=True,
+            )
+            return (
+                False,
+                "해제 작업이 시간 초과되었습니다. 잠시 후 다시 시도하세요.",
+            )
+        pack = outcome[0]
+        if pack is None:
+            return False, "내부 오류: 해제 스레드가 결과를 남기지 않았습니다."
+        ran, ok, err_exc, ver_hint = pack
+
+        if not ran:
+            return (
+                False,
+                err_exc or "가상 디스플레이 해제를 완료하지 못했습니다.",
+            )
+
+        if ok:
+            try:
+                log_remote_event("VD 테스트: 해제 완료")
+            except Exception:
+                pass
+            msg = "가상 디스플레이를 해제했습니다."
+            if ver_hint:
+                msg += " 참고: " + ver_hint
+            return True, msg
+        parts = [p for p in (err_exc, ver_hint) if p]
+        return (
+            False,
+            " · ".join(parts)
+            if parts
+            else "release() 실패 또는 알 수 없는 오류입니다.",
+        )
+
     def remote_host_has_start_error(self) -> bool:
         """송출 중이 아니고 마지막 호스트 시작이 실패한 경우(푸터 오류 표시)."""
         return self._remote_host is None and self._remote_host_last_error is not None
@@ -1228,6 +1629,16 @@ class AppState:
             acc_hint = None
         try:
             if _sys.platform == "darwin":
+                if self.vd_test_release_in_progress():
+                    raise RuntimeError(
+                        "VD 테스트 해제가 진행 중입니다. "
+                        "완료된 뒤 원격 설정에서 호스트를 시작하세요."
+                    )
+                if self.vd_test_display_active():
+                    raise RuntimeError(
+                        "VD 테스트 디스플레이가 켜져 있습니다. "
+                        "원격 설정에서 「VD 테스트 해제」를 누른 뒤 호스트를 시작하세요."
+                    )
                 from app_platform.darwin_compat import remote_host_macos_version_ok
 
                 ok_ver, ver_msg = remote_host_macos_version_ok()

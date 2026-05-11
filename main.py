@@ -228,17 +228,37 @@ def _install_error_routing(page: ft.Page) -> None:
     - ``page.on_error`` : Flet 이벤트 핸들러에서 새어나간 예외
     - ``sys.excepthook`` : 동기 코드의 미처리 예외
     - ``threading.excepthook`` : 백그라운드 스레드의 미처리 예외 (Py3.8+)
+    - ``asyncio`` 루프 예외 핸들러 : 코루틴/태스크에서 처리되지 않은 예외
+    - ``sys.unraisablehook`` : ``__del__`` 등에서 터진 예외 (Py3.8+)
 
     모달을 쓰지 않아 화면이 막히지 않고 사이드바 등으로 이동할 수 있다.
     """
 
     def _route(message: str, detail: str | None = None) -> None:
         try:
-            from flet_ui.log_buffers import log_app_event
+            from flet_ui.log_buffers import append_sidecar_error_file, get_log_store, log_app_event
 
+            get_log_store()
             log_app_event("ERROR", message, detail=detail)
         except Exception:
-            pass
+            try:
+                from flet_ui.log_buffers import append_sidecar_error_file
+
+                line = (message or "").strip().replace("\r", " ").replace("\n", " ")
+                if detail:
+                    d0 = str(detail).strip().splitlines()
+                    if d0:
+                        line = f"{line} | {d0[0][:2000]}"
+                append_sidecar_error_file("app", line or "ERROR")
+            except Exception:
+                try:
+                    print(
+                        f"[{APP_NAME}] 로그 기록 실패: {message}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
         head = str(message).strip()
         if len(head) > 240:
             head = head[:237] + "…"
@@ -312,6 +332,86 @@ def _install_error_routing(page: ft.Page) -> None:
                 pass
 
         threading.excepthook = _thread_excepthook  # type: ignore[assignment]
+
+    prev_unraisable = getattr(sys, "unraisablehook", None)
+
+    def _unraisablehook(unraisable: "sys.UnraisableHookArgs") -> None:  # type: ignore[name-defined]
+        try:
+            et = unraisable.exc_type
+            ev = unraisable.exc_value
+            tb = unraisable.exc_traceback
+            if et is not None:
+                tb_text = "".join(traceback.format_exception(et, ev, tb))
+                _route(f"[unraisable] {et.__name__}: {ev}", detail=tb_text)
+            else:
+                _route("[unraisable] (exc_type is None)", detail=repr(unraisable))
+        except Exception:
+            pass
+        if prev_unraisable is not None:
+            try:
+                prev_unraisable(unraisable)
+            except Exception:
+                pass
+
+    try:
+        sys.unraisablehook = _unraisablehook  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    def _schedule_asyncio_exception_handler() -> None:
+        async def _arm() -> None:
+            loop = asyncio.get_running_loop()
+            prev = loop.get_exception_handler()
+
+            def _async_handler(
+                loop_arg: asyncio.AbstractEventLoop, context: dict
+            ) -> None:
+                try:
+                    exc = context.get("exception")
+                    msg = context.get("message", "")
+                    if exc is not None:
+                        tb_text = "".join(
+                            traceback.format_exception(
+                                type(exc), exc, exc.__traceback__
+                            )
+                        )
+                        _route(
+                            f"[asyncio] {type(exc).__name__}: {exc}",
+                            detail=tb_text,
+                        )
+                    else:
+                        bits = [str(msg).strip()] if msg else []
+                        for key in ("future", "task", "handle"):
+                            obj = context.get(key)
+                            if obj is not None:
+                                bits.append(f"{key}={obj!r}")
+                        _route(
+                            "[asyncio] " + (" ".join(bits) if bits else repr(context)),
+                            detail=None,
+                        )
+                except Exception:
+                    pass
+                if prev is not None:
+                    try:
+                        prev(loop_arg, context)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        loop_arg.default_exception_handler(context)
+                    except Exception:
+                        pass
+
+            loop.set_exception_handler(_async_handler)
+
+        try:
+            run_task = getattr(page, "run_task", None)
+            if callable(run_task):
+                run_task(_arm)
+        except Exception:
+            pass
+
+    _schedule_asyncio_exception_handler()
 
 
 DEFAULT_WINDOW_WIDTH = 1280

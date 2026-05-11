@@ -7,7 +7,7 @@ import threading
 import flet as ft
 
 from ..components import LogConsole, outline_button, stream_log_panel
-from ..log_buffers import get_log_store
+from ..log_buffers import get_log_store, reset_app_log
 from ..state import (
     AppState,
     get_ocr_call_total,
@@ -41,6 +41,7 @@ class _LogsHubController:
         self.log_arduino: LogConsole | None = None
         self.log_web: LogConsole | None = None
         self.log_remote: LogConsole | None = None
+        self.log_app: LogConsole | None = None
         self.stats_ocr: ft.Text | None = None
         self.viewer_web: ft.Text | None = None
         self._mounted = False
@@ -48,6 +49,7 @@ class _LogsHubController:
         self._cur_arduino = 0
         self._cur_web = 0
         self._cur_remote = 0
+        self._cur_app = 0
         self._last_ocr_total: int = -1
         self._last_viewers: int = -1
 
@@ -73,6 +75,11 @@ class _LogsHubController:
             self._cur_remote = c
             if snap:
                 self.log_remote.append_many(snap)
+        if self.log_app:
+            snap, c = store.app.attach()
+            self._cur_app = c
+            if snap:
+                self.log_app.append_many(snap)
 
     def start(self, page: ft.Page) -> None:
         self.page = page
@@ -112,6 +119,7 @@ class _LogsHubController:
         lines_a, self._cur_arduino = store.arduino.read_since(self._cur_arduino)
         lines_w, self._cur_web = store.web.read_since(self._cur_web)
         lines_r, self._cur_remote = store.remote.read_since(self._cur_remote)
+        lines_app, self._cur_app = store.app.read_since(self._cur_app)
 
         total = get_ocr_call_total()
         ocr_stat_chg = total != self._last_ocr_total
@@ -123,6 +131,7 @@ class _LogsHubController:
             or lines_a
             or lines_w
             or lines_r
+            or lines_app
             or ocr_stat_chg
             or vw_chg
         ):
@@ -131,7 +140,7 @@ class _LogsHubController:
         self._last_ocr_total = total
         self._last_viewers = viewers
 
-        lo, la, lw, lr = lines_o, lines_a, lines_w, lines_r
+        lo, la, lw, lr, lapp = lines_o, lines_a, lines_w, lines_r, lines_app
         stats_val = f"OCR API 완료 호출: {total}회"
 
         async def _apply(
@@ -139,6 +148,7 @@ class _LogsHubController:
             _la=la,
             _lw=lw,
             _lr=lr,
+            _lapp=lapp,
             _stats=stats_val,
             _vw=viewers,
             _vw_ch=vw_chg,
@@ -157,6 +167,9 @@ class _LogsHubController:
                 if _lr and self.log_remote:
                     self.log_remote.append_many(_lr)
                     self.log_remote.flush(page)
+                if _lapp and self.log_app:
+                    self.log_app.append_many(_lapp)
+                    self.log_app.flush(page)
                 if _ocr_sc and self.stats_ocr:
                     self.stats_ocr.value = _stats
                     try:
@@ -352,10 +365,43 @@ def build_logs(state: AppState) -> ft.Control:
 
     btn_rem_clear.on_click = _clear_remote
 
+    autoscroll_app = ft.Checkbox(
+        label="맨 아래 자동 스크롤",
+        value=True,
+        active_color=T.PRIMARY,
+        label_style=label_md(),
+    )
+    btn_app_clear = outline_button("초기화", on_click=lambda _e: None)
+
+    log_app, card_app = stream_log_panel(
+        title="앱 / 전역",
+        icon=ft.Icons.BUG_REPORT_OUTLINED,
+        placeholder=(
+            "전역 예외·asyncio 경고·세그폴트 직전 스택은 "
+            "logs/app_error-*.log · logs/python-faulthandler-*.log 에도 남습니다."
+        ),
+        actions=[autoscroll_app, btn_app_clear],
+    )
+
+    autoscroll_app.on_change = lambda _e: log_app.set_autoscroll(
+        autoscroll_app.value or False
+    )
+
+    def _clear_app(_e: ft.ControlEvent) -> None:
+        reset_app_log()
+        st = get_log_store()
+        ctrl._cur_app = st.app.clear()
+        log_app.clear()
+        if log_app.page is not None:
+            log_app.update()
+
+    btn_app_clear.on_click = _clear_app
+
     ctrl.log_ocr = log_ocr
     ctrl.log_arduino = log_arduino
     ctrl.log_web = log_web
     ctrl.log_remote = log_remote
+    ctrl.log_app = log_app
     ctrl.stats_ocr = stats_ocr
     ctrl.viewer_web = viewer_web
     ctrl.prefill_all()
@@ -396,8 +442,17 @@ def build_logs(state: AppState) -> ft.Control:
             controls=[card_remote],
         ),
     )
+    tab_app = ft.Container(
+        expand=True,
+        padding=ft.padding.only(top=T.SPACE_SM),
+        content=ft.Column(
+            scroll=ft.ScrollMode.AUTO,
+            spacing=T.SPACE_MD,
+            controls=[card_app],
+        ),
+    )
 
-    _tab_count = 4
+    _tab_count = 5
     _sel = max(0, min(_tab_count - 1, _LOG_PAGE_SELECTED_TAB_INDEX))
 
     def _on_tabs_change(e: ft.ControlEvent) -> None:
@@ -431,11 +486,15 @@ def build_logs(state: AppState) -> ft.Control:
                             label="Remote",
                             icon=ft.Icons.SCREEN_SHARE_OUTLINED,
                         ),
+                        ft.Tab(
+                            label="앱",
+                            icon=ft.Icons.BUG_REPORT_OUTLINED,
+                        ),
                     ],
                 ),
                 ft.TabBarView(
                     expand=True,
-                    controls=[tab_ocr, tab_arduino, tab_web, tab_remote],
+                    controls=[tab_ocr, tab_arduino, tab_web, tab_remote, tab_app],
                 ),
             ],
         ),
@@ -447,7 +506,7 @@ def build_logs(state: AppState) -> ft.Control:
         controls=[
             ft.Text("Log", style=headline_sm(), color=T.ON_SURFACE),
             ft.Text(
-                "OCR·아두이노·웹 송출·원격 제어 로그를 한 화면에서 확인합니다.",
+                "OCR·아두이노·웹 송출·원격·앱(전역 예외) 로그를 한 화면에서 확인합니다.",
                 style=label_lg(),
                 color=T.ON_SURFACE_VARIANT,
             ),

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
+import threading
+import traceback
 from pathlib import Path
 from typing import Callable
 
@@ -266,15 +269,334 @@ def build_remote_settings(state: AppState) -> ft.Control:
         on_change=lambda e: _persist_host_auth(state, e.control.value),
     )
 
+    vd_test_refresh_hooks: list[Callable[[], None]] = []
     mac_controls: list[ft.Control] = []
     if sys.platform == "darwin":
+        vd_test_status = ft.Text(
+            "",
+            style=body_md(),
+            color=T.ON_SURFACE_VARIANT,
+        )
+        vd_test_create_btn = ft.OutlinedButton(
+            text="VD 테스트 생성",
+            icon=ft.Icons.ADD_TO_QUEUE_ROUNDED,
+            style=button_style_click_cursor(
+                ft.ButtonStyle(
+                    color=T.ON_SURFACE,
+                    side=ft.BorderSide(1, T.OUTLINE),
+                    padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                )
+            ),
+        )
+        vd_test_release_btn = ft.OutlinedButton(
+            text="VD 테스트 해제",
+            icon=ft.Icons.REMOVE_FROM_QUEUE_ROUNDED,
+            style=button_style_click_cursor(
+                ft.ButtonStyle(
+                    color=T.ON_SURFACE,
+                    side=ft.BorderSide(1, T.OUTLINE),
+                    padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                )
+            ),
+        )
+
+        def _vd_ui_diag(where: str, exc: BaseException | None = None) -> None:
+            """VD 테스트 버튼·async 흐름 예외를 ``remote`` 로그에 남겨 디버깅한다."""
+            try:
+                from streaming.remote_log import log_remote_diag
+
+                if exc is None:
+                    log_remote_diag(f"VD테스트 UI | {where}")
+                    return
+                log_remote_diag(
+                    f"VD테스트 UI | {where} | {type(exc).__name__}: {exc!r} | "
+                    f"{traceback.format_exc()}",
+                    error=True,
+                )
+            except Exception:
+                pass
+
+        async def _vd_await_thread(
+            target: Callable[[], tuple[bool, str]],
+            *,
+            name: str,
+        ) -> tuple[bool, str]:
+            """CG/PyObjC 블로킹은 ``asyncio.to_thread``(기본 풀 ``asyncio_N``)보다
+            전용 ``threading.Thread`` 가 재생성 시 덜 꼬인다(``initWithDescriptor`` 정지 완화).
+            """
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+
+            def _runner() -> None:
+                try:
+                    r = target()
+                except Exception as exc:
+                    loop.call_soon_threadsafe(fut.set_exception, exc)
+                else:
+                    loop.call_soon_threadsafe(fut.set_result, r)
+
+            threading.Thread(target=_runner, daemon=True, name=name).start()
+            return await fut
+
+        def _sync_vd_test_controls() -> None:
+            host_on = state.remote_host_active()
+            test_on = state.vd_test_display_active()
+            releasing = state.vd_test_release_in_progress()
+            creating = state.vd_test_create_in_progress()
+            vd_opt = bool(hp.use_virtual_display)
+            vd_test_create_btn.disabled = (
+                host_on or test_on or not vd_opt or releasing or creating
+            )
+            vd_test_release_btn.disabled = (
+                host_on or not test_on or not vd_opt or releasing
+            )
+            if releasing:
+                vd_test_status.value = (
+                    "VD 테스트: 해제 중… (잠시만 기다리세요. 완료 후 버튼이 갱신됩니다)"
+                )
+            elif creating:
+                vd_test_status.value = (
+                    "VD 테스트: 생성 중… (시스템이 준비될 때까지 걸릴 수 있습니다)"
+                )
+            elif test_on:
+                vd_test_status.value = (
+                    "VD 테스트: 켜짐 (1280×720) — 시스템 설정 → 디스플레이에서 확인"
+                )
+            elif host_on:
+                vd_test_status.value = (
+                    "VD 테스트: 원격 호스트 실행 중에는 사용할 수 없습니다."
+                )
+            elif not vd_opt:
+                vd_test_status.value = (
+                    "VD 테스트: 위 스위치를 켠 뒤에만 사용할 수 있습니다."
+                )
+            else:
+                vd_test_status.value = (
+                    "VD 테스트: 없음 — 호스트를 끈 상태에서 생성/해제로 "
+                    "CGVirtualDisplay 경로를 점검합니다."
+                )
+            try:
+                vd_test_status.update()
+            except Exception:
+                pass
+            try:
+                vd_test_create_btn.update()
+                vd_test_release_btn.update()
+            except Exception:
+                pass
+
+        def _on_vd_test_create(_e: ft.ControlEvent) -> None:
+            # 블로킹은 메인 코루틴 밖으로: ``asyncio.to_thread`` 대신 전용 스레드(위
+            # ``_vd_await_thread``) — 기본 스레드 풀에서 CG 재생성이 멈추는 경우가 있다.
+            # UI 갱신·스낵만 메인 ``run_task`` 코루틴 안에서 한다.
+            pg = getattr(state, "page", None)
+            rt = getattr(pg, "run_task", None) if pg is not None else None
+
+            async def _vd_create_flow() -> None:
+                ok, msg = False, "내부 오류"
+                try:
+                    if pg is None:
+                        return
+                    await asyncio.sleep(0)
+                    try:
+                        _sync_vd_test_controls()
+                    except Exception as exc:
+                        _vd_ui_diag("생성 직전 _sync_vd_test_controls", exc)
+                    ok, msg = await _vd_await_thread(
+                        state.vd_test_create_display,
+                        name="oddments-vd-test-create-ui",
+                    )
+                except Exception as exc:
+                    _vd_ui_diag("생성 async 흐름(전용 스레드 대기 포함)", exc)
+                    ok, msg = False, f"VD 테스트 생성 중 오류: {exc}"
+                try:
+                    if pg is not None:
+                        show_snack(
+                            pg,
+                            msg,
+                            severity="warning" if not ok else "info",
+                        )
+                except Exception as exc:
+                    _vd_ui_diag("생성 show_snack", exc)
+                try:
+                    _sync_vd_test_controls()
+                except Exception as exc:
+                    _vd_ui_diag("생성 완료 후 _sync_vd_test_controls", exc)
+
+            if callable(rt):
+                try:
+                    rt(_vd_create_flow)
+                except Exception as exc:
+                    _vd_ui_diag("생성 page.run_task 스케줄", exc)
+                return
+
+            def _work_fallback() -> None:
+                ok, msg = False, "내부 오류"
+                try:
+                    ok, msg = state.vd_test_create_display()
+                except Exception as exc:
+                    _vd_ui_diag("생성 스레드 폴백 vd_test_create_display", exc)
+                    ok, msg = False, f"VD 테스트 생성 중 오류: {exc}"
+                if pg is not None:
+                    try:
+                        show_snack(
+                            pg,
+                            msg,
+                            severity="warning" if not ok else "info",
+                        )
+                    except Exception as exc:
+                        _vd_ui_diag("생성 폴백 show_snack", exc)
+                try:
+                    _sync_vd_test_controls()
+                except Exception as exc:
+                    _vd_ui_diag("생성 폴백 _sync_vd_test_controls", exc)
+
+            threading.Thread(
+                target=_work_fallback,
+                daemon=True,
+                name="oddments-vd-test-create-ui",
+            ).start()
+
+        def _on_vd_test_release(_e: ft.ControlEvent) -> None:
+            # ``vd_test_release_display`` 는 내부에서 join 한다. ``asyncio.to_thread`` 풀보다
+            # 전용 스레드로 돌리고, ``after_busy`` 는 ``call_soon_threadsafe`` 로만 메인에 넘긴다.
+            pg = getattr(state, "page", None)
+            rt = getattr(pg, "run_task", None) if pg is not None else None
+
+            async def _vd_release_flow() -> None:
+                ok, msg = False, "내부 오류"
+                if pg is None:
+                    return
+                if not callable(rt):
+                    try:
+                        ok, msg = state.vd_test_release_display()
+                    except Exception as exc:
+                        _vd_ui_diag("해제 run_task 없음 vd_test_release_display", exc)
+                        ok, msg = False, f"VD 테스트 해제 중 오류: {exc}"
+                    try:
+                        if pg is not None:
+                            show_snack(
+                                pg,
+                                msg,
+                                severity="warning" if not ok else "info",
+                            )
+                    except Exception as exc:
+                        _vd_ui_diag("해제(run_task없음) show_snack", exc)
+                    try:
+                        _sync_vd_test_controls()
+                    except Exception as exc:
+                        _vd_ui_diag("해제(run_task없음) _sync_vd_test_controls", exc)
+                    return
+
+                loop = asyncio.get_running_loop()
+                try:
+                    await asyncio.sleep(0)
+                except Exception as exc:
+                    _vd_ui_diag("해제 async sleep(0)", exc)
+
+                def after_busy() -> None:
+                    def on_main() -> None:
+                        async def _sync_only() -> None:
+                            try:
+                                _sync_vd_test_controls()
+                            except Exception as exc:
+                                _vd_ui_diag("해제 after_busy 코루틴 _sync", exc)
+
+                        try:
+                            rt(_sync_only)
+                        except Exception as exc:
+                            _vd_ui_diag("해제 after_busy page.run_task", exc)
+
+                    try:
+                        loop.call_soon_threadsafe(on_main)
+                    except Exception as exc_outer:
+                        _vd_ui_diag("해제 call_soon_threadsafe", exc_outer)
+                        try:
+                            on_main()
+                        except Exception as exc_inner:
+                            _vd_ui_diag("해제 after_busy on_main 폴백", exc_inner)
+
+                try:
+                    ok, msg = await _vd_await_thread(
+                        lambda: state.vd_test_release_display(
+                            after_busy=after_busy
+                        ),
+                        name="oddments-vd-test-release-ui",
+                    )
+                except Exception as exc:
+                    _vd_ui_diag("해제 async 흐름 전용 스레드 대기", exc)
+                    ok, msg = False, f"VD 테스트 해제 중 오류: {exc}"
+                try:
+                    if pg is not None:
+                        show_snack(
+                            pg,
+                            msg,
+                            severity="warning" if not ok else "info",
+                        )
+                except Exception as exc:
+                    _vd_ui_diag("해제 show_snack", exc)
+                try:
+                    _sync_vd_test_controls()
+                except Exception as exc:
+                    _vd_ui_diag("해제 완료 후 _sync_vd_test_controls", exc)
+
+            if callable(rt):
+                try:
+                    rt(_vd_release_flow)
+                except Exception as exc:
+                    _vd_ui_diag("해제 page.run_task 스케줄", exc)
+                return
+
+            def _work_fallback() -> None:
+                def after_fb() -> None:
+                    try:
+                        _sync_vd_test_controls()
+                    except Exception as exc:
+                        _vd_ui_diag("해제 폴백 after_busy _sync", exc)
+
+                ok, msg = False, "내부 오류"
+                try:
+                    ok, msg = state.vd_test_release_display(after_busy=after_fb)
+                except Exception as exc:
+                    _vd_ui_diag("해제 스레드 폴백 vd_test_release_display", exc)
+                    ok, msg = False, f"VD 테스트 해제 중 오류: {exc}"
+                if pg is not None:
+                    try:
+                        show_snack(
+                            pg,
+                            msg,
+                            severity="warning" if not ok else "info",
+                        )
+                    except Exception as exc:
+                        _vd_ui_diag("해제 폴백 show_snack", exc)
+                try:
+                    _sync_vd_test_controls()
+                except Exception as exc:
+                    _vd_ui_diag("해제 폴백 _sync_vd_test_controls", exc)
+
+            threading.Thread(
+                target=_work_fallback,
+                daemon=True,
+                name="oddments-vd-test-release-ui",
+            ).start()
+
+        vd_test_create_btn.on_click = _on_vd_test_create
+        vd_test_release_btn.on_click = _on_vd_test_release
+
         vd_switch = ft.Switch(
             label="가상 디스플레이만 송출 (물리 모니터 미송출)",
             value=bool(hp.use_virtual_display),
-            on_change=lambda e: _persist_use_virtual_display(
-                state, bool(getattr(e.control, "value", False))
+            on_change=lambda e: (
+                _persist_use_virtual_display(
+                    state, bool(getattr(e.control, "value", False))
+                ),
+                _sync_vd_test_controls(),
             ),
         )
+
+        vd_test_refresh_hooks.append(_sync_vd_test_controls)
+        _sync_vd_test_controls()
+
         audio_vd_field = text_field(
             label="원격 오디오 입력 장치 (이름 일부)",
             value=hp.darwin_audio_input,
@@ -282,7 +604,24 @@ def build_remote_settings(state: AppState) -> ft.Control:
             expand=True,
             on_change=lambda e: _persist_darwin_audio_input(state, e.control.value),
         )
-        mac_controls = [vd_switch, audio_vd_field]
+        mac_controls = [
+            vd_switch,
+            ft.Text(
+                "1280×720 테스트용. 호스트가 꺼진 상태에서만 사용하세요.",
+                style=label_md(),
+                color=T.ON_SURFACE_VARIANT,
+            ),
+            ft.Row(
+                spacing=T.SPACE_MD,
+                wrap=False,
+                controls=[
+                    vd_test_create_btn,
+                    vd_test_release_btn,
+                ],
+            ),
+            vd_test_status,
+            audio_vd_field,
+        ]
 
     host_status = ft.Text(
         "호스트 실행 중" if state.remote_host_active() else "호스트 중지됨",
@@ -320,6 +659,11 @@ def build_remote_settings(state: AppState) -> ft.Control:
         host_start_btn.disabled = running
         host_stop_btn.disabled = not running
         host_status.value = "호스트 실행 중 (WebRTC)" if running else "호스트 중지됨"
+        for fn in vd_test_refresh_hooks:
+            try:
+                fn()
+            except Exception:
+                pass
 
     def _on_host_start(_e: ft.ControlEvent) -> None:
         ok, err, acc_hint = state.start_remote_host()

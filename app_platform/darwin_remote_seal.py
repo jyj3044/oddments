@@ -48,13 +48,26 @@ def _window_level() -> int:
 
 
 def _schedule_on_main(fn: Callable[[], None]) -> None:
-    """메인 CFRunLoop 에서 실행. 실패 시 NSOperationQueue 로 폴백."""
+    """메인 스레드에서 실행.
+
+    1) libdispatch 메인 큐 — Flet/Flutter 등에서 CFRunLoop 블록이 도지 않을 때 유효.
+    2) 메인 CFRunLoop ``CFRunLoopPerformBlock`` + WakeUp
+    3) ``NSOperationQueue.mainQueue`` 폴백
+    """
 
     def _wrapped() -> None:
         try:
             fn()
         except Exception:
             _log.exception("darwin_remote_seal: 메인 블록 실패")
+
+    try:
+        from app_platform.darwin_dispatch_main import schedule_on_main_dispatch_queue
+
+        if schedule_on_main_dispatch_queue(_wrapped):
+            return
+    except Exception:
+        pass
 
     try:
         from CoreFoundation import (  # type: ignore[import-untyped]

@@ -15,6 +15,8 @@ pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'
 # 맥 Retina: NSScreen.backingScaleFactor (원격 마우스 좌표 보정)
 pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'
 pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'
+# CGVirtualDisplay descriptor 큐·해제(dispatch_sync) — OS 에 VD 잔류 완화
+pyobjc-framework-libdispatch>=10.0; sys_platform == 'darwin'
 pyserial>=3.5
 pynput>=1.7.6
 aiohttp>=3.10.0
