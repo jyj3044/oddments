@@ -1456,12 +1456,64 @@ def remote_viewer_main(page: ft.Page) -> None:
                 stop_win_keyboard_sink,
             )
 
+            def _send_char_from_hook(ch: str) -> None:
+                """Windows WM_CHAR/WM_UNICHAR 훅 — IME 가 합성한 유니코드 문자(한글 등)를
+                호스트로 전송. 호스트는 ``CGEventKeyboardSetUnicodeString`` 으로 입력."""
+                try:
+                    log_remote_event(
+                        f"클라이언트: WM_CHAR ch={ch!r} cps={[hex(ord(c)) for c in ch]} "
+                        f"capture={viewer_kb_capture[0]}"
+                    )
+                except Exception:
+                    pass
+                if not ch or not viewer_kb_capture[0]:
+                    return
+                _send_json({"t": "char", "c": ch})
+
             start_win_keyboard_sink(
                 window_title=str(page.title),
                 should_suppress=lambda: viewer_kb_capture[0],
                 send_key=_send_mod_from_hook,
+                send_char=_send_char_from_hook,
             )
             win_kbd_sink_stop = stop_win_keyboard_sink
+
+            async def _kbd_sink_diag_loop() -> None:
+                import streaming.win_keyboard_sink as _wks
+
+                last_dump = (0, 0, 0, 0)
+                while True:
+                    await asyncio.sleep(3.0)
+                    try:
+                        snap = _wks.get_diag_snapshot()
+                        cur = (
+                            snap["char"],
+                            snap["unichar"],
+                            snap["ime"],
+                            snap["syschar"],
+                        )
+                        if cur != last_dump:
+                            log_remote_event(
+                                f"클라이언트: kbd-sink snapshot "
+                                f"ll_hook={snap['ll_hook']} "
+                                f"msg_hook={snap['msg_hook']} "
+                                f"tid={snap['msg_thread_id']} "
+                                f"WM_CHAR={snap['char']} "
+                                f"WM_UNICHAR={snap['unichar']} "
+                                f"WM_IME_CHAR={snap['ime']} "
+                                f"WM_SYSCHAR={snap['syschar']} "
+                                f"last_wp={hex(snap['last_wp'])}"
+                            )
+                            last_dump = cur
+                    except Exception:
+                        pass
+
+            try:
+                rd = getattr(page, "run_task", None)
+                if callable(rd):
+                    rd(_kbd_sink_diag_loop)
+            except Exception:
+                pass
         except Exception:
             win_kbd_sink_stop = None
 

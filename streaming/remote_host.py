@@ -52,6 +52,111 @@ _move_dedup_lock = threading.Lock()
 _last_move_pixel: list[tuple[int, int] | None] = [None]
 _inject_failure_logged = False
 
+# macOS 봉인 worker 가 CGEventTap 으로 사용자 하드웨어 키와 우리 합성 키를
+# 구별하기 위한 magic 값. 호스트가 합성하는 이벤트의 kCGEventSourceUserData
+# 필드에 이 값을 마킹하면, 봉인 worker tap 은 user_data == ODDM 인 이벤트는
+# 통과시키고 나머지(=사용자 키)는 차단할 수 있다.
+DARWIN_SYNTHETIC_USER_DATA: int = 0x4F44444D  # 'ODDM' (4 bytes ASCII)
+
+# macOS virtual keycodes (HIToolbox/Events.h) — 특수 토큰만 매핑한다.
+# 일반 ASCII/유니코드 문자는 vk=0 + CGEventKeyboardSetUnicodeString 으로 입력.
+_DARWIN_TOKEN_VK: dict[str, int] = {
+    "enter": 36, "return": 36,
+    "tab": 48,
+    "space": 49,
+    "delete": 51, "backspace": 51,
+    "escape": 53, "esc": 53,
+    "shift": 56, "shift_l": 56, "shift_r": 60,
+    "cmd": 55, "cmd_r": 54, "meta": 55, "meta_l": 55, "meta_r": 54,
+    "win": 55, "win_l": 55, "win_r": 54,
+    "alt": 58, "alt_l": 58, "alt_r": 61, "option": 58,
+    "ctrl": 59, "ctrl_l": 59, "ctrl_r": 62,
+    "caps_lock": 57,
+    "up": 126, "down": 125, "left": 123, "right": 124,
+    "home": 115, "end": 119, "page_up": 116, "page_down": 121,
+    "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+    "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+}
+
+
+def _darwin_post_event(ev: object) -> None:
+    """합성 이벤트에 magic user_data 마킹 후 HID tap 위치로 post.
+
+    Source 는 None (시스템 기본 결합 session state) 으로 만들어야 macOS 의 시스템
+    단축키 디스패처(예: ⌃Space 한영 토글)와 IME 가 이를 정상 합성 키로 인식한다.
+    Private source state 로 만들면 단축키·IME 단계에서 무시될 수 있다.
+    """
+    import Quartz  # type: ignore[import-untyped]
+
+    try:
+        Quartz.CGEventSetIntegerValueField(
+            ev,
+            Quartz.kCGEventSourceUserData,
+            DARWIN_SYNTHETIC_USER_DATA,
+        )
+    except Exception:
+        pass
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
+
+def _darwin_press_token(token: str, down: bool) -> bool:
+    """macOS 자체 키 합성. token == 특수 키이면 vk 매핑, 그 외 문자열은 unicode 로.
+
+    우리가 만든 모든 이벤트는 ``kCGEventSourceUserData = DARWIN_SYNTHETIC_USER_DATA``
+    로 마킹된다 → 봉인 worker tap 에서 통과 식별 가능.
+    Returns: 성공 시 True.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import Quartz  # type: ignore[import-untyped]
+    except Exception:
+        return False
+    low = token.lower()
+    vk = _DARWIN_TOKEN_VK.get(low)
+    try:
+        if vk is not None:
+            ev = Quartz.CGEventCreateKeyboardEvent(None, vk, bool(down))
+            if ev is None:
+                return False
+            _darwin_post_event(ev)
+            return True
+        if not token:
+            return False
+        ev = Quartz.CGEventCreateKeyboardEvent(None, 0, bool(down))
+        if ev is None:
+            return False
+        Quartz.CGEventKeyboardSetUnicodeString(ev, len(token), token)
+        _darwin_post_event(ev)
+        return True
+    except Exception as exc:
+        _log_inject_failure_once(exc)
+        return False
+
+
+def _darwin_type_unicode(text: str) -> bool:
+    """``text`` 의 각 코드포인트를 unicode 키 down+up 으로 주입한다."""
+    if sys.platform != "darwin" or not text:
+        return False
+    try:
+        import Quartz  # type: ignore[import-untyped]
+    except Exception:
+        return False
+    try:
+        for ch in text:
+            ev_d = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
+            if ev_d is not None:
+                Quartz.CGEventKeyboardSetUnicodeString(ev_d, len(ch), ch)
+                _darwin_post_event(ev_d)
+            ev_u = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
+            if ev_u is not None:
+                Quartz.CGEventKeyboardSetUnicodeString(ev_u, len(ch), ch)
+                _darwin_post_event(ev_u)
+        return True
+    except Exception as exc:
+        _log_inject_failure_once(exc)
+        return False
+
 
 def _pynput_mouse_keyboard() -> tuple[object, object]:
     global _mouse_controller, _kbd_controller
@@ -350,6 +455,12 @@ def _inject_input_message(
 
     def _press_key(token: str, down: bool) -> None:
         tok = str(token)
+        # macOS: 자체 합성으로 분기 (user_data 마킹 — 봉인 worker 키 차단과 통합).
+        if sys.platform == "darwin":
+            if _darwin_press_token(tok, bool(down)):
+                return
+            # 자체 합성 실패 시 pynput 폴백 — 합성 식별이 안 되어 호스트 키와
+            # 함께 차단될 수 있으나 입력 자체는 동작한다.
         key_obj: object | None = None
         if len(tok) == 1:
             key_obj = tok
@@ -431,7 +542,6 @@ def _inject_input_message(
             down = bool(msg.get("down", True))
         except Exception:
             down = True
-        # 진단: 한글 등 비-ASCII 키 수신 추적용.
         try:
             cps = [hex(ord(c)) for c in k]
             log_remote_event(
@@ -440,6 +550,25 @@ def _inject_input_message(
         except Exception:
             pass
         _press_key(k, down)
+        return
+
+    if t == "char":
+        c = str(msg.get("c", ""))
+        try:
+            cps = [hex(ord(ch)) for ch in c]
+            log_remote_event(f"호스트: 문자 수신 c={c!r} cps={cps}")
+        except Exception:
+            pass
+        if not c:
+            return
+        if sys.platform == "darwin":
+            _darwin_type_unicode(c)
+        else:
+            try:
+                kbd.type(c)
+            except Exception as exc:
+                _log_inject_failure_once(exc)
+        return
 
 
 def _clipboard_read_text() -> str:
@@ -567,6 +696,9 @@ class RemoteHostServer:
         # 봉인 동안 물리 화면에 등장한 일반 앱 창을 VD 로 끌어오는 polling 스레드.
         self._corral_thread: threading.Thread | None = None
         self._corral_stop_event: threading.Event | None = None
+        # 봉인 동안 호스트 사용자의 하드웨어 키만 차단하는 CGEventTap 스레드.
+        self._keyblock_thread: threading.Thread | None = None
+        self._keyblock_state: dict | None = None
         # 가상 디스플레이 PyObjC 객체는 워커·호스트 루프에서 동시에 건드리면 이중 release 로 SIGSEGV 가 난다.
         self._vd_session_lock = threading.Lock()
         # vd 해제 시 워커 스택/클로저가 PyObjC 래퍼를 붙잡으면 GC 가 idle 워커에서 object_dealloc 하며 SIGSEGV 난다.
@@ -669,11 +801,147 @@ class RemoteHostServer:
             # 봉인 후 창 코랄(corral) 스레드 시작: 0.3s 간격 polling 으로
             # 물리 화면에 등장한 일반 앱 창을 VD 로 이동시킨다.
             self._start_window_corral_thread(vid)
+            # 호스트 사용자의 하드웨어 키 입력을 차단한다 (마우스/트랙패드는 통과).
+            self._start_key_block_thread()
 
         try:
             loop.call_later(0.48, _fire)
         except Exception:
             _fire()
+
+    def _start_key_block_thread(self) -> None:
+        """봉인 동안 호스트 하드웨어 키만 차단하는 CGEventTap 스레드.
+
+        합성 이벤트는 ``kCGEventSourceUserData == DARWIN_SYNTHETIC_USER_DATA``
+        로 마킹되어 통과. 마우스/트랙패드 이벤트는 mask 에 포함하지 않아 통과.
+        호스트 메인 프로세스가 접근성 권한을 가지므로 worker 가 아닌 여기서
+        설치한다. 별도 스레드의 CFRunLoop 에서 callback 이 동작한다.
+        """
+        if sys.platform != "darwin":
+            return
+        if getattr(self, "_keyblock_thread", None) is not None:
+            return
+        ready_ev = threading.Event()
+        state: dict = {"tap": None, "src": None, "runloop": None, "ok": False}
+
+        def _run() -> None:
+            try:
+                import Quartz  # type: ignore[import-untyped]
+                from CoreFoundation import (  # type: ignore[import-untyped]
+                    CFMachPortCreateRunLoopSource,
+                    CFRunLoopAddSource,
+                    CFRunLoopGetCurrent,
+                    CFRunLoopRun,
+                    kCFRunLoopCommonModes,
+                )
+
+                def _cb(_proxy, type_, event, _refcon):  # noqa: ANN001
+                    try:
+                        # tap 자체가 사용자 입력으로 인해 비활성화될 수 있음 → 재활성.
+                        if int(type_) == int(
+                            Quartz.kCGEventTapDisabledByTimeout
+                        ) or int(type_) == int(
+                            Quartz.kCGEventTapDisabledByUserInput
+                        ):
+                            try:
+                                if state["tap"] is not None:
+                                    Quartz.CGEventTapEnable(state["tap"], True)
+                            except Exception:
+                                pass
+                            return event
+                        ud = Quartz.CGEventGetIntegerValueField(
+                            event, Quartz.kCGEventSourceUserData
+                        )
+                        if int(ud) == DARWIN_SYNTHETIC_USER_DATA:
+                            return event
+                        return None  # 호스트 사용자의 키 차단
+                    except Exception:
+                        return event
+
+                mask = (
+                    (1 << Quartz.kCGEventKeyDown)
+                    | (1 << Quartz.kCGEventKeyUp)
+                    | (1 << Quartz.kCGEventFlagsChanged)
+                )
+                tap = Quartz.CGEventTapCreate(
+                    Quartz.kCGHIDEventTap,
+                    Quartz.kCGHeadInsertEventTap,
+                    Quartz.kCGEventTapOptionDefault,
+                    mask,
+                    _cb,
+                    None,
+                )
+                if tap is None:
+                    try:
+                        log_remote_event(
+                            "호스트: 키 차단 tap 생성 실패 (접근성 권한 필요)",
+                            error=True,
+                        )
+                    except Exception:
+                        pass
+                    return
+                src = CFMachPortCreateRunLoopSource(None, tap, 0)
+                rl = CFRunLoopGetCurrent()
+                CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes)
+                Quartz.CGEventTapEnable(tap, True)
+                state["tap"] = tap
+                state["src"] = src
+                state["runloop"] = rl
+                state["ok"] = True
+                try:
+                    log_remote_event("호스트: 키 차단 tap 설치됨 (하드웨어 키만 차단)")
+                except Exception:
+                    pass
+                ready_ev.set()
+                # 봉인 해제 시 _stop_key_block_thread 가 CFRunLoopStop 으로 종료.
+                CFRunLoopRun()
+            except Exception as exc:
+                try:
+                    log_remote_event(
+                        f"호스트: 키 차단 tap 스레드 예외 — {type(exc).__name__}: {exc}",
+                        error=True,
+                    )
+                except Exception:
+                    pass
+            finally:
+                ready_ev.set()
+
+        t = threading.Thread(target=_run, name="vd-keyblock", daemon=True)
+        self._keyblock_thread = t
+        self._keyblock_state = state
+        t.start()
+        ready_ev.wait(timeout=2.0)
+
+    def _stop_key_block_thread(self) -> None:
+        st = getattr(self, "_keyblock_state", None)
+        if st is None:
+            return
+        try:
+            import Quartz  # type: ignore[import-untyped]
+            from CoreFoundation import CFRunLoopStop  # type: ignore[import-untyped]
+
+            tap = st.get("tap")
+            if tap is not None:
+                try:
+                    Quartz.CGEventTapEnable(tap, False)
+                except Exception:
+                    pass
+            rl = st.get("runloop")
+            if rl is not None:
+                try:
+                    CFRunLoopStop(rl)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        t = getattr(self, "_keyblock_thread", None)
+        if t is not None:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+        self._keyblock_thread = None
+        self._keyblock_state = None
 
     def _start_window_corral_thread(self, vid: int) -> None:
         """원격 세션 동안 0.3s 간격으로 물리 화면에 등장한 창을 VD 로 이동시킨다.
@@ -737,6 +1005,7 @@ class RemoteHostServer:
         if sys.platform != "darwin":
             return
         self._stop_window_corral_thread()
+        self._stop_key_block_thread()
         try:
             log_remote_diag("호스트: 물리 화면 봉인 해제 — schedule_seal_hide 예약")
         except Exception:

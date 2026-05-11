@@ -125,6 +125,14 @@ def _make_seal_window(frame: object, level: int) -> None:
     win.setIgnoresMouseEvents_(False)
     win.setCanHide_(False)
     win.setHidesOnDeactivate_(False)
+    # 키 포커스를 잡지 않는다 — 봉인 worker 가 keyWindow 가 되면 시스템 단축키
+    # (⌃Space 한영 토글 등) 가 봉인 worker 에 디스패치되어 VD 안의 앱에 도달하지
+    # 못한다. 또한 IME 가 봉인 worker 에 한글 조합을 시도하여
+    # 'IMKCFRunLoopWakeUpReliable' 에러를 유발한다.
+    try:
+        win.setAcceptsMouseMovedEvents_(False)
+    except Exception:
+        pass
     try:
         from AppKit import (  # type: ignore[import-untyped]
             NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -194,18 +202,16 @@ def _make_seal_window(frame: object, level: int) -> None:
         btn.setAction_("fire:")
         cv.addSubview_(btn)
 
-    win.makeKeyWindow()
+    # makeKeyWindow() 호출 안 함 — 키 입력은 봉인 worker 가 받지 않게 한다.
+    # 버튼 클릭은 windowLevel 이 충분히 높으면 keyWindow 가 아니어도 동작한다.
     win.orderFrontRegardless()
     _windows.append(win)
 
 
 def _build_seal_windows() -> None:
-    app = NSApplication.sharedApplication()
-    try:
-        app.activateIgnoringOtherApps_(True)
-    except Exception:
-        pass
-
+    # 봉인 worker 를 active app 으로 만들지 않는다. activate 호출 시 이전에 active
+    # 였던 앱(예: VD 안 앱) 의 포커스를 빼앗아 시스템 단축키·IME 가 봉인 worker
+    # 컨텍스트에서만 동작하게 된다.
     level = _shielding_level()
 
     try:
