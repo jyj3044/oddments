@@ -193,7 +193,8 @@ def build_remote_settings(state: AppState) -> ft.Control:
                 "가상 디스플레이는 CGVirtualDisplay 비공개 API를 사용합니다. "
                 "오디오는 BlackHole 등 가상 입력으로 캡처합니다. "
                 "해상도는 클라이언트가 연결(/offer) 시 보낸 값이 우선이며, "
-                "끊기면 가상 디스플레이가 정리됩니다.",
+                "끊기면 가상 디스플레이가 정리됩니다. "
+                "원격 중에는 물리 화면에 반투명 봉인·세션 끊기 버튼이 덮입니다.",
                 style=body_md(),
                 color=T.ON_SURFACE_VARIANT,
             ),

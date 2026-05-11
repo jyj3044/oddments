@@ -565,6 +565,59 @@ class RemoteHostServer:
         # _prepare_frame·짝수 맞춤 후 송출 버퍼 (뷰어 정규화와 주입 스팬 일치)
         self._last_frame_wh: tuple[int, int] = (0, 0)
 
+    def _request_disconnect_from_seal(self) -> None:
+        """물리 화면 오버레이 '세션 끊기' — AppKit 메인 스레드에서 호출될 수 있음."""
+        loop = self._loop
+        if loop is None:
+            return
+
+        async def _close_all() -> None:
+            for pc in list(self._pcs):
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+
+        try:
+            log_remote_event("호스트: 물리 화면에서 세션 끊기 요청")
+        except Exception:
+            pass
+        try:
+            asyncio.run_coroutine_threadsafe(_close_all(), loop)
+        except Exception:
+            pass
+
+    def _try_start_physical_seal(self) -> None:
+        if sys.platform != "darwin" or not self._virtual_display_enabled:
+            return
+        if int(self._vd_display_id) <= 0 or len(self._pcs) == 0:
+            return
+        try:
+            from app_platform.darwin_remote_seal import schedule_seal_show
+
+            schedule_seal_show(
+                int(self._vd_display_id),
+                self._request_disconnect_from_seal,
+            )
+        except Exception as exc:
+            try:
+                log_remote_event(
+                    f"호스트: 물리 화면 봉인 표시 실패 — {exc}",
+                    error=True,
+                )
+            except Exception:
+                pass
+
+    def _try_stop_physical_seal(self) -> None:
+        if sys.platform != "darwin":
+            return
+        try:
+            from app_platform.darwin_remote_seal import schedule_seal_hide
+
+            schedule_seal_hide()
+        except Exception:
+            pass
+
     def _auth_accept(self, token_param: object | None) -> bool:
         exp = self._auth_token
         if not exp:
@@ -663,6 +716,7 @@ class RemoteHostServer:
 
     def _blocking_restart_resolution(self, preset_id: str) -> None:
         """세션 유지 상태에서 해상도(프리셋)만 교체. 짧은 끊김 허용."""
+        self._try_stop_physical_seal()
         pid = (preset_id or "").strip() or "host_native"
         self._resolution_preset_id = pid
         with self._capture_lock:
@@ -682,6 +736,7 @@ class RemoteHostServer:
         try:
             self._ensure_geom()
             self._ensure_capture()
+            self._try_start_physical_seal()
         except Exception as exc:
             try:
                 log_remote_event(f"호스트: 해상도 변경 실패 — {exc}", error=True)
@@ -923,6 +978,7 @@ class RemoteHostServer:
         if sys.platform == "darwin" and self._virtual_display_enabled:
             self._release_virtual_display_session()
             self._geom = None
+        self._try_stop_physical_seal()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -966,6 +1022,7 @@ class RemoteHostServer:
         if sys.platform == "darwin" and self._virtual_display_enabled:
             self._release_virtual_display_session()
         self._geom = None
+        self._try_stop_physical_seal()
 
         if loop is not None:
             try:
@@ -1154,6 +1211,7 @@ class RemoteHostServer:
             pc.addTrack(SharedAudioTrack(self.audio, sample_rate=48000))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        self._try_start_physical_seal()
         try:
             log_remote_event(
                 f"호스트: SDP 답변 전송 (활성 피어 {len(self._pcs)})"
