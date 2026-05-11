@@ -806,13 +806,10 @@ def remote_viewer_main(page: ft.Page) -> None:
     def _send_remote_key(tok: str, down: bool) -> None:
         if not tok:
             return
-        _send_json(
-            {
-                "t": "key",
-                "k": _remap_key_token_for_mac_host(tok),
-                "down": down,
-            }
-        )
+        k = _remap_key_token_for_mac_host(tok)
+        if len(k) == 1 and k.isalpha():
+            k = k.lower()
+        _send_json({"t": "key", "k": k, "down": down})
 
     def _send_mod_from_hook(tok: str, down: bool) -> None:
         """Windows LL 훅 스레드에서 호출 — RemoteViewerSession.send_json 이 thread-safe."""
@@ -1256,7 +1253,7 @@ def remote_viewer_main(page: ft.Page) -> None:
         if not raw:
             return ""
         if len(raw) == 1:
-            return raw
+            return raw.lower() if raw.isalpha() else raw
         table = {
             "Enter": "enter",
             "Escape": "esc",
@@ -1350,13 +1347,20 @@ def remote_viewer_main(page: ft.Page) -> None:
 
     def _kd(e: ft.KeyDownEvent) -> None:
         tok = _norm_key_token(e.key)
-        if tok:
-            _send_remote_key(tok, True)
+        if not tok:
+            return
+        # Win: 캡스락은 WH_KEYBOARD_LL 훅에서만 보냄(중복 토글 방지). 맥은 caps_lock 으로 대소문자.
+        if sys.platform == "win32" and tok == "caps_lock":
+            return
+        _send_remote_key(tok, True)
 
     def _ku(e: ft.KeyUpEvent) -> None:
         tok = _norm_key_token(e.key)
-        if tok:
-            _send_remote_key(tok, False)
+        if not tok:
+            return
+        if sys.platform == "win32" and tok == "caps_lock":
+            return
+        _send_remote_key(tok, False)
 
     # 영상 셀: 아래는 전체 회색, 위는 실제 비트맵 크기만 GestureDetector (회색에서는 히트 없음).
     _vs_dw, _vs_dh, _vs_ox, _vs_oy = _contain_fit_disp_xy()
@@ -1474,13 +1478,13 @@ def remote_viewer_main(page: ft.Page) -> None:
             def _send_char_from_hook(ch: str) -> None:
                 """Windows WM_CHAR/WM_UNICHAR 훅 — ASCII 만 호스트로 보낸다.
 
-                한글 등 IME 확정 문자는 보내지 않고, 알파벳은 ``KeyboardListener`` 의
-                키 다운/업(영문 토큰)만 쓴다. macOS 호스트는 그 토큰을 물리 키로 주입해
-                한글 IME 가 2벌식처럼 받게 한다."""
+                한글 등 IME 확정 문자는 보내지 않고, 알파벳은 소문자만 보낸다.
+                대소문자는 맥 쪽 ``caps_lock`` 토글로 맞춘다."""
                 if not ch or not viewer_kb_capture[0]:
                     return
                 if not ch.isascii():
                     return
+                ch = "".join(c.lower() if c.isalpha() else c for c in ch)
                 _send_json({"t": "char", "c": ch})
 
             start_win_keyboard_sink(

@@ -199,6 +199,8 @@ def _darwin_reset_synth_modifiers() -> None:
     global _darwin_synth_mod_mask
     with _darwin_synth_mod_lock:
         _darwin_synth_mod_mask = 0
+    if sys.platform == "darwin":
+        _darwin_caps_lock_reset_for_disconnect()
 
 
 def _darwin_modifier_flag(quartz: object, tok_lower: str) -> int | None:
@@ -234,6 +236,109 @@ def _darwin_post_event(ev: object) -> None:
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
 
 
+# macOS 최근 빌드: Caps Lock 짧게 누르면 대소문자 고정이 아니라 입력 소스 전환 등으로만 간다.
+# 약 1초 이상 눌러야 대소문자 모드로 들어가므로, 원격에서 짧게 떼도 최소 홀드 시간을 맞춘다.
+DARWIN_CAPS_LOCK_MIN_HOLD_SEC = 1.05
+
+_darwin_caps_lock_state_lock = threading.Lock()
+_darwin_caps_lock_down_at: float | None = None
+_darwin_caps_lock_up_timer: threading.Timer | None = None
+
+
+def _darwin_caps_lock_cancel_timer() -> None:
+    global _darwin_caps_lock_up_timer
+    t = _darwin_caps_lock_up_timer
+    _darwin_caps_lock_up_timer = None
+    if t is not None:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+
+
+def _darwin_post_caps_lock_vk(down: bool) -> bool:
+    """Caps Lock 물리 키(vk 57) 한 번 post."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import Quartz  # type: ignore[import-untyped]
+
+        with _darwin_synth_mod_lock:
+            flags = _darwin_synth_mod_mask
+        ev = Quartz.CGEventCreateKeyboardEvent(None, 57, bool(down))
+        if ev is None:
+            return False
+        try:
+            Quartz.CGEventSetFlags(ev, flags)
+        except Exception:
+            pass
+        _darwin_post_event(ev)
+        return True
+    except Exception as exc:
+        _log_inject_failure_once(exc)
+        return False
+
+
+def _darwin_press_caps_lock_bridged(down: bool) -> bool:
+    """원격 Caps Lock 을 macOS 길게-누르기 규칙에 맞게 합성."""
+    import time
+
+    global _darwin_caps_lock_down_at, _darwin_caps_lock_up_timer
+
+    if sys.platform != "darwin":
+        return False
+
+    with _darwin_caps_lock_state_lock:
+        if down:
+            _darwin_caps_lock_cancel_timer()
+            if _darwin_caps_lock_down_at is not None:
+                _darwin_post_caps_lock_vk(False)
+                _darwin_caps_lock_down_at = None
+            if not _darwin_post_caps_lock_vk(True):
+                return False
+            _darwin_caps_lock_down_at = time.monotonic()
+            return True
+
+        if _darwin_caps_lock_down_at is None:
+            return _darwin_post_caps_lock_vk(False)
+
+        t0 = _darwin_caps_lock_down_at
+        elapsed = time.monotonic() - t0
+        remain = DARWIN_CAPS_LOCK_MIN_HOLD_SEC - elapsed
+
+        def _delayed_keyup() -> None:
+            global _darwin_caps_lock_up_timer, _darwin_caps_lock_down_at
+            try:
+                with _darwin_caps_lock_state_lock:
+                    _darwin_caps_lock_up_timer = None
+                    _darwin_caps_lock_down_at = None
+                _darwin_post_caps_lock_vk(False)
+            except Exception:
+                pass
+
+        if remain <= 0.002:
+            _darwin_caps_lock_down_at = None
+            return _darwin_post_caps_lock_vk(False)
+
+        th = threading.Timer(remain, _delayed_keyup)
+        th.daemon = True
+        _darwin_caps_lock_cancel_timer()
+        _darwin_caps_lock_up_timer = th
+        th.start()
+        return True
+
+
+def _darwin_caps_lock_reset_for_disconnect() -> None:
+    """세션 종료 등에서 지연 중인 Caps Lock 키업·타이머를 비운다."""
+    global _darwin_caps_lock_down_at
+
+    with _darwin_caps_lock_state_lock:
+        _darwin_caps_lock_cancel_timer()
+        if _darwin_caps_lock_down_at is not None:
+            _darwin_post_caps_lock_vk(False)
+            _darwin_caps_lock_down_at = None
+
+
 def _darwin_press_token(token: str, down: bool) -> bool:
     """macOS 자체 키 합성. 특수 토큰·US 물리 키는 vk, 그 외 한 글자는 unicode.
 
@@ -250,6 +355,8 @@ def _darwin_press_token(token: str, down: bool) -> bool:
     low = str(token).lower()
     if low == "space":
         low = " "
+    if low == "caps_lock":
+        return _darwin_press_caps_lock_bridged(bool(down))
     vk = _DARWIN_TOKEN_VK.get(low)
     if vk is None and len(token) == 1 and token == " ":
         vk = 49
