@@ -89,6 +89,7 @@ class RemoteViewerSession:
         self._pc: Optional[RTCPeerConnection] = None
         self._dc = None
         self._video_task: Optional[asyncio.Task[None]] = None
+        self._audio_task: Optional[asyncio.Task[None]] = None
         self._stop = asyncio.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._logged_ndarray_error = False
@@ -113,6 +114,7 @@ class RemoteViewerSession:
         self._pc = RTCPeerConnection(configuration=self._rtc_configuration)
         self._dc = self._pc.createDataChannel("input", ordered=True)
         self._pc.addTransceiver("video", direction="recvonly")
+        self._pc.addTransceiver("audio", direction="recvonly")
 
         @self._dc.on("message")
         def _on_dc_message(message: object) -> None:
@@ -179,16 +181,28 @@ class RemoteViewerSession:
         # 나중에 붙이면 track 이벤트를 놓쳐 영상이 영원히 안 온다.
         @self._pc.on("track")
         def _on_track(track) -> None:
-            if track.kind != "video":
-                return
-            try:
-                log_remote_event(f"뷰어: 비디오 트랙 수신 ({getattr(track, 'id', '?')})")
-            except Exception:
-                pass
-            self._video_task = asyncio.create_task(
-                self._drain_video(track),
-                name="remote-video",
-            )
+            if track.kind == "video":
+                try:
+                    log_remote_event(
+                        f"뷰어: 비디오 트랙 수신 ({getattr(track, 'id', '?')})"
+                    )
+                except Exception:
+                    pass
+                self._video_task = asyncio.create_task(
+                    self._drain_video(track),
+                    name="remote-video",
+                )
+            elif track.kind == "audio":
+                try:
+                    log_remote_event(
+                        f"뷰어: 오디오 트랙 수신 ({getattr(track, 'id', '?')})"
+                    )
+                except Exception:
+                    pass
+                self._audio_task = asyncio.create_task(
+                    self._drain_audio(track),
+                    name="remote-audio",
+                )
 
         answer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
         await self._pc.setRemoteDescription(answer)
@@ -225,6 +239,67 @@ class RemoteViewerSession:
                 )
         self._emit("영상 종료")
 
+    async def _drain_audio(self, track) -> None:
+        try:
+            import numpy as np
+            import sounddevice as sd
+        except ImportError:
+            try:
+                log_remote_event(
+                    "뷰어: sounddevice 또는 numpy 없음 — 원격 소리 재생 생략 "
+                    "(pip install sounddevice)",
+                    error=True,
+                )
+            except Exception:
+                pass
+            while not self._stop.is_set():
+                try:
+                    await asyncio.wait_for(track.recv(), timeout=1.0)
+                except (MediaStreamError, asyncio.CancelledError):
+                    break
+                except Exception:
+                    continue
+            return
+
+        self._emit("오디오 재생")
+        while not self._stop.is_set():
+            try:
+                frame = await asyncio.wait_for(track.recv(), timeout=3.0)
+            except asyncio.TimeoutError:
+                continue
+            except MediaStreamError:
+                break
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                break
+            try:
+                arr = frame.to_ndarray()
+            except Exception:
+                continue
+            if arr is None or getattr(arr, "size", 0) == 0:
+                continue
+            if arr.dtype != np.float32:
+                if arr.dtype == np.int16:
+                    arr = arr.astype(np.float32) / 32767.0
+                else:
+                    arr = arr.astype(np.float32)
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                mono = np.mean(arr, axis=1)
+            elif arr.ndim == 2 and arr.shape[1] == 1:
+                mono = arr[:, 0]
+            else:
+                mono = np.reshape(arr, (-1,))
+            sr = int(getattr(frame, "sample_rate", None) or 48000)
+            try:
+                sd.play(
+                    np.ascontiguousarray(mono, dtype=np.float32),
+                    samplerate=sr,
+                    blocking=False,
+                )
+            except Exception:
+                pass
+
     async def _cleanup(self) -> None:
         self._stop.set()
         vt = self._video_task
@@ -233,6 +308,16 @@ class RemoteViewerSession:
             vt.cancel()
             try:
                 await vt
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        at = self._audio_task
+        self._audio_task = None
+        if at is not None and not at.done():
+            at.cancel()
+            try:
+                await at
             except asyncio.CancelledError:
                 pass
             except Exception:

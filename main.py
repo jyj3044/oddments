@@ -489,9 +489,16 @@ def remote_viewer_main(page: ft.Page) -> None:
         else ft.ThemeMode.LIGHT
     )
     page.padding = 0
-    # 본문(viewport) 과 동일 톤으로 맞춰야 레이아웃 틈·디바이더 옆에 BACKGROUND(#121316)
-    # 만 깔려 검은 세로 띠처럼 보이지 않는다.
-    page.bgcolor = T.SURFACE_BRIGHT
+    # 원격 뷰어: 창 배경 · 네비 패널 · 영상 뒤 셀 — 세 영역 색을 분리한다.
+    if state.settings.dark_mode:
+        _RV_PAGE_BG = T.SURFACE_DIM
+        _RV_NAV_BG = T.SURFACE_CONTAINER
+        _RV_STREAM_CELL_BG = T.SURFACE_CONTAINER_LOW
+    else:
+        _RV_PAGE_BG = T.SURFACE_DIM
+        _RV_NAV_BG = T.SURFACE_CONTAINER
+        _RV_STREAM_CELL_BG = T.SURFACE_BRIGHT
+    page.bgcolor = _RV_PAGE_BG
     page.theme = T.theme()
     page.fonts = T.fonts()
 
@@ -521,6 +528,8 @@ def remote_viewer_main(page: ft.Page) -> None:
     # 영상 영역 클릭·부팅 지연 포커스 시 True → 저수준 훅으로 로컬 차단 + 원격 전송.
     viewer_kb_capture = [False]
     kl_ref: dict[str, ft.KeyboardListener | None] = {"k": None}
+    gd_ref: list[ft.GestureDetector | None] = [None]
+    video_shell_ref: list[ft.Container | None] = [None]
     win_kbd_sink_stop: Callable[[], None] | None = None
     meta_from_host = [False]
     decode_dims_shown = [False]
@@ -536,15 +545,21 @@ def remote_viewer_main(page: ft.Page) -> None:
 
     # 원격 스트림 종횡비(호스트 메타 또는 첫 프레임). 입력 좌표 정규화에 사용.
     stream_wh = [1280.0, 720.0]
-    # 뷰포트(네비 제외 영역) 크기 — on_size_change 로 갱신. 픽셀 박스 레이아웃에 사용.
+    # 뷰포트(네비 제외 영역) 크기. 포인터 좌표는 반드시 아래 layout_measured(실측)와 일치해야 한다.
     view_size = [1280.0, 720.0]
+    # KeyboardListener 내부 Container 의 on_size_change 로 얻은 실제 픽셀 크기 (0 이면 미수신).
+    layout_measured = [0.0, 0.0]
 
     def _contain_fit_disp_xy() -> tuple[float, float, float, float]:
-        """BoxFit.contain 과 동일: 표시 영역 (w,h) 및 좌상단 오프셋 (ox,oy)."""
+        """BoxFit.contain 과 동일: 표시 영역 (w,h) 및 좌상단 오프셋 (ox,oy).
+
+        종횡비는 WebRTC 로 디코드된 프레임에서 매 프레임 갱신하는 stream_wh 를 쓴다.
+        호스트 메타만 믿으면 송출 버퍼·실제 디코드 크기와 어긋나 좌표가 틀어질 수 있다.
+        """
         cw = max(1.0, view_size[0])
         ch = max(1.0, view_size[1])
-        sw = max(1.0, stream_wh[0])
-        sh = max(1.0, stream_wh[1])
+        sw = max(1.0, float(stream_wh[0]))
+        sh = max(1.0, float(stream_wh[1]))
         ar_s = sw / sh
         ar_c = cw / ch
         if ar_c > ar_s:
@@ -558,6 +573,21 @@ def remote_viewer_main(page: ft.Page) -> None:
             ox = 0.0
             oy = (ch - disp_h) * 0.5
         return max(1.0, disp_w), max(1.0, disp_h), ox, oy
+
+    def _inner_image_paint_rect() -> tuple[float, float, float, float]:
+        """영상 셀(disp_w×disp_h) 안에서 BoxFit.CONTAIN 과 동일한 실제 비트맵 (ox, oy, fw, fh).
+
+        GestureDetector 는 이 직사각형 크기로만 두어 회색 패딩에서는 포인터 이벤트가 나지 않게 한다.
+        """
+        disp_w, disp_h, _, _ = _contain_fit_disp_xy()
+        iw = max(1.0, float(stream_wh[0]))
+        ih = max(1.0, float(stream_wh[1]))
+        scale = min(disp_w / iw, disp_h / ih)
+        fw = iw * scale
+        fh = ih * scale
+        ox = (disp_w - fw) * 0.5
+        oy = (disp_h - fh) * 0.5
+        return ox, oy, fw, fh
 
     img_view = ft.Image(
         src=_REMOTE_PLACEHOLDER_DATA_URI,
@@ -576,61 +606,50 @@ def remote_viewer_main(page: ft.Page) -> None:
             ),
         ),
     )
-    # 픽셀 박스 + margin(ox,oy) = BoxFit.contain 과 동일 배치(세로·가로 중앙).
-    _dw, _dh, _ox, _oy = _contain_fit_disp_xy()
-    remote_frame = ft.Container(
-        expand=False,
-        width=float(_dw),
-        height=float(_dh),
-        margin=ft.margin.only(left=float(_ox), top=float(_oy)),
-        alignment=ft.Alignment.CENTER,
-        bgcolor=T.SURFACE_BRIGHT,
-        clip_behavior=ft.ClipBehavior.NONE,
-        content=img_view,
-    )
 
-    def _layout_remote_frame_pixels() -> None:
+    def _sync_remote_video_rect() -> None:
         dw, dh, ox, oy = _contain_fit_disp_xy()
         try:
-            remote_frame.width = float(dw)
-            remote_frame.height = float(dh)
-            remote_frame.margin = ft.margin.only(left=float(ox), top=float(oy))
-        except Exception:
-            pass
-
-    def _schedule_remote_frame_aspect() -> None:
-        async def _run() -> None:
-            _layout_remote_frame_pixels()
-            try:
-                remote_frame.update()
-            except Exception:
-                pass
-
-        try:
-            rt = getattr(page, "run_task", None)
-            if callable(rt):
-                rt(_run)
+            shell = video_shell_ref[0]
+            if shell is not None:
+                shell.left = float(ox)
+                shell.top = float(oy)
+                shell.width = float(dw)
+                shell.height = float(dh)
+            g = gd_ref[0]
+            if g is not None:
+                iox, ioy, iw, ih = _inner_image_paint_rect()
+                g.left = float(iox)
+                g.top = float(ioy)
+                g.width = float(iw)
+                g.height = float(ih)
         except Exception:
             pass
 
     last_emit = [0.0]
     last_hover = [0.0]
 
-    def _norm_xy(local_pos: object | None) -> tuple[float, float]:
-        """뷰포트 로컬 좌표 → 호스트 기준 0..1. BoxFit.contain 레터박스 보정."""
-        disp_w, disp_h, ox, oy = _contain_fit_disp_xy()
+    # 호버가 영상 위인지(레터박스 제외) — 스크롤 시 포인터 정보가 없을 때 사용.
+    hover_over_video = [False]
+
+    def _norm_xy_in_video(local_pos: object | None) -> tuple[float, float] | None:
+        """영상 전용 GestureDetector 로컬(0..fw, 0..fh) → 호스트 0..1."""
+        _, _, fw, fh = _inner_image_paint_rect()
         if local_pos is None:
-            return 0.5, 0.5
+            return None
         try:
             lx = float(getattr(local_pos, "x", 0.0))
             ly = float(getattr(local_pos, "y", 0.0))
         except (TypeError, ValueError):
-            return 0.5, 0.5
-        nx = (lx - ox) / max(disp_w, 1.0)
-        ny = (ly - oy) / max(disp_h, 1.0)
-        nx = max(0.0, min(1.0, nx))
-        ny = max(0.0, min(1.0, ny))
-        return nx, ny
+            return None
+        if lx < 0.0 or ly < 0.0 or lx > fw or ly > fh:
+            return None
+        nx = lx / max(fw, 1.0)
+        ny = ly / max(fh, 1.0)
+        return (
+            max(0.0, min(1.0, nx)),
+            max(0.0, min(1.0, ny)),
+        )
 
     def _emit_state(msg: str) -> None:
         async def _apply() -> None:
@@ -719,17 +738,10 @@ def remote_viewer_main(page: ft.Page) -> None:
             t = d.get("t")
             if t == "meta":
                 meta_from_host[0] = True
-                sw = d.get("stream_w")
-                sh = d.get("stream_h")
                 mw = d.get("mon_w")
                 mh = d.get("mon_h")
-                try:
-                    if sw and sh:
-                        stream_wh[0] = float(max(1, int(sw)))
-                        stream_wh[1] = float(max(1, int(sh)))
-                except (TypeError, ValueError):
-                    pass
-                _layout_remote_frame_pixels()
+                # stream_w/h 는 디코드 프레임 기준 stream_wh 와 맞춘다. 메타만으로 덮으면 좌표가 어긋날 수 있다.
+                _sync_remote_video_rect()
                 try:
                     if mw and mh:
                         res_line.value = f"{int(mw)}×{int(mh)}"
@@ -794,7 +806,7 @@ def remote_viewer_main(page: ft.Page) -> None:
 
     sidebar_container = ft.Container(
         width=rail_width_user[0],
-        bgcolor=T.SURFACE_CONTAINER_LOW,
+        bgcolor=_RV_NAV_BG,
         padding=ft.padding.symmetric(horizontal=10, vertical=12),
         on_click=_on_sidebar_pointer,
         content=ft.Column(
@@ -824,6 +836,8 @@ def remote_viewer_main(page: ft.Page) -> None:
         delta = _rail_drag_delta(e)
         if delta == 0.0:
             return
+        layout_measured[0] = 0.0
+        layout_measured[1] = 0.0
         max_w = _RV_NAV_WIDTH_MAX
         try:
             pw = float(page.width or 1280.0)
@@ -853,10 +867,10 @@ def remote_viewer_main(page: ft.Page) -> None:
     def _on_rail_drag_end(_e: ft.DragEndEvent) -> None:
         _persist_remote_rail_width()
 
-    rail_split_hit = ft.Container(expand=True, bgcolor=T.SURFACE_CONTAINER_LOW)
+    rail_split_hit = ft.Container(expand=True, bgcolor=_RV_NAV_BG)
     rail_splitter = ft.Container(
         width=6,
-        bgcolor=T.SURFACE_CONTAINER_LOW,
+        bgcolor=_RV_NAV_BG,
         content=ft.GestureDetector(
             mouse_cursor=ft.MouseCursor.RESIZE_LEFT_RIGHT,
             on_horizontal_drag_update=_on_rail_drag_update,
@@ -880,6 +894,8 @@ def remote_viewer_main(page: ft.Page) -> None:
     def _on_toggle_rail(_e: ft.ControlEvent) -> None:
         viewer_kb_capture[0] = False
         rail_expanded[0] = not rail_expanded[0]
+        layout_measured[0] = 0.0
+        layout_measured[1] = 0.0
         _sync_rail_layout()
         try:
             page.update()
@@ -922,13 +938,55 @@ def remote_viewer_main(page: ft.Page) -> None:
         ch = max(1.0, ph)
         return cw, ch
 
+    def _effective_viewport() -> tuple[float, float]:
+        """포인터 정규화에 쓰는 뷰포트 크기. 실측(on_size_change)은 창 추정과 맞을 때만 채택.
+
+        Flet/플랫폼에 따라 on_size_change 가 전체 창 크기·비정상 값을 줄 수 있어,
+        그대로 쓰면 disp_w/disp_h 가 과대 → Stack 위젯이 깨지거나 영상이 안 보일 수 있다.
+        """
+        win_w, win_h = _viewport_size_from_window()
+        lw, lh = layout_measured[0], layout_measured[1]
+        if lw < 8.0 or lh < 8.0:
+            return win_w, win_h
+        # 실측은 보통 사이드바를 뺀 영역과 동일한 차순이어야 한다.
+        if lw > win_w + 48.0 or lh > win_h + 48.0:
+            return win_w, win_h
+        if lw + 24.0 < win_w * 0.65 or lh + 24.0 < win_h * 0.65:
+            return win_w, win_h
+        return lw, lh
+
     def _sync_view_layout() -> None:
-        cw, ch = _viewport_size_from_window()
+        cw, ch = _effective_viewport()
         view_size[0] = cw
         view_size[1] = ch
-        _layout_remote_frame_pixels()
+        _sync_remote_video_rect()
         try:
-            remote_frame.update()
+            sh = video_shell_ref[0]
+            if sh is not None:
+                sh.update()
+            g = gd_ref[0]
+            if g is not None:
+                g.update()
+        except Exception:
+            pass
+
+    def _schedule_remote_frame_aspect() -> None:
+        async def _run() -> None:
+            _sync_remote_video_rect()
+            try:
+                sh = video_shell_ref[0]
+                if sh is not None:
+                    sh.update()
+                g = gd_ref[0]
+                if g is not None:
+                    g.update()
+            except Exception:
+                pass
+
+        try:
+            rt = getattr(page, "run_task", None)
+            if callable(rt):
+                rt(_run)
         except Exception:
             pass
 
@@ -1003,17 +1061,25 @@ def remote_viewer_main(page: ft.Page) -> None:
                     _rv_flush_scheduled[0] = False
 
     def _on_frame(rgb: np.ndarray) -> None:
-        now = time.monotonic()
-        if now - last_emit[0] < 0.040:
-            return
-        last_emit[0] = now
         try:
             rgb = np.ascontiguousarray(rgb)
             if rgb.ndim != 3 or rgb.shape[2] != 3:
                 return
-            # 표시만 축소(입력 좌표용 stream_wh 는 원본 해상도 유지).
-            disp = rgb
             h0, w0 = rgb.shape[:2]
+            nw = float(max(1, w0))
+            nh = float(max(1, h0))
+            if (
+                abs(stream_wh[0] - nw) > 0.5
+                or abs(stream_wh[1] - nh) > 0.5
+            ):
+                stream_wh[0] = nw
+                stream_wh[1] = nh
+                _schedule_remote_frame_aspect()
+            else:
+                stream_wh[0] = nw
+                stream_wh[1] = nh
+
+            disp = rgb
             mx = max(h0, w0)
             if mx > _REMOTE_VIEW_MAX_DISPLAY_SIDE:
                 sc = _REMOTE_VIEW_MAX_DISPLAY_SIDE / mx
@@ -1022,6 +1088,15 @@ def remote_viewer_main(page: ft.Page) -> None:
                     (max(1, int(w0 * sc)), max(1, int(h0 * sc))),
                     interpolation=cv2.INTER_AREA,
                 )
+        except Exception:
+            return
+
+        now = time.monotonic()
+        if now - last_emit[0] < 0.040:
+            return
+        last_emit[0] = now
+
+        try:
             bgr = cv2.cvtColor(disp, cv2.COLOR_RGB2BGR)
             ok, buf = cv2.imencode(
                 ".jpg",
@@ -1038,12 +1113,6 @@ def remote_viewer_main(page: ft.Page) -> None:
 
         if not meta_from_host[0] and not decode_dims_shown[0]:
             decode_dims_shown[0] = True
-            try:
-                h, w = rgb.shape[:2]
-                stream_wh[0] = float(max(1, w))
-                stream_wh[1] = float(max(1, h))
-            except Exception:
-                pass
             _schedule_remote_frame_aspect()
 
         if not first_video_logged[0]:
@@ -1114,17 +1183,30 @@ def remote_viewer_main(page: ft.Page) -> None:
             return aliases[low]
         return low
 
-    def _on_vp_size(_e: ft.LayoutSizeChangeEvent) -> None:
-        # 이벤트 값만 쓰면 창을 다시 키울 때 크기가 예전 최소값에 묶일 수 있음 → 창 기준 동기화.
+    def _on_vp_size(e: ft.LayoutSizeChangeEvent) -> None:
+        # local_position 과 같은 좌표계: 반드시 이 컨테이너의 실제 width/height 와 맞출 것.
+        try:
+            ew = float(e.width)
+            eh = float(e.height)
+            if ew >= 8.0 and eh >= 8.0:
+                layout_measured[0] = ew
+                layout_measured[1] = eh
+        except (TypeError, ValueError):
+            pass
         _sync_view_layout()
 
     def _hover(_e: ft.PointerEvent) -> None:
+        pos = getattr(_e, "local_position", None)
+        pair = _norm_xy_in_video(pos)
+        hover_over_video[0] = pair is not None
+        if pair is None:
+            return
         now = time.monotonic()
         # macOS 등에서 합성 커서 이동 비용·권한 이슈를 줄이기 위해 호버 전송 상한을 낮춤.
         if now - last_hover[0] < 0.065:
             return
         last_hover[0] = now
-        nx, ny = _norm_xy(getattr(_e, "local_position", None))
+        nx, ny = pair
         _send_json({"t": "move", "nx": nx, "ny": ny})
 
     def _tap_dn(e: ft.TapEvent, btn: str, down: bool) -> None:
@@ -1133,11 +1215,17 @@ def remote_viewer_main(page: ft.Page) -> None:
                 page.run_task(_focus_remote_viewport)
             except Exception:
                 pass
-        nx, ny = _norm_xy(getattr(e, "local_position", None))
+        pair = _norm_xy_in_video(getattr(e, "local_position", None))
+        hover_over_video[0] = pair is not None
+        if pair is None:
+            return
+        nx, ny = pair
         _send_json({"t": "move", "nx": nx, "ny": ny})
         _send_json({"t": "btn", "btn": btn, "down": down})
 
     def _scroll_ev(e: ft.ScrollEvent) -> None:
+        if not hover_over_video[0]:
+            return
         sd = getattr(e, "scroll_delta", None)
         dy = float(getattr(sd, "y", 0.0) or 0.0)
         dx = float(getattr(sd, "x", 0.0) or 0.0)
@@ -1153,21 +1241,49 @@ def remote_viewer_main(page: ft.Page) -> None:
         if tok:
             _send_remote_key(tok, False)
 
-    # 레터박스 오프셋은 remote_frame.margin(ox,oy) 로 직접 반영 (contain 과 좌표 일치).
-    gd = ft.GestureDetector(
-        expand=True,
+    # 영상 셀: 아래는 전체 회색, 위는 실제 비트맵 크기만 GestureDetector (회색에서는 히트 없음).
+    _vs_dw, _vs_dh, _vs_ox, _vs_oy = _contain_fit_disp_xy()
+    _vs_ix, _vs_iy, _vs_iw, _vs_ih = _inner_image_paint_rect()
+    video_gd = ft.GestureDetector(
+        left=float(_vs_ix),
+        top=float(_vs_iy),
+        width=float(_vs_iw),
+        height=float(_vs_ih),
         mouse_cursor=ft.MouseCursor.PRECISE,
-        content=ft.Container(
-            expand=True,
-            clip_behavior=ft.ClipBehavior.NONE,
-            content=remote_frame,
-        ),
+        content=img_view,
         on_hover=_hover,
         on_tap_down=lambda ev: _tap_dn(ev, "left", True),
         on_tap_up=lambda ev: _tap_dn(ev, "left", False),
         on_secondary_tap_down=lambda ev: _tap_dn(ev, "right", True),
         on_secondary_tap_up=lambda ev: _tap_dn(ev, "right", False),
         on_scroll=_scroll_ev,
+    )
+    gd_ref[0] = video_gd
+    video_shell = ft.Container(
+        left=float(_vs_ox),
+        top=float(_vs_oy),
+        width=float(_vs_dw),
+        height=float(_vs_dh),
+        clip_behavior=ft.ClipBehavior.NONE,
+        content=ft.Stack(
+            expand=True,
+            controls=[
+                ft.Container(expand=True, bgcolor=_RV_STREAM_CELL_BG),
+                video_gd,
+            ],
+        ),
+    )
+    video_shell_ref[0] = video_shell
+    _sync_remote_video_rect()
+
+    viewport_mouse_layer = ft.Stack(
+        expand=True,
+        fit=ft.StackFit.EXPAND,
+        clip_behavior=ft.ClipBehavior.NONE,
+        controls=[
+            ft.Container(expand=True, bgcolor=_RV_PAGE_BG),
+            video_shell,
+        ],
     )
 
     # expand 는 직계 부모가 Row/Column 등일 때만 먹는다. KL 의 부모를 Row 바로 아래
@@ -1177,7 +1293,7 @@ def remote_viewer_main(page: ft.Page) -> None:
         autofocus=True,
         content=ft.Container(
             expand=True,
-            bgcolor=T.SURFACE_BRIGHT,
+            bgcolor=_RV_PAGE_BG,
             clip_behavior=ft.ClipBehavior.NONE,
             on_size_change=_on_vp_size,
             padding=0,
@@ -1186,7 +1302,7 @@ def remote_viewer_main(page: ft.Page) -> None:
                 expand=True,
                 spacing=0,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                controls=[gd],
+                controls=[viewport_mouse_layer],
             ),
         ),
         on_key_down=_kd,
@@ -1218,6 +1334,8 @@ def remote_viewer_main(page: ft.Page) -> None:
         pass
 
     def _on_page_resize_remote(_e: object) -> None:
+        layout_measured[0] = 0.0
+        layout_measured[1] = 0.0
         _sync_view_layout()
 
     try:

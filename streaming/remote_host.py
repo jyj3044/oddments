@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import os
 import sys
 import threading
 import time
@@ -24,7 +25,14 @@ from aiortc import (
 from capture.thread import CaptureThread, enumerate_monitors
 
 from .remote_log import log_remote_event
-from .web_stream import SharedVideoBuffer, SharedVideoTrack, _even_dims_bgr
+from .remote_presets import preset_dimensions
+from .web_stream import (
+    SharedAudioBuffer,
+    SharedAudioTrack,
+    SharedVideoBuffer,
+    SharedVideoTrack,
+    _even_dims_bgr,
+)
 
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="remote-input")
 
@@ -85,6 +93,46 @@ def _darwin_backing_scale() -> float:
     return 1.0
 
 
+def _darwin_backing_scale_for_geom(
+    left: int, top: int, width: int, height: int,
+) -> float:
+    """캡처 모니터 영역 중심이 속한 NSScreen 의 backingScaleFactor.
+
+    메인 화면만 보면 외장·비주류 모니터에서 Retina 배율이 틀어져 좌표가 밀린다.
+    mss 좌표계와 NSScreen.frame 모두 글로벌 좌표(원점·축 동일)로 겹침 판별한다.
+    """
+    if sys.platform != "darwin":
+        return 1.0
+    try:
+        from AppKit import NSScreen  # type: ignore[import-untyped]
+
+        cx = float(left) + float(width) * 0.5
+        cy = float(top) + float(height) * 0.5
+        for scr in NSScreen.screens():
+            r = scr.frame()
+            ox = float(r.origin.x)
+            oy = float(r.origin.y)
+            rw = float(r.size.width)
+            rh = float(r.size.height)
+            if ox <= cx <= ox + rw and oy <= cy <= oy + rh:
+                return float(scr.backingScaleFactor())
+    except Exception:
+        pass
+    return _darwin_backing_scale()
+
+
+def _resolve_pointer_scale(stored: float) -> float:
+    """환경변수 MAPLE_REMOTE_POINTER_SCALE 로 호스트 배율 강제(실험·비표준 환경)."""
+    raw = os.environ.get("MAPLE_REMOTE_POINTER_SCALE", "").strip()
+    if not raw:
+        return stored
+    try:
+        v = float(raw)
+        return v if v > 0 else stored
+    except ValueError:
+        return stored
+
+
 def rtc_configuration_from_stun_turn(
     *,
     stun_urls: str,
@@ -126,6 +174,48 @@ def _monitor_geometry(index: int) -> Optional[tuple[int, int, int, int]]:
     return None
 
 
+def _darwin_main_pixel_size() -> tuple[int, int]:
+    """메인 디스플레이 픽셀 크기 (가상 디스플레이 host_native 용)."""
+    if sys.platform != "darwin":
+        return 1920, 1080
+    try:
+        from AppKit import NSScreen  # type: ignore[import-untyped]
+
+        scr = NSScreen.mainScreen()
+        if scr is None:
+            return 1920, 1080
+        f = scr.frame()
+        scale = float(scr.backingScaleFactor())
+        w = max(320, int(round(float(f.size.width) * scale)))
+        h = max(240, int(round(float(f.size.height) * scale)))
+        return w, h
+    except Exception:
+        return 1920, 1080
+
+
+def _mss_index_for_rect(
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    *,
+    tol: int = 16,
+) -> Optional[int]:
+    """mss 모니터 목록에서 좌표가 일치하는 인덱스."""
+    for m in enumerate_monitors():
+        try:
+            if (
+                abs(int(m.get("left", 0)) - left) <= tol
+                and abs(int(m.get("top", 0)) - top) <= tol
+                and abs(int(m.get("width", 0)) - width) <= tol
+                and abs(int(m.get("height", 0)) - height) <= tol
+            ):
+                return int(m["index"])
+        except (TypeError, ValueError, KeyError):
+            continue
+    return None
+
+
 def _prepare_frame(
     bgr: np.ndarray,
     *,
@@ -143,6 +233,23 @@ def _prepare_frame(
         if (w, h) != (ew, eh):
             return cv2.resize(bgr, (ew, eh), interpolation=cv2.INTER_AREA)
     return bgr
+
+
+def _norm_to_monitor_pixel_floats(
+    nx: float,
+    ny: float,
+    rect: tuple[int, int, int, int],
+) -> tuple[float, float]:
+    """뷰어 정규 좌표(0..1, 송출 버퍼 기준) → mss 모니터 직사각형 좌표계 절대 위치.
+
+    송출 해상도를 인코더에서 낮춰도 한 픽셀 열이 여전히 화면 가로 전체에 대응하므로,
+    스팬은 반드시 ``rect`` 의 폭·높이(gw×gh)를 쓴다. ``frame_wh`` 로 스팬을 줄이면
+    커서가 화면 안에서만 움직이는 것처럼 보인다.
+    """
+    left, top, gw, gh = rect
+    ax_f = float(left) + float(nx) * float(gw)
+    ay_f = float(top) + float(ny) * float(gh)
+    return ax_f, ay_f
 
 
 def _inject_input_message(
@@ -163,7 +270,6 @@ def _inject_input_message(
     if not isinstance(msg, dict):
         return
     t = str(msg.get("t", "")).lower()
-    left, top, w, h = rect
     try:
         from pynput.keyboard import Key  # type: ignore[import-untyped]
         from pynput.mouse import Button  # type: ignore[import-untyped]
@@ -249,9 +355,8 @@ def _inject_input_message(
             return
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
-        ax_f = float(left) + nx * float(w)
-        ay_f = float(top) + ny * float(h)
-        ps = max(float(pointer_scale), 1e-6)
+        ax_f, ay_f = _norm_to_monitor_pixel_floats(nx, ny, rect)
+        ps = max(float(_resolve_pointer_scale(pointer_scale)), 1e-6)
         if sys.platform == "darwin" and ps > 1.01:
             ax = int(ax_f / ps)
             ay = int(ay_f / ps)
@@ -355,6 +460,11 @@ def _dispatch_dc_payload(
         )
         return
     t = str(msg.get("t", "")).lower()
+    if t == "resolution":
+        preset = str(msg.get("preset", "")).strip()
+        if preset:
+            srv._schedule_resolution_change(preset)
+        return
     if t == "clip_get":
 
         def _work() -> None:
@@ -400,11 +510,15 @@ class RemoteHostServer:
         rtc_configuration: RTCConfiguration | None = None,
         auth_token: str = "",
         h264_hardware_encode: bool = False,
+        virtual_display_enabled: bool = False,
+        resolution_preset: str = "host_native",
+        darwin_audio_device: str = "",
     ) -> None:
         self.host = str(host).strip() or "0.0.0.0"
         self.port = int(port)
         self.fps = float(max(5.0, min(60.0, fps)))
         self.monitor_index = int(monitor_index)
+        self._capture_monitor_index = int(monitor_index)
         self.capture_width = max(0, int(capture_width))
         self.capture_height = max(0, int(capture_height))
         self._rtc_configuration = rtc_configuration or RTCConfiguration()
@@ -412,7 +526,18 @@ class RemoteHostServer:
         self._h264_hardware_encode = bool(h264_hardware_encode)
         self._h264_patch_applied = False
 
+        self._virtual_display_enabled = bool(virtual_display_enabled)
+        self._resolution_preset_id = (resolution_preset or "host_native").strip()
+        self._darwin_audio_device = (darwin_audio_device or "").strip()
+        self._vd_obj: object | None = None
+        self._vd_display_id: int = 0
+
         self.video = SharedVideoBuffer()
+        self.audio = SharedAudioBuffer()
+        self._audio_stop = threading.Event()
+        self._audio_thread: threading.Thread | None = None
+        self._audio_logged_fail = False
+
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._pcs: set[RTCPeerConnection] = set()
@@ -425,6 +550,8 @@ class RemoteHostServer:
         self._meta_pending: set[object] = set()
         # 맥 Retina: mss/monitor geom 은 물리 픽셀 → pynput 는 논리 포인트일 때 나눔.
         self._pointer_scale: float = 1.0
+        # _prepare_frame·짝수 맞춤 후 송출 버퍼 (뷰어 정규화와 주입 스팬 일치)
+        self._last_frame_wh: tuple[int, int] = (0, 0)
 
     def _auth_accept(self, token_param: object | None) -> bool:
         exp = self._auth_token
@@ -442,6 +569,205 @@ class RemoteHostServer:
         except Exception:
             return False
 
+    def _release_virtual_display_session(self) -> None:
+        if self._vd_obj is None:
+            return
+        try:
+            from app_platform.darwin_virtual_display import release_virtual_display
+
+            release_virtual_display(self._vd_obj)
+        except Exception:
+            pass
+        self._vd_obj = None
+        self._vd_display_id = 0
+
+    def _ensure_geom_virtual_display(self) -> None:
+        from app_platform.darwin_virtual_display import (
+            DarwinVirtualDisplayError,
+            cg_display_bounds,
+            create_virtual_display,
+        )
+
+        w, h = preset_dimensions(
+            self._resolution_preset_id,
+            host_native=_darwin_main_pixel_size,
+        )
+        w = max(320, int(w))
+        h = max(240, int(h))
+        try:
+            vd, did = create_virtual_display(w, h, refresh_hz=60.0)
+        except DarwinVirtualDisplayError as exc:
+            raise RuntimeError(str(exc)) from exc
+        self._vd_obj = vd
+        self._vd_display_id = int(did)
+        bx, by, bw, bh = cg_display_bounds(int(did))
+        left = int(round(bx))
+        top = int(round(by))
+        gw = max(1, int(round(bw)))
+        gh = max(1, int(round(bh)))
+        idx = _mss_index_for_rect(left, top, gw, gh)
+        if idx is None:
+            self._release_virtual_display_session()
+            raise RuntimeError(
+                "가상 디스플레이가 생성되었으나 mss 모니터 목록과 매칭되지 않았습니다."
+            )
+        self._capture_monitor_index = idx
+        self._geom = (left, top, gw, gh)
+        self._pointer_scale = 1.0
+        try:
+            log_remote_event(
+                f"호스트: 가상 디스플레이 {gw}×{gh} (mss #{idx}, CG ID {did})"
+            )
+        except Exception:
+            pass
+
+    def _ensure_geom(self) -> None:
+        if self._geom is not None:
+            return
+        if sys.platform == "darwin" and self._virtual_display_enabled:
+            self._ensure_geom_virtual_display()
+            return
+        geom = _monitor_geometry(self.monitor_index)
+        if geom is None:
+            raise RuntimeError(
+                f"모니터 #{self.monitor_index} 을(를) 찾을 수 없습니다."
+            )
+        self._geom = geom
+        self._capture_monitor_index = int(self.monitor_index)
+
+    def _blocking_restart_resolution(self, preset_id: str) -> None:
+        """세션 유지 상태에서 해상도(프리셋)만 교체. 짧은 끊김 허용."""
+        pid = (preset_id or "").strip() or "host_native"
+        self._resolution_preset_id = pid
+        with self._capture_lock:
+            cap = self._capture
+            self._capture = None
+        if cap is not None:
+            try:
+                cap.stop()
+                cap.join(timeout=3.0)
+            except Exception:
+                pass
+        self._stop_darwin_audio()
+        if sys.platform == "darwin" and self._virtual_display_enabled:
+            self._release_virtual_display_session()
+        self._geom = None
+        self._pointer_scale = 1.0
+        try:
+            self._ensure_geom()
+            self._ensure_capture()
+        except Exception as exc:
+            try:
+                log_remote_event(f"호스트: 해상도 변경 실패 — {exc}", error=True)
+            except Exception:
+                pass
+
+    def _schedule_resolution_change(self, preset_id: str) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+
+        async def _coro() -> None:
+            exe_loop = asyncio.get_running_loop()
+            await exe_loop.run_in_executor(
+                _POOL,
+                self._blocking_restart_resolution,
+                preset_id,
+            )
+
+        try:
+            asyncio.run_coroutine_threadsafe(_coro(), loop)
+        except Exception:
+            pass
+
+    def _darwin_audio_worker(self) -> None:
+        try:
+            import soundcard as sc  # type: ignore[import-untyped]
+        except ImportError:
+            if not self._audio_logged_fail:
+                self._audio_logged_fail = True
+                try:
+                    log_remote_event(
+                        "호스트: soundcard 모듈 없음 — 원격 오디오 생략",
+                        error=True,
+                    )
+                except Exception:
+                    pass
+            return
+        mic = None
+        needle = self._darwin_audio_device.lower()
+        try:
+            all_m = list(sc.all_microphones(include_loopback=True))
+        except Exception as exc:
+            if not self._audio_logged_fail:
+                self._audio_logged_fail = True
+                try:
+                    log_remote_event(f"호스트: 마이크 열거 실패 — {exc}", error=True)
+                except Exception:
+                    pass
+            return
+        if needle:
+            for m in all_m:
+                if needle in str(getattr(m, "name", "")).lower():
+                    mic = m
+                    break
+        if mic is None:
+            for m in all_m:
+                n = str(getattr(m, "name", "")).lower()
+                if "blackhole" in n:
+                    mic = m
+                    break
+        if mic is None:
+            if not self._audio_logged_fail:
+                self._audio_logged_fail = True
+                try:
+                    log_remote_event(
+                        "호스트: BlackHole 등 가상 입력 장치를 찾지 못했습니다. "
+                        "시스템 오디오를 원격으로 보내려면 BlackHole 2ch 설치 후 "
+                        "멀티 출력 장치로 라우팅하세요.",
+                        error=True,
+                    )
+                except Exception:
+                    pass
+            return
+        try:
+            try:
+                log_remote_event(f"호스트: 원격 오디오 입력 «{mic.name}»")
+            except Exception:
+                pass
+            with mic.recorder(samplerate=48000, channels=2) as rec:
+                while not self._audio_stop.is_set():
+                    buf = rec.record(numframes=960)
+                    if buf is not None and getattr(buf, "size", 0):
+                        self.audio.publish(buf)
+        except Exception as exc:
+            try:
+                log_remote_event(f"호스트: 오디오 캡처 중단 — {exc}", error=True)
+            except Exception:
+                pass
+
+    def _start_darwin_audio(self) -> None:
+        if sys.platform != "darwin":
+            return
+        if self._audio_thread is not None and self._audio_thread.is_alive():
+            return
+        self._audio_stop.clear()
+        self._audio_thread = threading.Thread(
+            target=self._darwin_audio_worker,
+            daemon=True,
+            name="Oddments-RemoteAudio",
+        )
+        self._audio_thread.start()
+
+    def _stop_darwin_audio(self) -> None:
+        self._audio_stop.set()
+        if self._audio_thread is not None and self._audio_thread.is_alive():
+            try:
+                self._audio_thread.join(timeout=2.0)
+            except Exception:
+                pass
+        self._audio_thread = None
+
     def _push_frame(self, frame: np.ndarray) -> None:
         try:
             if (
@@ -453,7 +779,7 @@ class RemoteHostServer:
                     rh, rw = int(frame.shape[0]), int(frame.shape[1])
                     _gl, _gt, gw, gh = self._geom
                     if abs(rw - gw) <= 4 and abs(rh - gh) <= 4:
-                        s = _darwin_backing_scale()
+                        s = _darwin_backing_scale_for_geom(_gl, _gt, gw, gh)
                         if s > 1.01:
                             self._pointer_scale = s
                 except Exception:
@@ -463,6 +789,11 @@ class RemoteHostServer:
                 capture_width=self.capture_width,
                 capture_height=self.capture_height,
             )
+            try:
+                oh, ow = out.shape[:2]
+                self._last_frame_wh = (int(ow), int(oh))
+            except (TypeError, ValueError, IndexError):
+                pass
             self.video.push(out)
             if self._meta_pending and self._loop is not None:
                 h, w = out.shape[:2]
@@ -496,17 +827,6 @@ class RemoteHostServer:
         except Exception:
             pass
 
-    def _ensure_geom(self) -> None:
-        """첫 연결 시 모니터 기하만 확보(캡처와 분리)."""
-        if self._geom is not None:
-            return
-        geom = _monitor_geometry(self.monitor_index)
-        if geom is None:
-            raise RuntimeError(
-                f"모니터 #{self.monitor_index} 을(를) 찾을 수 없습니다."
-            )
-        self._geom = geom
-
     def _ensure_capture(self) -> None:
         """인증된 클라이언트가 붙은 뒤에만 화면 캡처·인코더 패치를 적용한다."""
         self._ensure_geom()
@@ -521,19 +841,27 @@ class RemoteHostServer:
         with self._capture_lock:
             if self._capture is not None and self._capture.is_alive():
                 return
+            idx = int(self._capture_monitor_index)
             try:
                 log_remote_event(
-                    f"호스트: 화면 캡처 시작 (모니터 #{self.monitor_index})"
+                    f"호스트: 화면 캡처 시작 (모니터 #{idx}"
+                    + (
+                        ", 가상 디스플레이"
+                        if sys.platform == "darwin" and self._virtual_display_enabled
+                        else ""
+                    )
+                    + ")",
                 )
             except Exception:
                 pass
             self._capture = CaptureThread(
-                monitor_index=self.monitor_index,
+                monitor_index=idx,
                 target_fps=self.fps,
                 on_frame=self._push_frame,
                 window_hwnd=None,
             )
             self._capture.start()
+        self._start_darwin_audio()
 
     def _stop_capture_if_idle(self) -> None:
         """활성 피어가 없으면 캡처를 멈춰 CPU 를 돌려준다."""
@@ -552,6 +880,10 @@ class RemoteHostServer:
                 cap.join(timeout=2.0)
             except Exception:
                 pass
+        self._stop_darwin_audio()
+        if sys.platform == "darwin" and self._virtual_display_enabled:
+            self._release_virtual_display_session()
+            self._geom = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -571,6 +903,7 @@ class RemoteHostServer:
         raise RuntimeError("원격 호스트 서버 시작 시간 초과.")
 
     def stop(self) -> None:
+        self._stop_darwin_audio()
         cap = self._capture
         self._capture = None
         if cap is not None:
@@ -579,6 +912,9 @@ class RemoteHostServer:
                 cap.join(timeout=2.0)
             except Exception:
                 pass
+        if sys.platform == "darwin" and self._virtual_display_enabled:
+            self._release_virtual_display_session()
+        self._geom = None
 
         loop = self._loop
         if loop is not None:
@@ -691,8 +1027,6 @@ class RemoteHostServer:
         pc = RTCPeerConnection(configuration=self._rtc_configuration)
         self._pcs.add(pc)
 
-        geom = self._geom
-
         @pc.on("connectionstatechange")
         async def _on_state_change() -> None:
             st = pc.connectionState
@@ -720,14 +1054,15 @@ class RemoteHostServer:
 
             @channel.on("message")
             def _on_message(message: object) -> None:
-                if geom is None:
+                g = srv._geom
+                if g is None:
                     return
                 raw = (
                     message.decode("utf-8", errors="ignore")
                     if isinstance(message, (bytes, bytearray))
                     else str(message)
                 )
-                _POOL.submit(_dispatch_dc_payload, srv, raw, geom, channel)
+                _POOL.submit(_dispatch_dc_payload, srv, raw, g, channel)
 
         pc.on("datachannel", _on_datachannel)
 
@@ -739,6 +1074,8 @@ class RemoteHostServer:
                 max_stream_side=0,
             )
         )
+        if sys.platform == "darwin":
+            pc.addTrack(SharedAudioTrack(self.audio, sample_rate=48000))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         try:

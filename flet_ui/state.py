@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import socket
 import sys
 import threading
@@ -248,6 +249,12 @@ class RemoteHostProfile:
     auth_token: str = ""
     # True 이면 호스트 시작 시 NVENC/AMF/VideoToolbox 등을 시도하고, 없으면 libx264 유지.
     h264_hardware_encode: bool = False
+    # macOS 호스트: CGVirtualDisplay 로 가상 모니터만 송출 (물리 모니터 미송출).
+    use_virtual_display: bool = True
+    # streaming.remote_presets 의 preset id (기본 host_native = 메인 디스플레이와 동일 크기).
+    resolution_preset: str = "host_native"
+    # macOS: 원격용 가상 입력 장치 이름 부분 문자열 (예: BlackHole). 비우면 BlackHole 자동 탐색.
+    darwin_audio_input: str = ""
 
 
 @dataclass
@@ -480,6 +487,15 @@ class AppState:
                 h.h264_hardware_encode = bool(
                     rh.get("h264_hardware_encode", h.h264_hardware_encode)
                 )
+                h.use_virtual_display = bool(
+                    rh.get("use_virtual_display", h.use_virtual_display)
+                )
+                h.resolution_preset = str(
+                    rh.get("resolution_preset", h.resolution_preset) or "host_native"
+                )
+                h.darwin_audio_input = str(
+                    rh.get("darwin_audio_input", h.darwin_audio_input) or ""
+                )
             if isinstance(rc, dict):
                 c = self.settings.remote.client
                 c.host = str(rc.get("host", c.host) or "")
@@ -545,6 +561,9 @@ class AppState:
                     "turn_password": rh.turn_password,
                     "auth_token": rh.auth_token,
                     "h264_hardware_encode": rh.h264_hardware_encode,
+                    "use_virtual_display": rh.use_virtual_display,
+                    "resolution_preset": rh.resolution_preset,
+                    "darwin_audio_input": rh.darwin_audio_input,
                 },
                 "client": {
                     "host": rc.host,
@@ -1222,12 +1241,26 @@ class AppState:
         except Exception:
             acc_hint = None
         try:
+            if _sys.platform == "darwin":
+                from app_platform.darwin_compat import remote_host_macos_version_ok
+
+                ok_ver, ver_msg = remote_host_macos_version_ok()
+                if not ok_ver:
+                    raise RuntimeError(ver_msg)
+                if not (hp.auth_token or "").strip():
+                    if os.environ.get("MAPLE_REMOTE_ALLOW_NO_PASSWORD") != "1":
+                        raise RuntimeError(
+                            "맥 호스트는 연결 비밀번호가 필요합니다. "
+                            "설정에 입력하거나 개발용으로 환경변수 "
+                            "MAPLE_REMOTE_ALLOW_NO_PASSWORD=1 을 사용하세요."
+                        )
             rtc_cfg = rtc_configuration_from_stun_turn(
                 stun_urls=hp.stun_urls,
                 turn_uri=hp.turn_uri,
                 turn_username=hp.turn_username,
                 turn_password=hp.turn_password,
             )
+            vd = bool(hp.use_virtual_display) if _sys.platform == "darwin" else False
             srv = RemoteHostServer(
                 host="0.0.0.0",
                 port=hp.listen_port,
@@ -1238,6 +1271,9 @@ class AppState:
                 rtc_configuration=rtc_cfg,
                 auth_token=hp.auth_token,
                 h264_hardware_encode=hp.h264_hardware_encode,
+                virtual_display_enabled=vd,
+                resolution_preset=hp.resolution_preset,
+                darwin_audio_device=hp.darwin_audio_input,
             )
             srv.start()
             self._remote_host = srv

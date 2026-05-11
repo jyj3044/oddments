@@ -8,6 +8,8 @@ from pathlib import Path
 
 import flet as ft
 
+from streaming.remote_presets import PRESET_LABELS
+
 from ..components import (
     section_card,
     show_snack,
@@ -137,13 +139,63 @@ def build_remote_settings(state: AppState) -> ft.Control:
         on_change=lambda e: _persist_turn(state, password=e.control.value),
     )
     host_auth = text_field(
-        label="연결 비밀번호 (선택)",
+        label="연결 비밀번호 (필수 · 맥 호스트)"
+        if sys.platform == "darwin"
+        else "연결 비밀번호 (선택)",
         value=hp.auth_token,
         password=True,
-        hint="비우면 인증 없음 · 클라이언트와 동일",
+        hint="맥 호스트는 필수 · 클라이언트와 동일"
+        if sys.platform == "darwin"
+        else "비우면 인증 없음 · 클라이언트와 동일",
         expand=True,
         on_change=lambda e: _persist_host_auth(state, e.control.value),
     )
+
+    mac_controls: list[ft.Control] = []
+    if sys.platform == "darwin":
+        vd_switch = ft.Switch(
+            label="가상 디스플레이만 송출 (물리 모니터 미송출)",
+            value=bool(hp.use_virtual_display),
+            on_change=lambda e: _persist_use_virtual_display(
+                state, bool(getattr(e.control, "value", False))
+            ),
+        )
+        _preset_label_by_id = {k: lab for k, lab in PRESET_LABELS}
+        _preset_row_labels = [lab for _, lab in PRESET_LABELS]
+        _cur_preset_label = _preset_label_by_id.get(
+            hp.resolution_preset, PRESET_LABELS[0][1]
+        )
+        preset_dd = ft.Dropdown(
+            label="해상도 프리셋",
+            value=_cur_preset_label,
+            width=420,
+            options=[ft.dropdown.Option(lab) for lab in _preset_row_labels],
+            on_select=lambda e: _persist_resolution_preset_label(
+                state, str(getattr(e.control, "value", "") or "")
+            ),
+        )
+        audio_vd_field = text_field(
+            label="원격 오디오 입력 장치 (이름 일부)",
+            value=hp.darwin_audio_input,
+            hint="비우면 BlackHole 자동 탐색 · 시스템 소리는 멀티 출력으로 라우팅",
+            expand=True,
+            on_change=lambda e: _persist_darwin_audio_input(state, e.control.value),
+        )
+        mac_controls = [
+            vd_switch,
+            ft.Row(
+                spacing=T.SPACE_MD,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+                controls=[preset_dd],
+            ),
+            audio_vd_field,
+            ft.Text(
+                "가상 디스플레이는 CGVirtualDisplay 비공개 API를 사용합니다. "
+                "오디오는 BlackHole 등 가상 입력으로 캡처합니다.",
+                style=body_md(),
+                color=T.ON_SURFACE_VARIANT,
+            ),
+        ]
 
     host_status = ft.Text(
         "호스트 실행 중" if state.remote_host_active() else "호스트 중지됨",
@@ -224,6 +276,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
                     controls=[port_host, mon_field, fps_field],
                 ),
                 h264_hw,
+                *mac_controls,
                 ft.Text(
                     "PyAV 에 해당 인코더가 포함되어 있어야 합니다. 없거나 실패 시 libx264 로 송출합니다.",
                     style=body_md(),
@@ -396,7 +449,8 @@ def build_remote_settings(state: AppState) -> ft.Control:
         controls=[
             ft.Text("Remote Desktop", style=headline_sm(), color=T.ON_SURFACE),
             ft.Text(
-                "단일 모니터 기준. 해상도는 아래 값이 0일 때 원격 대상의 네이티브 해상도를 따릅니다.",
+                "맥 호스트는 가상 디스플레이 모드에서 물리 모니터 대신 지정 해상도만 송출합니다. "
+                "그 외 OS 는 단일 모니터 인덱스 기준입니다.",
                 style=label_lg(),
                 color=T.ON_SURFACE_VARIANT,
             ),
@@ -471,6 +525,24 @@ def _persist_turn(
 
 def _persist_host_auth(state: AppState, raw: str) -> None:
     state.settings.remote.host.auth_token = str(raw)
+    state.save()
+
+
+def _persist_use_virtual_display(state: AppState, enabled: bool) -> None:
+    state.settings.remote.host.use_virtual_display = enabled
+    state.save()
+
+
+def _persist_resolution_preset_label(state: AppState, label: str) -> None:
+    for k, lab in PRESET_LABELS:
+        if lab == label:
+            state.settings.remote.host.resolution_preset = k
+            state.save()
+            return
+
+
+def _persist_darwin_audio_input(state: AppState, raw: str) -> None:
+    state.settings.remote.host.darwin_audio_input = str(raw)
     state.save()
 
 
