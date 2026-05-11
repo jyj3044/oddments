@@ -41,6 +41,8 @@ def _clamp_port_str(raw: str, default: int) -> int:
 
 def _remote_host_monitor_button_label(state: AppState) -> str:
     hp = state.settings.remote.host
+    if sys.platform == "darwin" and bool(hp.use_virtual_display):
+        return "가상 디스플레이"
     idx = int(hp.monitor_index or 1)
     cache = getattr(state, "_monitor_cache", []) or []
     for m in cache:
@@ -59,7 +61,26 @@ def _set_remote_host_monitor(
     idx: int,
     on_picked: Callable[[], None] | None = None,
 ) -> None:
+    if sys.platform == "darwin":
+        state.settings.remote.host.use_virtual_display = False
     state.settings.remote.host.monitor_index = max(1, int(idx))
+    state.save()
+    page = getattr(state, "page", None)
+    if page is None:
+        return
+    close_active_dialog(page)
+    if on_picked is not None:
+        try:
+            on_picked()
+        except Exception:
+            pass
+
+
+def _set_remote_host_virtual_display(
+    state: AppState,
+    on_picked: Callable[[], None] | None = None,
+) -> None:
+    state.settings.remote.host.use_virtual_display = True
     state.save()
     page = getattr(state, "page", None)
     if page is None:
@@ -85,7 +106,8 @@ def _open_remote_host_monitor_picker(
         state._monitor_cache = monitors  # type: ignore[attr-defined]
     except Exception:
         pass
-    if not monitors:
+    _darwin = sys.platform == "darwin"
+    if not monitors and not _darwin:
         show_snack(
             page,
             "사용 가능한 모니터가 없습니다.",
@@ -110,6 +132,22 @@ def _open_remote_host_monitor_picker(
         close_active_dialog(page)
 
     items: list[ft.Control] = []
+    if _darwin:
+        items.append(
+            ft.ListTile(
+                leading=ft.Icon(ft.Icons.CAST_CONNECTED, color=T.PRIMARY),
+                title=ft.Text("가상 디스플레이"),
+                subtitle=ft.Text(
+                    "물리 모니터 미송출 · 연결 시 클라이언트 preset 해상도",
+                    style=label_md(),
+                    color=T.ON_SURFACE_VARIANT,
+                ),
+                on_click=lambda _e: (
+                    _restore_keyboard(),
+                    _set_remote_host_virtual_display(state, on_picked),
+                ),
+            )
+        )
     for m in monitors:
         idx = int(m["index"])
         w = int(m["width"])
@@ -141,7 +179,7 @@ def _open_remote_host_monitor_picker(
         title=ft.Text("모니터 선택", style=title_lg()),
         content=ft.Container(
             width=520,
-            height=min(420, 80 + len(items) * 72),
+            height=min(480, 80 + len(items) * 72),
             content=ft.ListView(controls=items, spacing=4),
         ),
         actions=[
@@ -214,10 +252,12 @@ def build_remote_settings(state: AppState) -> ft.Control:
     except Exception:
         pass
 
+    _host_row_h = 48
     port_host = text_field(
         label="수신 포트",
         value=str(hp.listen_port),
         expand=True,
+        height=_host_row_h,
         keyboard_type=ft.KeyboardType.NUMBER,
         on_change=lambda e: _persist_host_port(state, e.control.value),
     )
@@ -240,11 +280,12 @@ def build_remote_settings(state: AppState) -> ft.Control:
             state, _refresh_remote_monitor_btn
         ),
     )
-    monitor_btn.height = 48
+    monitor_btn.height = int(_host_row_h)
     fps_field = text_field(
         label="FPS",
         value=str(hp.stream_fps),
         expand=True,
+        height=_host_row_h,
         keyboard_type=ft.KeyboardType.NUMBER,
         on_change=lambda e: _persist_host_fps(state, e.control.value),
     )
@@ -268,13 +309,6 @@ def build_remote_settings(state: AppState) -> ft.Control:
 
     mac_controls: list[ft.Control] = []
     if sys.platform == "darwin":
-        vd_switch = ft.Switch(
-            label="가상 디스플레이만 송출 (물리 모니터 미송출)",
-            value=bool(hp.use_virtual_display),
-            on_change=lambda e: _persist_use_virtual_display(
-                state, bool(getattr(e.control, "value", False))
-            ),
-        )
         audio_vd_field = text_field(
             label="원격 오디오 입력 장치 (이름 일부)",
             value=hp.darwin_audio_input,
@@ -282,7 +316,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
             expand=True,
             on_change=lambda e: _persist_darwin_audio_input(state, e.control.value),
         )
-        mac_controls = [vd_switch, audio_vd_field]
+        mac_controls = [audio_vd_field]
 
     host_status = ft.Text(
         "호스트 실행 중" if state.remote_host_active() else "호스트 중지됨",
@@ -349,7 +383,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
     host_stop_btn.on_click = _on_host_stop
 
     host_card = section_card(
-        title="호스트 (이 PC에서 화면 공유)",
+        title="호스트",
         icon=ft.Icons.CAST_CONNECTED,
         content=ft.Column(
             spacing=T.SPACE_MD,
@@ -357,7 +391,7 @@ def build_remote_settings(state: AppState) -> ft.Control:
             controls=[
                 ft.Row(
                     spacing=T.SPACE_MD,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[port_host, monitor_btn, fps_field],
                 ),
                 h264_hw,
@@ -556,11 +590,6 @@ def _persist_host_port(state: AppState, raw: str) -> None:
 
 def _persist_host_auth(state: AppState, raw: str) -> None:
     state.settings.remote.host.auth_token = str(raw)
-    state.save()
-
-
-def _persist_use_virtual_display(state: AppState, enabled: bool) -> None:
-    state.settings.remote.host.use_virtual_display = enabled
     state.save()
 
 
