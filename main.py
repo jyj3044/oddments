@@ -65,6 +65,7 @@ from flet_ui.theme import (
     body_md,
     button_style_click_cursor,
     label_lg,
+    label_md,
 )
 from flet_ui.state import APP_NAME, AppState
 
@@ -706,14 +707,78 @@ def remote_viewer_main(page: ft.Page) -> None:
             pass
 
     rail_expanded = [True]
-    SIDEBAR_W_FULL = 300
-    SIDEBAR_W_MIN = 52
+    SIDEBAR_W_COLLAPSED = 52
+    _RV_NAV_WIDTH_MIN = 180.0
+    _RV_NAV_WIDTH_MAX = 560.0
+    rw_cfg = getattr(state.settings.window, "remote_viewer_sidebar_width", None)
+    try:
+        if rw_cfg is not None and int(rw_cfg) > 0:
+            rail_width_user = [
+                float(
+                    max(
+                        _RV_NAV_WIDTH_MIN,
+                        min(_RV_NAV_WIDTH_MAX, float(rw_cfg)),
+                    )
+                )
+            ]
+        else:
+            rail_width_user = [300.0]
+    except (TypeError, ValueError):
+        rail_width_user = [300.0]
 
     sb_title = ft.Text("원격 뷰어", style=label_lg(), color=T.ON_SURFACE)
     sb_target = ft.Text(
         f"대상 {rc.host or '127.0.0.1'}:{rc.port}",
         style=body_md(),
         color=T.ON_SURFACE_VARIANT,
+    )
+    # True: 호버마다 move 전송. False: 버튼을 누른 동안만 move(드래그 유지).
+    hover_sync_enabled = [True]
+    remote_btn_mask = [0]
+    # True: 클릭 직전에 move 전송 → 호스트가 해당 좌표로 커서를 옮김(실사용). False: 순간이동 없음·위치 불일치.
+    click_coord_enabled = [True]
+
+    def _on_hover_sync_change(e: ft.ControlEvent) -> None:
+        try:
+            hover_sync_enabled[0] = bool(getattr(e.control, "value", True))
+        except Exception:
+            pass
+
+    def _on_click_coord_change(e: ft.ControlEvent) -> None:
+        try:
+            click_coord_enabled[0] = bool(getattr(e.control, "value", True))
+        except Exception:
+            pass
+
+    remote_mouse_hint = ft.Text(
+        "한 PC에서 호스트와 뷰어를 같이 쓰면, 원격 제어를 위해 클릭할 때마다 "
+        "좌표를 보내 물리 커서가 캡처 화면 쪽으로 움직입니다. 키보드만 확인할 때는 "
+        "아래를 조합해 보세요. 정확한 마우스 검증은 VM, 다른 PC, 또는 캡처를 다른 "
+        "모니터로 두는 구성이 안전합니다.",
+        style=label_md(),
+        color=T.ON_SURFACE_VARIANT,
+    )
+
+    hover_sync_switch = ft.Switch(
+        label="호버 시 원격 커서 이동",
+        value=True,
+        tooltip=(
+            "끄면 마우스만 지나갈 때는 원격 커서가 움직이지 않습니다. "
+            "드래그 중에는 계속 이동이 전송됩니다. 스크롤은 그대로입니다."
+        ),
+        on_change=_on_hover_sync_change,
+    )
+
+    click_coord_switch = ft.Switch(
+        label="클릭 시 화면 좌표 맞추기",
+        value=True,
+        tooltip=(
+            "끄면 클릭 직전에 좌표를 보내지 않아 같은 PC에서 커서가 캡처 화면으로 "
+            "점프하지 않습니다. 대신 클릭이 영상 속 위치와 맞지 않고(현재 OS 커서 "
+            "위치 기준) 드래그·정밀 조작은 기대할 수 없습니다. 키/버튼 수신 여부만 "
+            "볼 때 쓰세요."
+        ),
+        on_change=_on_click_coord_change,
     )
 
     expanded_block = ft.Column(
@@ -723,6 +788,9 @@ def remote_viewer_main(page: ft.Page) -> None:
             sb_target,
             conn_status,
             res_line,
+            remote_mouse_hint,
+            hover_sync_switch,
+            click_coord_switch,
         ],
     )
 
@@ -733,8 +801,8 @@ def remote_viewer_main(page: ft.Page) -> None:
     )
 
     sidebar_container = ft.Container(
-        width=SIDEBAR_W_FULL,
-        bgcolor=T.SURFACE_BRIGHT,
+        width=rail_width_user[0],
+        bgcolor=T.SURFACE_CONTAINER_LOW,
         padding=ft.padding.symmetric(horizontal=10, vertical=12),
         on_click=_on_sidebar_pointer,
         content=ft.Column(
@@ -747,10 +815,70 @@ def remote_viewer_main(page: ft.Page) -> None:
         ),
     )
 
+    def _rail_drag_delta(e: ft.DragUpdateEvent) -> float:
+        if e.primary_delta is not None:
+            return float(e.primary_delta)
+        ld = e.local_delta
+        if ld is not None:
+            return float(ld.x)
+        gd = e.global_delta
+        if gd is not None:
+            return float(gd.x)
+        return 0.0
+
+    def _on_rail_drag_update(e: ft.DragUpdateEvent) -> None:
+        if not rail_expanded[0]:
+            return
+        delta = _rail_drag_delta(e)
+        if delta == 0.0:
+            return
+        max_w = _RV_NAV_WIDTH_MAX
+        try:
+            pw = float(page.width or 1280.0)
+            max_w = min(max_w, max(_RV_NAV_WIDTH_MIN + 48.0, pw * 0.58))
+        except Exception:
+            pass
+        w = max(_RV_NAV_WIDTH_MIN, min(max_w, rail_width_user[0] + delta))
+        if abs(w - rail_width_user[0]) < 0.25:
+            return
+        rail_width_user[0] = w
+        sidebar_container.width = w
+        try:
+            page.update()
+        except Exception:
+            pass
+
+    def _persist_remote_rail_width() -> None:
+        try:
+            state.settings.window.remote_viewer_sidebar_width = int(
+                round(rail_width_user[0])
+            )
+            state.save()
+        except Exception:
+            pass
+
+    def _on_rail_drag_end(_e: ft.DragEndEvent) -> None:
+        _persist_remote_rail_width()
+
+    rail_split_hit = ft.Container(expand=True, bgcolor=T.SURFACE_CONTAINER_LOW)
+    rail_splitter = ft.Container(
+        width=6,
+        bgcolor=T.SURFACE_CONTAINER_LOW,
+        content=ft.GestureDetector(
+            mouse_cursor=ft.MouseCursor.RESIZE_LEFT_RIGHT,
+            on_horizontal_drag_update=_on_rail_drag_update,
+            on_horizontal_drag_end=_on_rail_drag_end,
+            content=rail_split_hit,
+        ),
+    )
+
     def _sync_rail_layout() -> None:
         ex = rail_expanded[0]
-        sidebar_container.width = SIDEBAR_W_FULL if ex else SIDEBAR_W_MIN
+        sidebar_container.width = (
+            rail_width_user[0] if ex else float(SIDEBAR_W_COLLAPSED)
+        )
         expanded_block.visible = ex
+        rail_splitter.visible = ex
         toggle_rail_btn.icon = (
             ft.Icons.CHEVRON_LEFT if ex else ft.Icons.CHEVRON_RIGHT
         )
@@ -928,6 +1056,8 @@ def remote_viewer_main(page: ft.Page) -> None:
         view_size[1] = max(1.0, float(e.height))
 
     def _hover(_e: ft.PointerEvent) -> None:
+        if not hover_sync_enabled[0] and remote_btn_mask[0] == 0:
+            return
         now = time.monotonic()
         if now - last_hover[0] < 0.045:
             return
@@ -936,13 +1066,20 @@ def remote_viewer_main(page: ft.Page) -> None:
         _send_json({"t": "move", "nx": nx, "ny": ny})
 
     def _tap_dn(e: ft.TapEvent, btn: str, down: bool) -> None:
+        bit = 1 if btn == "left" else (2 if btn == "right" else 4)
+        if bit:
+            if down:
+                remote_btn_mask[0] |= bit
+            else:
+                remote_btn_mask[0] &= ~bit
         if down:
             try:
                 page.run_task(_focus_remote_viewport)
             except Exception:
                 pass
         nx, ny = _norm_xy(getattr(e, "local_position", None))
-        _send_json({"t": "move", "nx": nx, "ny": ny})
+        if click_coord_enabled[0]:
+            _send_json({"t": "move", "nx": nx, "ny": ny})
         _send_json({"t": "btn", "btn": btn, "down": down})
 
     def _scroll_ev(e: ft.ScrollEvent) -> None:
@@ -1010,6 +1147,7 @@ def remote_viewer_main(page: ft.Page) -> None:
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
             controls=[
                 sidebar_container,
+                rail_splitter,
                 viewport,
             ],
         )
@@ -1106,6 +1244,12 @@ def remote_viewer_main(page: ft.Page) -> None:
                 s.request_close()  # type: ignore[attr-defined]
             except Exception:
                 pass
+        try:
+            state.settings.window.remote_viewer_sidebar_width = int(
+                round(rail_width_user[0])
+            )
+        except Exception:
+            pass
         try:
             state.save()
         except Exception:

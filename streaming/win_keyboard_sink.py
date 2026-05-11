@@ -46,6 +46,15 @@ _VK_TO_TOKEN = {
     VK_RMENU: "alt_r",
 }
 
+# SetWindowsHookEx 는 호출마다 새로 만든 WINFUNCTYPE 과 호환되지 않는다.
+# 프로토타입은 모듈 로드 시 한 번만 정의한다 (Python ctypes 문서 / Win32 LL 훅 관행).
+_LOWLEVEL_KEYBOARD_PROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t,
+    ctypes.c_int,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = (
@@ -92,15 +101,17 @@ def _foreground_matches_title(title: str) -> bool:
     return bool(mine and fg == mine)
 
 
-def _low_level_proc(n_code: int, w_param: wintypes.WPARAM, l_param: wintypes.LPARAM):
+def _low_level_proc(n_code: int, w_param: wintypes.WPARAM, l_param: wintypes.LPARAM) -> int:
     if n_code == HC_ACTION:
         try:
             kb = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             vk = int(kb.vkCode)
             if vk in _SUPPRESS_VKS and _state.should_suppress():
                 if not _foreground_matches_title(_state.window_title):
-                    return ctypes.windll.user32.CallNextHookEx(
-                        _state.hook, n_code, w_param, l_param
+                    return int(
+                        ctypes.windll.user32.CallNextHookEx(
+                            _state.hook, n_code, w_param, l_param
+                        )
                     )
                 wp = int(w_param)
                 if wp in (
@@ -116,7 +127,9 @@ def _low_level_proc(n_code: int, w_param: wintypes.WPARAM, l_param: wintypes.LPA
                     return 1
         except Exception:
             pass
-    return ctypes.windll.user32.CallNextHookEx(_state.hook, n_code, w_param, l_param)
+    return int(
+        ctypes.windll.user32.CallNextHookEx(_state.hook, n_code, w_param, l_param)
+    )
 
 
 def start_win_keyboard_sink(
@@ -133,18 +146,15 @@ def start_win_keyboard_sink(
     _state.should_suppress = should_suppress
     _state.send_key = send_key
     _state.stop.clear()
-    _state.proc_ref = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)(
-        _low_level_proc
-    )
+    _state.proc_ref = _LOWLEVEL_KEYBOARD_PROC(_low_level_proc)
 
     def _run() -> None:
         user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        h_mod = kernel32.GetModuleHandleW(None)
+        # WH_KEYBOARD_LL + 전역 훅(dwThreadId==0) 일 때 hMod 는 NULL 이어야 한다 (MSDN).
         hook = user32.SetWindowsHookExW(
             WH_KEYBOARD_LL,
             _state.proc_ref,
-            h_mod,
+            None,
             0,
         )
         if not hook:

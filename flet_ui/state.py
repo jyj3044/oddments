@@ -226,6 +226,8 @@ class WindowSettings:
     dashboard_preview_height: Optional[int] = None
     # 메인 창 왼쪽 네비게이션 패널 폭(px). None 이면 테마 기본 SIDEBAR_WIDTH.
     sidebar_width: Optional[int] = None
+    # 원격 뷰어 보조 창 왼쪽 패널 펼침 폭(px). None 이면 코드 초기값.
+    remote_viewer_sidebar_width: Optional[int] = None
 
 
 @dataclass
@@ -418,6 +420,16 @@ class AppState:
                     swi = 0
                 if swi > 0:
                     win.sidebar_width = max(180, min(560, swi))
+            raw_rv = win_d.get(
+                "remote_viewer_sidebar_width", win.remote_viewer_sidebar_width
+            )
+            if raw_rv is not None:
+                try:
+                    rvi = int(raw_rv)
+                except (TypeError, ValueError):
+                    rvi = 0
+                if rvi > 0:
+                    win.remote_viewer_sidebar_width = max(180, min(560, rvi))
 
         self.settings.dark_mode = bool(d.get("dark_mode", self.settings.dark_mode))
 
@@ -512,6 +524,7 @@ class AppState:
                 "maximized": bool(self.settings.window.maximized),
                 "dashboard_preview_height": self.settings.window.dashboard_preview_height,
                 "sidebar_width": self.settings.window.sidebar_width,
+                "remote_viewer_sidebar_width": self.settings.window.remote_viewer_sidebar_width,
             },
             "dark_mode": bool(self.settings.dark_mode),
             "remote_control": {
