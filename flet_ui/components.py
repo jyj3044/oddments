@@ -13,6 +13,7 @@ import flet as ft
 from .theme import (
     StreamMasterTheme as T,
     body_md,
+    button_style_click_cursor,
     label_lg,
     label_md,
     title_lg,
@@ -104,12 +105,14 @@ def primary_button(
         on_click=on_click,
         disabled=disabled,
         tooltip=tooltip,
-        style=ft.ButtonStyle(
-            bgcolor=T.PRIMARY,
-            color=T.ON_PRIMARY,
-            padding=ft.padding.symmetric(horizontal=16, vertical=10),
-            shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
-            text_style=label_lg(),
+        style=button_style_click_cursor(
+            ft.ButtonStyle(
+                bgcolor=T.PRIMARY,
+                color=T.ON_PRIMARY,
+                padding=ft.padding.symmetric(horizontal=16, vertical=10),
+                shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
+                text_style=label_lg(),
+            )
         ),
     )
 
@@ -131,13 +134,15 @@ def outline_button(
         on_click=on_click,
         disabled=disabled,
         tooltip=tooltip,
-        style=ft.ButtonStyle(
-            color=fg,
-            bgcolor=T.SURFACE_CONTAINER_LOWEST,
-            side=ft.BorderSide(1, border_color),
-            padding=ft.padding.symmetric(horizontal=16, vertical=10),
-            shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
-            text_style=label_lg(),
+        style=button_style_click_cursor(
+            ft.ButtonStyle(
+                color=fg,
+                bgcolor=T.SURFACE_CONTAINER_LOWEST,
+                side=ft.BorderSide(1, border_color),
+                padding=ft.padding.symmetric(horizontal=16, vertical=10),
+                shape=ft.RoundedRectangleBorder(radius=T.RADIUS_DEFAULT),
+                text_style=label_lg(),
+            )
         ),
     )
 
@@ -792,6 +797,34 @@ def set_clipboard(page: ft.Page, text: str) -> bool:
     return False
 
 
+def schedule_clipboard_read(
+    page: ft.Page, callback: Callable[[Optional[str]], None]
+) -> bool:
+    """OS 클립보드 텍스트를 비동기로 읽고 ``callback(text)`` 로 넘긴다.
+
+    ``text`` 가 None 이면 읽기 실패 또는 미지원.
+    """
+    cb = getattr(page, "clipboard", None)
+    if cb is not None and hasattr(cb, "get"):
+        run_task = getattr(page, "run_task", None)
+        if callable(run_task):
+
+            async def _do() -> None:
+                try:
+                    t = await cb.get()
+                    callback(t if isinstance(t, str) else None)
+                except Exception:
+                    callback(None)
+
+            try:
+                run_task(_do)
+                return True
+            except Exception:
+                pass
+    callback(None)
+    return False
+
+
 # 매우 긴 에러 메시지로 다이얼로그가 폭발하지 않게 자르는 컷오프 (트레이스백 포함).
 _ALERT_DIALOG_MAX_CHARS = 4000
 
@@ -903,7 +936,11 @@ def show_alert(
             ),
             content=body,
             actions=[
-                ft.TextButton(confirm_label, on_click=_on_confirm),
+                ft.TextButton(
+                    confirm_label,
+                    on_click=_on_confirm,
+                    style=button_style_click_cursor(ft.ButtonStyle()),
+                ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
@@ -984,6 +1021,7 @@ __all__ = [
     "ALERT_DETAIL_BOX_HEIGHT",
     "close_active_dialog",
     "set_clipboard",
+    "schedule_clipboard_read",
     "STATUS_OFFLINE",
     "STATUS_IDLE",
     "STATUS_ONLINE",

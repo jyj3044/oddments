@@ -1,4 +1,4 @@
-"""Web Stream 페이지 — WebRTC, HTTPS, 미디어 품질, 시청자, 로그."""
+"""Web Stream 페이지 — WebRTC, HTTPS, 미디어 품질, 시청자."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import threading
 import flet as ft
 
 from ..components import (
-    LogConsole,
     dropdown,
     ensure_file_picker,
     field_label,
@@ -15,14 +14,9 @@ from ..components import (
     section_card,
     set_clipboard,
     show_snack,
-    stream_log_panel,
     text_field,
 )
-from ..log_buffers import get_log_store
-from ..state import (
-    AppState,
-    reset_web_log,
-)
+from ..state import AppState
 from ..theme import (
     StreamMasterTheme as T,
     headline_sm,
@@ -31,30 +25,20 @@ from ..theme import (
     title_md,
 )
 
-# 웹 탭 재진입 시 이전 폴링 스레드를 정리한다. (Flet 0.85 Column 에는 on_mount 가 없음)
-_prev_web_log_ctrl: _WebPageController | None = None
+_prev_web_viewer_ctrl: _WebViewerPoller | None = None
 
 
-class _WebPageController:
+class _WebViewerPoller:
+    """시청 연결 수 표시만 주기적으로 갱신한다."""
+
     def __init__(self, state: AppState) -> None:
         self.state = state
         self.page: ft.Page | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self.log_console: LogConsole | None = None
         self.viewer_count_text: ft.Text | None = None
         self._mounted = False
         self._last_viewer_count: int = -1
-        self._log_cursor: int = 0
-
-    def prefill_log(self) -> None:
-        log = self.log_console
-        if log is None:
-            return
-        snapshot, cursor = get_log_store().web.attach()
-        self._log_cursor = cursor
-        if snapshot:
-            log.append_many(snapshot)
 
     def start(self, page: ft.Page) -> None:
         self.page = page
@@ -83,30 +67,21 @@ class _WebPageController:
         self._thread = None
 
     def _tick(self) -> None:
-        if not self._mounted or self.log_console is None:
+        if not self._mounted or self.viewer_count_text is None:
             return
-        lines, new_cursor = get_log_store().web.read_since(self._log_cursor)
         viewers = int(self.state.get_web_viewer_count())
-        viewers_changed = viewers != self._last_viewer_count
-        if not lines and not viewers_changed:
+        if viewers == self._last_viewer_count:
             return
-        self._log_cursor = new_cursor
+        self._last_viewer_count = viewers
         page = self.page
         if page is None:
             return
 
-        log = self.log_console
         viewer_text = self.viewer_count_text
-        self._last_viewer_count = viewers
 
-        async def _apply(
-            _lines=lines, _viewers=viewers, _changed=viewers_changed
-        ) -> None:
+        async def _apply(_viewers=viewers) -> None:
             try:
-                if _lines and log is not None:
-                    log.append_many(_lines)
-                    log.flush(page)
-                if _changed and viewer_text is not None:
+                if viewer_text is not None:
                     viewer_text.value = str(_viewers)
                     try:
                         viewer_text.update()
@@ -126,14 +101,14 @@ class _WebPageController:
 
 
 def build_web_stream(state: AppState) -> ft.Control:
-    global _prev_web_log_ctrl
+    global _prev_web_viewer_ctrl
 
-    if _prev_web_log_ctrl is not None:
-        _prev_web_log_ctrl.shutdown()
-        _prev_web_log_ctrl = None
+    if _prev_web_viewer_ctrl is not None:
+        _prev_web_viewer_ctrl.shutdown()
+        _prev_web_viewer_ctrl = None
 
     web = state.settings.web
-    ctrl = _WebPageController(state)
+    ctrl = _WebViewerPoller(state)
 
     enable_cb = ft.Checkbox(
         label="웹 송출(WebRTC) 사용",
@@ -369,7 +344,10 @@ def build_web_stream(state: AppState) -> ft.Control:
     )
 
     viewer_count_text = ft.Text(
-        "0", style=headline_sm(), color=T.PRIMARY, weight=ft.FontWeight.BOLD
+        str(int(state.get_web_viewer_count())),
+        style=headline_sm(),
+        color=T.PRIMARY,
+        weight=ft.FontWeight.BOLD,
     )
     viewer_card = ft.Container(
         padding=T.SPACE_MD,
@@ -396,43 +374,7 @@ def build_web_stream(state: AppState) -> ft.Control:
         ),
     )
 
-    autoscroll_cb = ft.Checkbox(
-        label="맨 아래 자동 스크롤",
-        value=True,
-        active_color=T.PRIMARY,
-        label_style=label_md(),
-    )
-
-    btn_web_log_init = outline_button("초기화", on_click=lambda _e: None)
-
-    log_console, log_card = stream_log_panel(
-        title="웹 로그",
-        icon=ft.Icons.TERMINAL,
-        placeholder="뷰어 접속·WebRTC 연결 이벤트가 여기에 표시됩니다.",
-        actions=[
-            autoscroll_cb,
-            btn_web_log_init,
-        ],
-    )
-
-    def _toggle_autoscroll(_e: ft.ControlEvent) -> None:
-        log_console.set_autoscroll(autoscroll_cb.value or False)
-
-    autoscroll_cb.on_change = _toggle_autoscroll
-
-    def _reset_web_log_panel(_e: ft.ControlEvent) -> None:
-        reset_web_log()
-        store = get_log_store()
-        ctrl._log_cursor = store.web.clear()
-        log_console.clear()
-        if log_console.page is not None:
-            log_console.update()
-
-    btn_web_log_init.on_click = _reset_web_log_panel
-
-    ctrl.log_console = log_console
     ctrl.viewer_count_text = viewer_count_text
-    ctrl.prefill_log()
 
     right_column = ft.Column(
         spacing=T.GUTTER,
@@ -453,7 +395,6 @@ def build_web_stream(state: AppState) -> ft.Control:
     page_root = ft.Column(
         controls=[
             top_row,
-            log_card,
         ],
         spacing=T.GUTTER,
         expand=True,
@@ -469,7 +410,7 @@ def build_web_stream(state: AppState) -> ft.Control:
 
     page_root.on_mount = _on_mount  # type: ignore[attr-defined]
 
-    _prev_web_log_ctrl = ctrl
+    _prev_web_viewer_ctrl = ctrl
     page_obj = getattr(state, "page", None)
     if isinstance(page_obj, ft.Page):
         ctrl.start(page_obj)
@@ -576,12 +517,12 @@ def _pick_pem(state: AppState, target: ft.TextField, attr: str) -> None:
         show_snack(page, f"파일 선택기 호출 실패: {exc}", error=True)
 
 
-def shutdown_web_log_poller_if_any() -> None:
-    global _prev_web_log_ctrl
+def shutdown_web_viewer_poller_if_any() -> None:
+    global _prev_web_viewer_ctrl
 
-    if _prev_web_log_ctrl is not None:
-        _prev_web_log_ctrl.shutdown()
-        _prev_web_log_ctrl = None
+    if _prev_web_viewer_ctrl is not None:
+        _prev_web_viewer_ctrl.shutdown()
+        _prev_web_viewer_ctrl = None
 
 
-__all__ = ["build_web_stream", "shutdown_web_log_poller_if_any"]
+__all__ = ["build_web_stream", "shutdown_web_viewer_poller_if_any"]

@@ -1,26 +1,19 @@
-"""OCR Settings 페이지 — 키워드, 전처리 변형, 템플릿, 임계값, 로그."""
+"""OCR Settings 페이지 — 키워드, 전처리 변형, 템플릿, 임계값."""
 
 from __future__ import annotations
-
-import threading
 
 import flet as ft
 
 from ..components import (
-    LogConsole,
     ensure_file_picker,
     outline_button,
     section_card,
     show_snack,
-    stream_log_panel,
     text_field,
 )
-from ..log_buffers import get_log_store
 from ..state import (
     AppState,
     OCR_VARIANT_UI_CHOICES,
-    get_ocr_call_total,
-    reset_ocr_log,
 )
 from ..theme import (
     StreamMasterTheme as T,
@@ -29,109 +22,8 @@ from ..theme import (
     label_md,
 )
 
-# OCR 탭 재진입 시 이전 폴링 스레드 정리. (Flet 0.85 Column 은 on_mount 가 거의 오지 않음)
-_prev_ocr_log_ctrl: _OcrPageController | None = None
-
-class _OcrPageController:
-    def __init__(self, state: AppState) -> None:
-        self.state = state
-        self.page: ft.Page | None = None
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self.log_console: LogConsole | None = None
-        self.stats_text: ft.Text | None = None
-        self._mounted = False
-        self._last_total: int = -1
-        # 중앙 로그 버퍼에서 마지막으로 읽은 절대 인덱스
-        self._log_cursor: int = 0
-
-    def prefill_log(self) -> None:
-        """페이지 빌드 직후 호출. 중앙 버퍼에 누적된 라인을 즉시 LogConsole 에 반영."""
-        log = self.log_console
-        if log is None:
-            return
-        snapshot, cursor = get_log_store().ocr.attach()
-        self._log_cursor = cursor
-        if snapshot:
-            log.append_many(snapshot)
-
-    def start(self, page: ft.Page) -> None:
-        self.page = page
-        self._mounted = True
-        if self._thread is not None:
-            return
-        self._stop.clear()
-
-        def _loop() -> None:
-            while not self._stop.is_set():
-                self._tick()
-                if self._stop.wait(0.2):
-                    return
-
-        self._thread = threading.Thread(
-            target=_loop, name="flet-ocr-log", daemon=True
-        )
-        self._thread.start()
-
-    def shutdown(self) -> None:
-        self._mounted = False
-        self._stop.set()
-        t = self._thread
-        if t is not None and t.is_alive():
-            t.join(timeout=2.0)
-        self._thread = None
-
-    def _tick(self) -> None:
-        if not self._mounted or self.log_console is None:
-            return
-        lines, new_cursor = get_log_store().ocr.read_since(self._log_cursor)
-        total = get_ocr_call_total()
-        counter_changed = total != self._last_total
-        if not lines and not counter_changed:
-            return
-        self._log_cursor = new_cursor
-        self._last_total = total
-        page = self.page
-        if page is None:
-            return
-
-        log = self.log_console
-        stats = self.stats_text
-        stats_value = f"OCR API 완료 호출: {total}회"
-
-        async def _apply(_lines=lines, _stats=stats_value) -> None:
-            try:
-                if _lines and log is not None:
-                    log.append_many(_lines)
-                    log.flush(page)
-                if stats is not None:
-                    stats.value = _stats
-                    try:
-                        stats.update()
-                    except Exception:
-                        pass
-                try:
-                    page.update()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        try:
-            page.run_task(_apply)
-        except Exception:
-            self._mounted = False
-
-
 def build_ocr_settings(state: AppState) -> ft.Control:
-    global _prev_ocr_log_ctrl
-
-    if _prev_ocr_log_ctrl is not None:
-        _prev_ocr_log_ctrl.shutdown()
-        _prev_ocr_log_ctrl = None
-
     det = state.settings.detection
-    ctrl = _OcrPageController(state)
 
     keyword_field = text_field(
         value=det.keywords,
@@ -383,82 +275,17 @@ def build_ocr_settings(state: AppState) -> ft.Control:
     keyword_ocr_cb.on_change = _on_keyword_ocr_change
     _sync_ocr_dependent_ui()
 
-    stats_text = ft.Text(
-        f"OCR API 완료 호출: {get_ocr_call_total()}회",
-        style=body_md(),
-        color=T.ON_SURFACE_VARIANT,
-    )
-    autoscroll_cb = ft.Checkbox(
-        label="맨 아래 자동 스크롤",
-        value=True,
-        active_color=T.PRIMARY,
-        label_style=label_md(),
-    )
-
-    btn_ocr_log_init = outline_button("초기화", on_click=lambda _e: None)
-
-    log_console, log_card = stream_log_panel(
-        title="OCR 로그",
-        placeholder="OCR 로그가 여기에 표시됩니다.",
-        actions=[btn_ocr_log_init],
-        controls_above_console=[
-            ft.Row(
-                spacing=24,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[stats_text, autoscroll_cb],
-            ),
-        ],
-    )
-
-    def _toggle_autoscroll(_e: ft.ControlEvent) -> None:
-        log_console.set_autoscroll(autoscroll_cb.value or False)
-
-    autoscroll_cb.on_change = _toggle_autoscroll
-
-    def _reset_ocr_log_panel(_e: ft.ControlEvent) -> None:
-        reset_ocr_log()
-        store = get_log_store()
-        new_cursor = store.ocr.clear()
-        ctrl._log_cursor = new_cursor
-        log_console.clear()
-        stats_text.value = "OCR API 완료 호출: 0회"
-        if log_console.page is not None:
-            log_console.update()
-        if stats_text.page is not None:
-            try:
-                stats_text.update()
-            except Exception:
-                pass
-
-    btn_ocr_log_init.on_click = _reset_ocr_log_panel
-
-    ctrl.log_console = log_console
-    ctrl.stats_text = stats_text
-    ctrl.prefill_log()
-
     page_root = ft.Column(
         spacing=T.SPACE_LG,
         controls=[
             detection_card,
             variant_card,
             template_card,
-            log_card,
         ],
         expand=True,
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         scroll=ft.ScrollMode.AUTO,
     )
-
-    def _on_mount(e: ft.ControlEvent) -> None:
-        if e.page is not None:
-            ctrl.start(e.page)
-
-    page_root.on_mount = _on_mount  # type: ignore[attr-defined]
-
-    _prev_ocr_log_ctrl = ctrl
-    page_obj = getattr(state, "page", None)
-    if isinstance(page_obj, ft.Page):
-        ctrl.start(page_obj)
 
     return page_root
 
@@ -537,12 +364,4 @@ def _clear_template(
     state._sync_cfg_from_settings()
 
 
-def shutdown_ocr_log_poller_if_any() -> None:
-    global _prev_ocr_log_ctrl
-
-    if _prev_ocr_log_ctrl is not None:
-        _prev_ocr_log_ctrl.shutdown()
-        _prev_ocr_log_ctrl = None
-
-
-__all__ = ["build_ocr_settings", "shutdown_ocr_log_poller_if_any"]
+__all__ = ["build_ocr_settings"]

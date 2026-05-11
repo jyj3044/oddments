@@ -1,4 +1,4 @@
-"""Arduino Link 페이지 — COM 연결, 포커스 제어, 전송 키, 로그."""
+"""Arduino Link 페이지 — COM 연결, 포커스 제어, 전송 키."""
 
 from __future__ import annotations
 
@@ -8,16 +8,13 @@ from typing import Callable
 import flet as ft
 
 from ..components import (
-    LogConsole,
     dropdown,
     field_label,
     outline_button,
     primary_button,
     section_card,
-    stream_log_panel,
     text_field,
 )
-from ..log_buffers import get_log_store
 from ..state import (
     AppState,
     list_com_ports,
@@ -50,23 +47,11 @@ class _ArduinoPageController:
         self.page: ft.Page | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self.log_console: LogConsole | None = None
         self.status_text: ft.Text | None = None
         self.connect_btn: ft.FilledButton | None = None
         self.apply_baud_state = None  # type: ignore[assignment]
         self._last_active: bool | None = None
         self._mounted = False
-        self._log_cursor: int = 0
-
-    def prefill_log(self) -> None:
-        """페이지 빌드 직후 호출. 중앙 버퍼에 누적된 라인을 LogConsole 에 복원."""
-        log = self.log_console
-        if log is None:
-            return
-        snapshot, cursor = get_log_store().arduino.attach()
-        self._log_cursor = cursor
-        if snapshot:
-            log.append_many(snapshot)
 
     def start(self, page: ft.Page) -> None:
         self.page = page
@@ -95,19 +80,16 @@ class _ArduinoPageController:
         self._thread = None
 
     def _tick(self) -> None:
-        if not self._mounted or self.log_console is None:
+        if not self._mounted:
             return
-        all_lines, new_cursor = get_log_store().arduino.read_since(self._log_cursor)
         active = self.state.arduino_active()
         active_changed = active != self._last_active
-        if not all_lines and not active_changed:
+        if not active_changed:
             return
-        self._log_cursor = new_cursor
         page = self.page
         if page is None:
             return
 
-        log = self.log_console
         status = self.status_text
         btn = self.connect_btn
         apply_baud = self.apply_baud_state
@@ -115,15 +97,11 @@ class _ArduinoPageController:
         self._last_active = active
 
         async def _apply(
-            _lines=all_lines,
             _active=active,
             _changed=active_changed,
             _err=err_text,
         ) -> None:
             try:
-                if _lines and log is not None:
-                    log.append_many(_lines)
-                    log.flush(page)
                 if _changed and status is not None:
                     if _active:
                         status.value = "● 연결됨"
@@ -236,6 +214,8 @@ def build_arduino_link(state: AppState) -> ft.Control:
         on_click=lambda _e: _toggle_connect(state, connect_btn, _apply_baud_state),
     )
 
+    status_text = ft.Text("● 미연결", style=label_md(), color=T.ON_SURFACE_VARIANT)
+
     connection_card = section_card(
         title="연결 설정",
         icon=ft.Icons.SETTINGS_INPUT_COMPONENT,
@@ -262,6 +242,7 @@ def build_arduino_link(state: AppState) -> ft.Control:
                         ),
                     ],
                 ),
+                status_text,
             ],
         ),
     )
@@ -471,48 +452,9 @@ def build_arduino_link(state: AppState) -> ft.Control:
         ),
     )
 
-    autoscroll_cb = ft.Checkbox(
-        label="맨 아래 자동 스크롤",
-        value=True,
-        active_color=T.PRIMARY,
-        label_style=label_md(),
-    )
-
-    status_text = ft.Text("● 미연결", style=label_md(), color=T.ON_SURFACE_VARIANT)
-
-    btn_clear_log = outline_button(
-        "로그 비우기", icon=ft.Icons.DELETE_OUTLINE, on_click=lambda _e: None
-    )
-
-    log_console, log_card = stream_log_panel(
-        title="아두이노 로그",
-        icon=ft.Icons.TERMINAL,
-        placeholder="아두이노 로그가 여기에 표시됩니다.",
-        actions=[status_text, btn_clear_log],
-        description="[KB] PC 키 이벤트, [RX] 시리얼 수신, [상태] 알림이 한 창에 표시됩니다.",
-        controls_above_console=[autoscroll_cb],
-    )
-
-    def _toggle_autoscroll(_e: ft.ControlEvent) -> None:
-        log_console.set_autoscroll(autoscroll_cb.value or False)
-
-    autoscroll_cb.on_change = _toggle_autoscroll
-
-    def _clear_log(_e: ft.ControlEvent) -> None:
-        store = get_log_store()
-        ctrl._log_cursor = store.arduino.clear()
-        log_console.clear()
-        if log_console.page is not None:
-            log_console.update()
-
-    btn_clear_log.on_click = _clear_log
-
-    ctrl.log_console = log_console
     ctrl.status_text = status_text
     ctrl.connect_btn = connect_btn
     ctrl.apply_baud_state = _apply_baud_state  # type: ignore[assignment]
-    ctrl.prefill_log()
-
     top_row = ft.Row(
         controls=[
             ft.Container(content=connection_card, expand=True),
@@ -527,7 +469,6 @@ def build_arduino_link(state: AppState) -> ft.Control:
         controls=[
             top_row,
             keys_card,
-            log_card,
         ],
         spacing=T.GUTTER,
         expand=True,

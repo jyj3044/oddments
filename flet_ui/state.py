@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import socket
 import sys
 import threading
@@ -42,6 +43,11 @@ from detection.ocr_diag import (
     get_ocr_call_total,
     reset_ocr_log,
     set_ocr_keyword_alert_sound_handler,
+)
+from streaming.remote_log import (
+    drain_remote_log_lines,
+    log_remote_event,
+    reset_remote_log,
 )
 from streaming.web_log import drain_web_log_lines, log_web_event, reset_web_log
 
@@ -131,6 +137,8 @@ try:
 except ImportError:
     WebStreamServer = None  # type: ignore[assignment]
 
+from streaming.remote_host import RemoteHostServer
+
 APP_NAME = "Oddments"
 SETTINGS_FILENAME = "oddments_settings.json"
 DEFAULT_KEYWORDS = "보스,레드"
@@ -217,6 +225,46 @@ class WindowSettings:
     top: Optional[int] = None
     maximized: bool = False
     dashboard_preview_height: Optional[int] = None
+    # 메인 창 왼쪽 네비게이션 패널 폭(px). None 이면 테마 기본 SIDEBAR_WIDTH.
+    sidebar_width: Optional[int] = None
+    # 원격 뷰어 보조 창 왼쪽 패널 펼침 폭(px). None 이면 코드 초기값.
+    remote_viewer_sidebar_width: Optional[int] = None
+
+
+@dataclass
+class RemoteHostProfile:
+    """원격 제어 호스트(공유 측) 옵션. 캡처·인코딩·리슨은 네이티브 모듈에서 소비."""
+
+    listen_port: int = 49152
+    monitor_index: int = 1
+    stream_fps: int = 30
+    # 비어 있으면 연결 시 비밀번호를 요구하지 않음. 설정 시 클라이언트와 동일해야 한다.
+    auth_token: str = ""
+    # True 이면 호스트 시작 시 NVENC/AMF/VideoToolbox 등을 시도하고, 없으면 libx264 유지.
+    h264_hardware_encode: bool = False
+    # macOS 호스트: CGVirtualDisplay 로 가상 모니터만 송출 (물리 모니터 미송출).
+    use_virtual_display: bool = True
+    # macOS: 원격용 가상 입력 장치 이름 부분 문자열 (예: BlackHole). 비우면 BlackHole 자동 탐색.
+    darwin_audio_input: str = ""
+
+
+@dataclass
+class RemoteClientProfile:
+    """원격 제어 클라이언트(뷰어) 연결 정보."""
+
+    host: str = ""
+    port: int = 49152
+    auth_token: str = ""
+    # 연결 시 /offer 에 실림. 가상 디스플레이 호스트가 이 프리셋으로 모니터를 연다.
+    resolution_preset: str = "host_native"
+    # True 이면 Windows 뷰어→macOS 호스트 시 Ctrl=Control, Win=⌥, Alt=⌘ 로 전송.
+    mac_modifier_remap: bool = False
+
+
+@dataclass
+class RemoteControlSettings:
+    host: RemoteHostProfile = field(default_factory=RemoteHostProfile)
+    client: RemoteClientProfile = field(default_factory=RemoteClientProfile)
 
 
 @dataclass
@@ -226,6 +274,7 @@ class AppSettings:
     web: WebStreamSettings = field(default_factory=WebStreamSettings)
     arduino: ArduinoSettings = field(default_factory=ArduinoSettings)
     window: WindowSettings = field(default_factory=WindowSettings)
+    remote: RemoteControlSettings = field(default_factory=RemoteControlSettings)
     dark_mode: bool = False
 
 
@@ -256,6 +305,10 @@ class AppState:
 
         self._streamer = None
         self._stream_audio_error: str | None = None
+
+        self._remote_host = None
+        # 호스트 시작 실패 시에만 설정. 성공·중지 시 None.
+        self._remote_host_last_error: str | None = None
 
         # 공인 IPv4 조회 결과 캐시(60초). URL 복사 같은 빈번한 호출에서 매번
         # 외부 HTTP 요청을 날리지 않게 한다.
@@ -361,14 +414,86 @@ class AppState:
             win.dashboard_preview_height = _maybe_int(
                 win_d.get("dashboard_preview_height", win.dashboard_preview_height)
             )
+            raw_sw = win_d.get("sidebar_width", win.sidebar_width)
+            if raw_sw is not None:
+                try:
+                    swi = int(raw_sw)
+                except (TypeError, ValueError):
+                    swi = 0
+                if swi > 0:
+                    win.sidebar_width = max(180, min(560, swi))
+            raw_rv = win_d.get(
+                "remote_viewer_sidebar_width", win.remote_viewer_sidebar_width
+            )
+            if raw_rv is not None:
+                try:
+                    rvi = int(raw_rv)
+                except (TypeError, ValueError):
+                    rvi = 0
+                if rvi > 0:
+                    win.remote_viewer_sidebar_width = max(180, min(560, rvi))
 
         self.settings.dark_mode = bool(d.get("dark_mode", self.settings.dark_mode))
+
+        r = d.get("remote_control")
+        if isinstance(r, dict):
+            rh = r.get("host") or {}
+            rc = r.get("client") or {}
+
+            def _safe_u16_port(v: object, default: int) -> int:
+                try:
+                    p = int(v)
+                except (TypeError, ValueError):
+                    p = int(default)
+                return max(1, min(65535, p))
+
+            if isinstance(rh, dict):
+                h = self.settings.remote.host
+                h.listen_port = _safe_u16_port(
+                    rh.get("listen_port", h.listen_port), h.listen_port
+                )
+                try:
+                    h.monitor_index = max(
+                        1, int(rh.get("monitor_index", h.monitor_index) or 1)
+                    )
+                except (TypeError, ValueError):
+                    h.monitor_index = 1
+                try:
+                    h.stream_fps = max(
+                        5, min(60, int(rh.get("stream_fps", h.stream_fps) or 30))
+                    )
+                except (TypeError, ValueError):
+                    h.stream_fps = 30
+                h.auth_token = str(rh.get("auth_token", h.auth_token) or "")
+                h.h264_hardware_encode = bool(
+                    rh.get("h264_hardware_encode", h.h264_hardware_encode)
+                )
+                h.use_virtual_display = bool(
+                    rh.get("use_virtual_display", h.use_virtual_display)
+                )
+                h.darwin_audio_input = str(
+                    rh.get("darwin_audio_input", h.darwin_audio_input) or ""
+                )
+            if isinstance(rc, dict):
+                c = self.settings.remote.client
+                c.host = str(rc.get("host", c.host) or "")
+                c.port = _safe_u16_port(rc.get("port", c.port), c.port)
+                c.auth_token = str(rc.get("auth_token", c.auth_token) or "")
+                c.resolution_preset = str(
+                    rc.get("resolution_preset", c.resolution_preset) or "host_native"
+                )
+                c.mac_modifier_remap = bool(
+                    rc.get("mac_modifier_remap", c.mac_modifier_remap)
+                )
 
     def _serialize_settings_dict(self) -> dict:
         det = self.settings.detection
         cap = self.settings.capture
         web = self.settings.web
         ard = self.settings.arduino
+        rem = self.settings.remote
+        rh = rem.host
+        rc = rem.client
         return {
             "keywords": det.keywords,
             "template_paths": list(det.template_paths),
@@ -400,8 +525,28 @@ class AppState:
                 "top": self.settings.window.top,
                 "maximized": bool(self.settings.window.maximized),
                 "dashboard_preview_height": self.settings.window.dashboard_preview_height,
+                "sidebar_width": self.settings.window.sidebar_width,
+                "remote_viewer_sidebar_width": self.settings.window.remote_viewer_sidebar_width,
             },
             "dark_mode": bool(self.settings.dark_mode),
+            "remote_control": {
+                "host": {
+                    "listen_port": rh.listen_port,
+                    "monitor_index": rh.monitor_index,
+                    "stream_fps": rh.stream_fps,
+                    "auth_token": rh.auth_token,
+                    "h264_hardware_encode": rh.h264_hardware_encode,
+                    "use_virtual_display": rh.use_virtual_display,
+                    "darwin_audio_input": rh.darwin_audio_input,
+                },
+                "client": {
+                    "host": rc.host,
+                    "port": rc.port,
+                    "auth_token": rc.auth_token,
+                    "resolution_preset": rc.resolution_preset,
+                    "mac_modifier_remap": rc.mac_modifier_remap,
+                },
+            },
         }
 
     # ─── 설정 → DetectionConfig 동기화 ────────────────────
@@ -484,7 +629,7 @@ class AppState:
                 self._stream_audio_error = web_streamer.get_audio_error()
                 log_web_event("WebRTC 송출 시작 요청")
             except Exception as exc:  # noqa: BLE001
-                log_web_event(f"WebRTC 시작 실패: {exc}")
+                log_web_event(f"WebRTC 시작 실패: {exc}", error=True)
                 return False, f"웹 송출 시작 실패: {exc}"
 
         def _on_frame(frame: np.ndarray) -> None:
@@ -1033,6 +1178,133 @@ class AppState:
         except Exception:  # noqa: BLE001
             return []
 
+    # ─── 원격 호스트 (WebRTC) ────────────────────────────
+
+    def remote_host_active(self) -> bool:
+        return self._remote_host is not None
+
+    def remote_host_has_start_error(self) -> bool:
+        """송출 중이 아니고 마지막 호스트 시작이 실패한 경우(푸터 오류 표시)."""
+        return self._remote_host is None and self._remote_host_last_error is not None
+
+    def start_remote_host(self) -> tuple[bool, str | None, str | None]:
+        """성공 시 세 번째 값은 macOS 접근성 미허용 안내(있을 때만)."""
+        if self._remote_host is not None:
+            return True, None, None
+        hp = self.settings.remote.host
+        acc_hint: str | None = None
+        try:
+            import sys as _sys
+
+            if _sys.platform == "darwin":
+                from app_platform.darwin_accessibility import (
+                    accessibility_trusted_after_prompt,
+                )
+
+                _trusted, acc_hint = accessibility_trusted_after_prompt()
+                if _trusted:
+                    acc_hint = None
+                else:
+                    try:
+                        msg = (
+                            "원격 호스트: 접근성이 아직 허용되지 않았습니다. "
+                            "원격 마우스·키보드 주입은 설정 후에 동작합니다."
+                        )
+                        if hp.use_virtual_display:
+                            msg += (
+                                " 가상 디스플레이 모드에서는 물리 화면 봉인(전체 오버레이)도 "
+                                "접근성이 허용된 뒤에 표시되는 경우가 많습니다."
+                            )
+                        log_remote_event(msg)
+                    except Exception:
+                        pass
+                    if hp.use_virtual_display and acc_hint:
+                        acc_hint = (
+                            acc_hint
+                            + " (가상 디스플레이) 물리 화면 봉인은 접근성 허용 후 표시됩니다."
+                        )
+        except Exception:
+            acc_hint = None
+        try:
+            if _sys.platform == "darwin":
+                from app_platform.darwin_compat import remote_host_macos_version_ok
+
+                ok_ver, ver_msg = remote_host_macos_version_ok()
+                if not ok_ver:
+                    raise RuntimeError(ver_msg)
+                if not (hp.auth_token or "").strip():
+                    if os.environ.get("MAPLE_REMOTE_ALLOW_NO_PASSWORD") != "1":
+                        raise RuntimeError(
+                            "맥 호스트는 연결 비밀번호가 필요합니다. "
+                            "설정에 입력하거나 개발용으로 환경변수 "
+                            "MAPLE_REMOTE_ALLOW_NO_PASSWORD=1 을 사용하세요."
+                        )
+            vd = bool(hp.use_virtual_display) if _sys.platform == "darwin" else False
+
+            seal_ui_runner = None
+            if _sys.platform == "darwin" and vd:
+
+                def seal_ui_runner(fn: Callable[[], None]) -> None:
+                    # NSWindow 는 AppKit 메인 스레드에서만 안전. Flet ``run_task`` 코루틴은
+                    # 그 보장이 없어 봉인이 안 뜨거나 무시될 수 있음 → 항상 CF 메인 루프로 보냄.
+                    from app_platform.darwin_remote_seal import _schedule_on_main
+
+                    _schedule_on_main(fn)
+
+            srv = RemoteHostServer(
+                host="0.0.0.0",
+                port=hp.listen_port,
+                fps=float(hp.stream_fps),
+                monitor_index=hp.monitor_index,
+                auth_token=hp.auth_token,
+                h264_hardware_encode=hp.h264_hardware_encode,
+                virtual_display_enabled=vd,
+                darwin_audio_device=hp.darwin_audio_input,
+                seal_ui_runner=seal_ui_runner,
+            )
+            srv.start()
+            self._remote_host = srv
+            self._remote_host_last_error = None
+            try:
+                log_remote_event(
+                    f"원격 호스트: 시작됨 (포트 {hp.listen_port}, 첫 연결 시 캡처)"
+                )
+            except Exception:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log_remote_event(f"원격 호스트: 시작 실패 — {exc}", error=True)
+            except Exception:
+                pass
+            self._remote_host_last_error = str(exc)
+            self._notify_state()
+            return False, str(exc), None
+        self._notify_state()
+        return True, None, acc_hint
+
+    def stop_remote_host(self) -> None:
+        srv = self._remote_host
+        self._remote_host = None
+        self._remote_host_last_error = None
+        if srv is not None:
+            try:
+                log_remote_event("원격 호스트: 송출 종료")
+            except Exception:
+                pass
+            try:
+                srv.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from streaming.h264_hw_patch import install_h264_hardware_encoder
+
+            install_h264_hardware_encoder(
+                enabled=self.settings.remote.host.h264_hardware_encode
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._notify_state()
+
     # ─── 종료 ─────────────────────────────────────────────
 
     def shutdown(self) -> None:
@@ -1040,6 +1312,7 @@ class AppState:
             self.save()
         except Exception:  # noqa: BLE001
             pass
+        self.stop_remote_host()
         self.stop_capture(blocking=True)
         try:
             self.arduino_disconnect()
@@ -1054,6 +1327,9 @@ class AppState:
 __all__ = [
     "AppState",
     "AppSettings",
+    "RemoteControlSettings",
+    "RemoteHostProfile",
+    "RemoteClientProfile",
     "ArduinoSettings",
     "WebStreamSettings",
     "CaptureSettings",
@@ -1062,8 +1338,11 @@ __all__ = [
     "drain_ocr_log_lines",
     "get_ocr_call_total",
     "reset_ocr_log",
+    "drain_remote_log_lines",
     "drain_web_log_lines",
+    "log_remote_event",
     "log_web_event",
+    "reset_remote_log",
     "reset_web_log",
     "list_com_ports",
     "drain_received_serial_lines",
