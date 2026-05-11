@@ -72,7 +72,7 @@ class RemoteViewerSession:
         *,
         signal_host: str,
         signal_port: int,
-        rtc_configuration: RTCConfiguration,
+        rtc_configuration: RTCConfiguration | None = None,
         on_frame: OnFrame,
         on_state: OnState | None = None,
         on_dc_json: OnDcJson | None = None,
@@ -81,7 +81,9 @@ class RemoteViewerSession:
     ) -> None:
         self._host = (signal_host or "").strip() or "127.0.0.1"
         self._port = int(signal_port)
-        self._rtc_configuration = rtc_configuration
+        self._rtc_configuration = rtc_configuration or RTCConfiguration(
+            iceServers=[]
+        )
         self._on_frame = on_frame
         self._on_state = on_state
         self._on_dc_json = on_dc_json
@@ -377,7 +379,7 @@ def run_session_in_thread(
     *,
     signal_host: str,
     signal_port: int,
-    rtc_configuration: RTCConfiguration,
+    rtc_configuration: RTCConfiguration | None = None,
     on_frame: OnFrame,
     on_state: OnState | None = None,
     on_dc_json: OnDcJson | None = None,
