@@ -378,7 +378,7 @@ def build_logs(state: AppState) -> ft.Control:
         icon=ft.Icons.BUG_REPORT_OUTLINED,
         placeholder=(
             "전역 예외·asyncio 경고·세그폴트 직전 스택은 "
-            "logs/app_error-*.log · logs/python-faulthandler-*.log 에도 남습니다."
+            "logs/app_error-*.log · logs/crash-*.log · logs/python-faulthandler-*.log 에도 남습니다."
         ),
         actions=[autoscroll_app, btn_app_clear],
     )

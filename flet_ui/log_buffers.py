@@ -10,6 +10,8 @@
   ``WARN``/``ERROR``/``CRITICAL`` 은 메모리 ``app`` 버퍼에도 넣어 Log 페이지 「앱」 탭에 표시한다.
 * ``faulthandler`` 는 ``logs/python-faulthandler-YYYYMMDD.log`` 에 덤프한다(세그폴트 등 네이티브 크래시 시
   Python 스택 추적에 도움; ``excepthook`` 으로는 잡히지 않는다).
+* ``crash_diagnostics`` 는 미처리 예외·Flet 오류·UI 행 의심 시 ``logs/crash-YYYYMMDD.log`` 에
+  상세 스택과 프로세스 정보를 남긴다.
 * 1시간마다 ``LOG_RETENTION_DAYS`` (기본 2일) 보다 오래된 로그 파일 자동 삭제.
 
 페이지(``page_ocr``, ``page_arduino``, ``page_web``) 들은 더 이상 소스 큐를

@@ -156,8 +156,14 @@ class _DashboardController:
             return
         try:
             page.run_task(coro_factory)  # type: ignore[arg-type]
-        except Exception:
+        except Exception as exc:
             self._mounted = False
+            try:
+                from ..crash_diagnostics import log_swallowed
+
+                log_swallowed("dashboard_preview", exc, context="page.run_task")
+            except Exception:
+                pass
 
     async def _flush_preview_frames(self) -> None:
         page = self.page
@@ -178,8 +184,13 @@ class _DashboardController:
                     img.src = data
                     img.visible = True
                     img.update()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    try:
+                        from ..crash_diagnostics import log_swallowed
+
+                        log_swallowed("dashboard_preview", exc, context="preview image update")
+                    except Exception:
+                        pass
                 await asyncio.sleep(0)
         finally:
             self._preview_flush_scheduled[0] = False
@@ -190,8 +201,14 @@ class _DashboardController:
                 self._preview_flush_scheduled[0] = True
                 try:
                     pg2.run_task(self._flush_preview_frames)
-                except Exception:
+                except Exception as exc:
                     self._preview_flush_scheduled[0] = False
+                    try:
+                        from ..crash_diagnostics import log_swallowed
+
+                        log_swallowed("dashboard_preview", exc, context="reschedule flush")
+                    except Exception:
+                        pass
 
     def _tick(self) -> None:
         img = self._preview_image
@@ -239,8 +256,14 @@ class _DashboardController:
             return
         try:
             pg.run_task(self._flush_preview_frames)
-        except Exception:
+        except Exception as exc:
             self._preview_flush_scheduled[0] = False
+            try:
+                from ..crash_diagnostics import log_swallowed
+
+                log_swallowed("dashboard_preview", exc, context="schedule flush")
+            except Exception:
+                pass
 
 
 def build_dashboard(state: AppState) -> ft.Control:

@@ -171,15 +171,19 @@ def _win32_foreground_hwnd() -> int | None:
         return None
 
 
+def _settings_base_dir() -> Path:
+    """설정 JSON 기준 폴더. PyInstaller 등 동결 빌드는 exe 위치(시작 메뉴 실행 시 cwd 와 무관)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd()
+
+
 def _settings_path() -> Path:
-    base = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", False) else Path.cwd()
-    if base and base.exists():
-        return base / SETTINGS_FILENAME
-    return Path.cwd() / SETTINGS_FILENAME
+    return _settings_base_dir() / SETTINGS_FILENAME
 
 
 def _writable_settings_path() -> Path:
-    return Path.cwd() / SETTINGS_FILENAME
+    return _settings_base_dir() / SETTINGS_FILENAME
 
 
 @dataclass
@@ -814,6 +818,16 @@ class AppState:
                 )
             except Exception as exc:  # noqa: BLE001
                 triggered, reason = False, f"감지 오류: {exc}"
+                try:
+                    from flet_ui.crash_diagnostics import record_exception
+
+                    record_exception(
+                        "detection",
+                        f"OCR/감지 루프 오류: {exc}",
+                        exc=exc,
+                    )
+                except Exception:
+                    pass
             self._last_triggered = triggered
             self._last_reason = reason
             if triggered:
