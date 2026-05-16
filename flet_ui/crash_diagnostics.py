@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -45,6 +46,7 @@ _prev_excepthook: Any = None
 _prev_thread_hook: Any = None
 _prev_unraisable: Any = None
 _prev_signal_handlers: dict[int, Any] = {}
+_prev_showwarning: Any = None
 
 
 def _crash_log_dir() -> Path:
@@ -267,6 +269,53 @@ def _on_signal(signum: int, frame) -> None:
         raise SystemExit(128 + signum)
 
 
+def _warning_level(category: type[Warning], message: str) -> str:
+    msg = str(message)
+    if issubclass(category, RuntimeWarning):
+        if "never awaited" in msg or "wasn't awaited" in msg:
+            return "ERROR"
+        return "WARN"
+    if issubclass(category, (DeprecationWarning, PendingDeprecationWarning)):
+        return "INFO"
+    if issubclass(category, UserWarning):
+        return "WARN"
+    return "WARN"
+
+
+def _on_showwarning(
+    message: Warning | str,
+    category: type[Warning],
+    filename: str,
+    lineno: int,
+    file: Any = None,
+    line: str | None = None,
+) -> None:
+    try:
+        lvl = _warning_level(category, str(message))
+        loc = f"{filename}:{lineno}"
+        detail = loc
+        if line:
+            detail = f"{loc}\n{line.rstrip()}"
+        record_exception(
+            "python_warning",
+            f"{category.__name__}: {message}",
+            detail=detail,
+            level=lvl,
+        )
+    except Exception:
+        pass
+    if _prev_showwarning is not None:
+        try:
+            _prev_showwarning(message, category, filename, lineno, file, line)
+        except Exception:
+            pass
+    else:
+        try:
+            sys.stderr.write(warnings.formatwarning(message, category, filename, lineno, line))
+        except Exception:
+            pass
+
+
 def _on_atexit() -> None:
     try:
         _append_crash_file(
@@ -318,6 +367,7 @@ def _stop_watchdog() -> None:
 def install_process_crash_handlers() -> None:
     """Flet 창이 뜨기 전에 호출. 프로세스 수명 동안 한 번만 설치된다."""
     global _process_installed, _prev_excepthook, _prev_thread_hook, _prev_unraisable
+    global _prev_showwarning
     with _install_lock:
         if _process_installed:
             return
@@ -327,6 +377,10 @@ def install_process_crash_handlers() -> None:
             get_log_store()
         except Exception:
             pass
+        _prev_showwarning = warnings.showwarning
+        warnings.showwarning = _on_showwarning  # type: ignore[assignment]
+        # ``coroutine was never awaited`` 등 RuntimeWarning 이 기본 필터에 걸리지 않게.
+        warnings.filterwarnings("default", category=RuntimeWarning)
         _prev_excepthook = sys.excepthook
         sys.excepthook = _on_sys_excepthook
         if hasattr(threading, "excepthook"):
@@ -363,11 +417,22 @@ def attach_flet_page(
     touch_ui_heartbeat()
     _start_watchdog()
 
+    def _is_benign_flet_ui_error(message: str) -> bool:
+        m = message.lower()
+        if "session closed" in m or "control must be added to the page" in m:
+            return True
+        if "rangeerror" in m and "not in inclusive range" in m:
+            return True
+        return False
+
     def _on_page_error(e: Any) -> None:
         data = getattr(e, "data", None) or "알 수 없는 오류"
-        first_line = str(data).strip().splitlines()[:1]
-        head = first_line[0] if first_line else str(data)
-        record_exception("flet", head, detail=str(data))
+        text = str(data)
+        if _is_benign_flet_ui_error(text):
+            return
+        first_line = text.strip().splitlines()[:1]
+        head = first_line[0] if first_line else text
+        record_exception("flet", head, detail=text)
 
     try:
         page.on_error = _on_page_error  # type: ignore[attr-defined]

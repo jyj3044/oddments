@@ -6,7 +6,7 @@ import threading
 
 import flet as ft
 
-from ..components import LogConsole, outline_button, stream_log_panel
+from ..components import LogConsole, _is_flet_detach_error, outline_button, stream_log_panel
 from ..log_buffers import get_log_store, reset_app_log
 from ..state import (
     AppState,
@@ -27,7 +27,6 @@ _prev_logs_ctrl: _LogsHubController | None = None
 
 # Log 페이지 탭 선택 (세션 메모리만, 설정 저장 안 함)
 _LOG_PAGE_SELECTED_TAB_INDEX: int = 0
-
 
 class _LogsHubController:
     """네 종류 로그 버퍼를 한 스레드에서 폴링한다."""
@@ -52,6 +51,8 @@ class _LogsHubController:
         self._cur_app = 0
         self._last_ocr_total: int = -1
         self._last_viewers: int = -1
+        self._hub_gen = 0
+        self._apply_pending = False
 
     def prefill_all(self) -> None:
         store = get_log_store()
@@ -91,7 +92,7 @@ class _LogsHubController:
         def _loop() -> None:
             while not self._stop.is_set():
                 self._tick()
-                if self._stop.wait(0.2):
+                if self._stop.wait(0.25):
                     return
 
         self._thread = threading.Thread(
@@ -99,16 +100,54 @@ class _LogsHubController:
         )
         self._thread.start()
 
+    def _detach_log_consoles(self) -> None:
+        for log in (
+            self.log_ocr,
+            self.log_arduino,
+            self.log_web,
+            self.log_remote,
+            self.log_app,
+        ):
+            if log is not None:
+                try:
+                    log.detach()
+                except Exception:
+                    pass
+        self.log_ocr = None
+        self.log_arduino = None
+        self.log_web = None
+        self.log_remote = None
+        self.log_app = None
+        self.stats_ocr = None
+        self.viewer_web = None
+
     def shutdown(self) -> None:
         self._mounted = False
+        self._apply_pending = False
+        self._hub_gen += 1
+        self._detach_log_consoles()
+        self.page = None
         self._stop.set()
         t = self._thread
         if t is not None and t.is_alive():
             t.join(timeout=2.0)
         self._thread = None
 
+    @staticmethod
+    def _safe_page_update(page: ft.Page) -> None:
+        try:
+            page.update()
+        except Exception as exc:
+            if not _is_flet_detach_error(exc):
+                try:
+                    from ..crash_diagnostics import log_swallowed
+
+                    log_swallowed("logs_hub", exc, context="page.update")
+                except Exception:
+                    pass
+
     def _tick(self) -> None:
-        if not self._mounted:
+        if not self._mounted or self._apply_pending:
             return
         page = self.page
         if page is None:
@@ -142,6 +181,7 @@ class _LogsHubController:
 
         lo, la, lw, lr, lapp = lines_o, lines_a, lines_w, lines_r, lines_app
         stats_val = f"OCR API 완료 호출: {total}회"
+        hub_gen = self._hub_gen
 
         async def _apply(
             _lo=lo,
@@ -153,45 +193,71 @@ class _LogsHubController:
             _vw=viewers,
             _vw_ch=vw_chg,
             _ocr_sc=ocr_stat_chg,
+            _gen=hub_gen,
         ) -> None:
+            if not self._mounted or _gen != self._hub_gen:
+                return
+
+            def _still_here() -> bool:
+                return bool(self._mounted) and _gen == self._hub_gen
+
+            updated: list[LogConsole] = []
+
+            def _push(console: LogConsole | None, batch: list[str]) -> None:
+                if not batch or console is None or not _still_here():
+                    return
+                console.append_many(batch)
+                updated.append(console)
+
             try:
-                if _lo and self.log_ocr:
-                    self.log_ocr.append_many(_lo)
-                    self.log_ocr.flush(page)
-                if _la and self.log_arduino:
-                    self.log_arduino.append_many(_la)
-                    self.log_arduino.flush(page)
-                if _lw and self.log_web:
-                    self.log_web.append_many(_lw)
-                    self.log_web.flush(page)
-                if _lr and self.log_remote:
-                    self.log_remote.append_many(_lr)
-                    self.log_remote.flush(page)
-                if _lapp and self.log_app:
-                    self.log_app.append_many(_lapp)
-                    self.log_app.flush(page)
-                if _ocr_sc and self.stats_ocr:
+                _push(self.log_ocr, _lo)
+                _push(self.log_arduino, _la)
+                _push(self.log_web, _lw)
+                _push(self.log_remote, _lr)
+                _push(self.log_app, _lapp)
+                if not _still_here():
+                    return
+                if _ocr_sc and self.stats_ocr is not None:
                     self.stats_ocr.value = _stats
-                    try:
-                        self.stats_ocr.update()
-                    except Exception:
-                        pass
-                if _vw_ch and self.viewer_web:
+                if _vw_ch and self.viewer_web is not None:
                     self.viewer_web.value = str(_vw)
+                self._safe_page_update(page)
+                if _still_here() and updated:
+                    consoles = [
+                        self.log_ocr,
+                        self.log_arduino,
+                        self.log_web,
+                        self.log_remote,
+                        self.log_app,
+                    ]
+                    idx = max(0, min(len(consoles) - 1, _LOG_PAGE_SELECTED_TAB_INDEX))
+                    visible = consoles[idx]
+                    if visible is not None and visible in updated:
+                        await visible.snap_to_bottom(alive=_still_here)
+            except Exception as exc:
+                if not _is_flet_detach_error(exc):
                     try:
-                        self.viewer_web.update()
+                        from ..crash_diagnostics import log_swallowed
+
+                        log_swallowed("logs_hub", exc, context="apply")
                     except Exception:
                         pass
+            finally:
+                self._apply_pending = False
                 try:
-                    page.update()
+                    from ..crash_diagnostics import touch_ui_heartbeat
+
+                    touch_ui_heartbeat()
                 except Exception:
                     pass
-            except Exception:
-                pass
 
+        if not self._mounted:
+            return
+        self._apply_pending = True
         try:
             page.run_task(_apply)
         except Exception:
+            self._apply_pending = False
             self._mounted = False
 
 
@@ -405,6 +471,29 @@ def build_logs(state: AppState) -> ft.Control:
     ctrl.stats_ocr = stats_ocr
     ctrl.viewer_web = viewer_web
     ctrl.prefill_all()
+    page_obj = getattr(state, "page", None)
+    if isinstance(page_obj, ft.Page):
+        _prefill_gen = ctrl._hub_gen
+        _logs = (log_ocr, log_arduino, log_web, log_remote, log_app)
+
+        def _prefill_alive() -> bool:
+            return bool(ctrl._mounted) and ctrl._hub_gen == _prefill_gen
+
+        async def _prefill_show() -> None:
+            if not _prefill_alive():
+                return
+            _LogsHubController._safe_page_update(page_obj)
+            if not _prefill_alive():
+                return
+            idx = max(0, min(len(_logs) - 1, _LOG_PAGE_SELECTED_TAB_INDEX))
+            c = _logs[idx]
+            if c is not None:
+                await c.snap_to_bottom(alive=_prefill_alive)
+
+        try:
+            page_obj.run_task(_prefill_show)
+        except Exception:
+            _LogsHubController._safe_page_update(page_obj)
 
     tab_ocr = ft.Container(
         expand=True,
@@ -461,8 +550,24 @@ def build_logs(state: AppState) -> ft.Control:
             idx = int(e.data)
         except (TypeError, ValueError):
             return
-        if 0 <= idx < _tab_count:
-            _LOG_PAGE_SELECTED_TAB_INDEX = idx
+        if not (0 <= idx < _tab_count):
+            return
+        _LOG_PAGE_SELECTED_TAB_INDEX = idx
+        consoles = (log_ocr, log_arduino, log_web, log_remote, log_app)
+        c = consoles[idx]
+        pg = getattr(state, "page", None)
+        if c is None or not isinstance(pg, ft.Page):
+            return
+
+        async def _snap_tab() -> None:
+            if not ctrl._mounted:
+                return
+            await c.snap_to_bottom(alive=lambda: ctrl._mounted)
+
+        try:
+            pg.run_task(_snap_tab)
+        except Exception:
+            pass
 
     tabs = ft.Tabs(
         length=_tab_count,
@@ -523,7 +628,6 @@ def build_logs(state: AppState) -> ft.Control:
     page_root.on_mount = _on_mount  # type: ignore[attr-defined]
 
     _prev_logs_ctrl = ctrl
-    page_obj = getattr(state, "page", None)
     if isinstance(page_obj, ft.Page):
         ctrl.start(page_obj)
 

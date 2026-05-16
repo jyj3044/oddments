@@ -264,53 +264,78 @@ def stat_chip(text: str) -> ft.Container:
     )
 
 
+_LOG_CONSOLE_FONT = "Consolas, 'Cascadia Mono', 'Courier New', monospace"
+_LOG_CONSOLE_PLACEHOLDER_FG = "#888888"
+# 맨 아래에 붙어 있을 때로 간주하는 여유(px). ``tail -f`` 처럼 살짝 위로 올려도 따라감.
+_LOG_STICK_BOTTOM_THRESHOLD = 48.0
+# Flet ``auto_scroll`` 기본 ``scroll_interval``(10ms) 은 단계적으로 내려가 애니메이션처럼 보인다.
+_LOG_CONSOLE_SCROLL_INTERVAL = 0
+
+
+def _is_flet_detach_error(exc: BaseException) -> bool:
+    """페이지에서 제거된 컨트롤에 ``update``/``scroll_to`` 할 때 나는 예상 오류."""
+    msg = str(exc).lower()
+    if "session closed" in msg or "control must be added to the page" in msg:
+        return True
+    if "rangeerror" in msg or "not in inclusive range" in msg:
+        return True
+    return False
+
+
+def _is_scroll_alive(alive: Optional[Callable[[], bool]]) -> bool:
+    if alive is not None and not alive():
+        return False
+    return True
+
+
 class LogConsole(ft.Container):
     """등폭 글꼴·검정 계열 배경의 스크롤 가능한 로그 패널.
 
-    - ``append(line)`` / ``append_many(lines)`` 로 한 줄/여러 줄 추가, 일정 줄 수 초과
-      시 앞쪽 자동 트림.
-    - ``clear()`` 로 텍스트만 비움.
-    - 가로는 부모에서 ``expand=True`` 로 영역을 채운다.
-    - 줄 앞에 ``LOG_CONSOLE_ALERT_PREFIX`` sentinel 이 붙은 라인은 자동으로 strip 하고
-      해당 줄만 ``LOG_CONSOLE_ALERT_COLOR`` (밝은 빨강) 으로 강조 표시한다.
+    - ``append`` / ``append_many`` 로 spans 만 갱신(IPC 없음).
+    - 화면 반영은 호출 측 ``page.update()`` 한 번으로 묶는다.
+    - 맨 아래 따라가기는 ``scroll_to(offset=-1, duration=0)`` 로 즉시 이동한다.
+      (``auto_scroll`` 은 자식 추가 시만 동작해 단일 ``Text`` spans 갱신에는 쓰지 않음.)
+    - 위로 스크롤해 읽는 동안에는 자동 따라가기를 멈춘다.
     """
 
     def __init__(
         self,
         *,
         height: int = 256,
-        # 메모리 보호를 위해 화면에 유지할 최대 줄 수.
-        # 영속화된 전체 기록은 ``flet_ui.log_buffers`` 의 파일 로그를 참고할 것.
         max_lines: int = 500,
         autoscroll: bool = True,
         placeholder: str = "",
         expand: bool = True,
     ) -> None:
-        # 각 항목: (텍스트, 강조색 또는 None)
         self._lines: list[tuple[str, Optional[str]]] = []
         self._max_lines = max_lines
         self._autoscroll = autoscroll
         self._placeholder = placeholder
+        self._placeholder_active = bool(placeholder)
+        self._stick_bottom = True
+        self._programmatic_scroll = False
+        self._attached = True
 
-        # spans 기반: 줄별로 다른 색상을 적용할 수 있도록 ft.TextSpan 컬렉션을 쓴다.
-        # placeholder 는 spans 가 비었을 때 보여줄 단일 span 으로 갱신한다.
         self._text = ft.Text(
-            spans=[ft.TextSpan(text=placeholder)] if placeholder else [],
+            spans=(
+                [ft.TextSpan(text=placeholder, style=ft.TextStyle(color=_LOG_CONSOLE_PLACEHOLDER_FG))]
+                if placeholder
+                else []
+            ),
             selectable=True,
-            font_family="Consolas, 'Cascadia Mono', 'Courier New', monospace",
+            font_family=_LOG_CONSOLE_FONT,
             size=12,
             color=LOG_CONSOLE_FG,
         )
-        # ListView.auto_scroll 은 자식 컨트롤이 추가·삭제될 때만 동작하고,
-        # 단일 Text 의 value 만 바뀌면 스크롤이 내려가지 않는다. Column + scroll_to 로 처리한다.
-        # NOTE: ``Column.scroll`` 은 ``ScrollMode`` 만 받는다. 스크롤바 비주얼은 외곽
-        # 컨테이너에 부여한 ``_LOG_CONSOLE_SCROLLBAR_THEME`` 에서 처리한다.
         self._scroll_host = ft.Column(
             controls=[self._text],
             spacing=0,
             tight=True,
             scroll=ft.ScrollMode.AUTO,
+            auto_scroll=False,
+            scroll_interval=_LOG_CONSOLE_SCROLL_INTERVAL,
             expand=True,
+            on_scroll=self._on_scroll,
         )
         scroll_body = ft.Container(
             content=self._scroll_host,
@@ -333,94 +358,159 @@ class LogConsole(ft.Container):
 
     @staticmethod
     def _normalize(line: str) -> str:
-        # 큐의 라인은 trailing ``\n`` 으로 끝나는 경우가 많아 spans 결합 시 빈 줄이
-        # 생기지 않도록 정리한다.
         return line.rstrip("\r\n")
+
+    def _is_live(self) -> bool:
+        # 트리에서 빠진 뒤에도 ``page`` 참조가 잠깐 남을 수 있어 ``_attached`` 만 본다.
+        return self._attached
+
+    def detach(self) -> None:
+        """탭 이탈·페이지 재빌드 시 호출 — 이후 update/scroll 을 막는다."""
+        self._attached = False
+        try:
+            self._scroll_host.auto_scroll = False
+        except Exception:
+            pass
+
+    def _span_for_line(self, text: str, color: Optional[str], *, leading_newline: bool) -> list[ft.TextSpan]:
+        out: list[ft.TextSpan] = []
+        if leading_newline:
+            out.append(ft.TextSpan(text="\n"))
+        if color is not None:
+            out.append(ft.TextSpan(text=text, style=ft.TextStyle(color=color)))
+        else:
+            out.append(ft.TextSpan(text=text))
+        return out
 
     def _rebuild_text(self) -> None:
         if not self._lines:
             self._text.spans = (
-                [ft.TextSpan(text=self._placeholder)] if self._placeholder else []
+                [
+                    ft.TextSpan(
+                        text=self._placeholder,
+                        style=ft.TextStyle(color=_LOG_CONSOLE_PLACEHOLDER_FG),
+                    )
+                ]
+                if self._placeholder
+                else []
             )
+            self._placeholder_active = bool(self._placeholder)
             return
+        self._placeholder_active = False
         spans: list[ft.TextSpan] = []
         for i, (text, color) in enumerate(self._lines):
-            if i > 0:
-                spans.append(ft.TextSpan(text="\n"))
-            if color is not None:
-                spans.append(
-                    ft.TextSpan(text=text, style=ft.TextStyle(color=color))
-                )
-            else:
-                spans.append(ft.TextSpan(text=text))
+            spans.extend(self._span_for_line(text, color, leading_newline=(i > 0)))
         self._text.spans = spans
+
+    def _drop_placeholder(self) -> None:
+        if self._placeholder_active:
+            self._text.spans = []
+            self._placeholder_active = False
+
+    def _trim_lines(self) -> bool:
+        excess = len(self._lines) - self._max_lines
+        if excess <= 0:
+            return False
+        self._lines = self._lines[-self._max_lines :]
+        self._rebuild_text()
+        return True
+
+    def _append_line(self, text: str, color: Optional[str]) -> None:
+        self._drop_placeholder()
+        leading = bool(self._lines)
+        self._lines.append((text, color))
+        if not self._trim_lines():
+            self._text.spans.extend(
+                self._span_for_line(text, color, leading_newline=leading)
+            )
+
+    def _on_scroll(self, e: ft.OnScrollEvent) -> None:
+        if self._programmatic_scroll or not self._autoscroll:
+            return
+        max_ext = float(e.max_scroll_extent or 0.0)
+        px = float(e.pixels or 0.0)
+        if max_ext <= 1.0:
+            stick = True
+        else:
+            stick = px >= max_ext - _LOG_STICK_BOTTOM_THRESHOLD
+        if stick != self._stick_bottom:
+            self._stick_bottom = stick
+            self.sync_autoscroll()
 
     def set_autoscroll(self, on: bool) -> None:
         self._autoscroll = bool(on)
+        if on:
+            self._stick_bottom = True
+        self.sync_autoscroll()
+
+    def sync_autoscroll(self) -> None:
+        """호환용 no-op — 실제 따라가기는 ``snap_to_bottom``."""
+        return
+
+    async def snap_to_bottom(
+        self, *, alive: Optional[Callable[[], bool]] = None
+    ) -> None:
+        """레이아웃 반영 후 맨 아래로 즉시 점프(``duration=0``)."""
+        if not _is_scroll_alive(alive) or not self._is_live():
+            return
+        if not (self._autoscroll and self._stick_bottom):
+            return
+        self._programmatic_scroll = True
+        try:
+            import asyncio
+
+            try:
+                await asyncio.sleep(0)
+            except Exception:
+                pass
+            if (
+                not _is_scroll_alive(alive)
+                or not self._is_live()
+                or not (self._autoscroll and self._stick_bottom)
+            ):
+                return
+            ret = self._scroll_host.scroll_to(offset=-1, duration=0)
+            if ret is not None and hasattr(ret, "__await__"):
+                await ret  # type: ignore[misc]
+        except Exception as exc:
+            if _is_flet_detach_error(exc):
+                self.detach()
+        finally:
+            self._programmatic_scroll = False
 
     def append(self, line: str, *, color: Optional[str] = None) -> None:
+        if not self._is_live():
+            return
         text = self._normalize(line)
         if color is None:
             text, color = _split_alert_line(text)
-        self._lines.append((text, color))
-        if len(self._lines) > self._max_lines:
-            self._lines = self._lines[-self._max_lines:]
-        self._rebuild_text()
+        self._append_line(text, color)
 
     def append_many(self, lines: Iterable[str]) -> None:
+        if not self._is_live():
+            return
         for raw in lines:
             text = self._normalize(raw)
             text, color = _split_alert_line(text)
-            self._lines.append((text, color))
-        if len(self._lines) > self._max_lines:
-            self._lines = self._lines[-self._max_lines:]
-        self._rebuild_text()
+            self._append_line(text, color)
 
     def clear(self) -> None:
         self._lines = []
         self._rebuild_text()
+        self._stick_bottom = True
+        self.sync_autoscroll()
 
     def flush(self, page: Optional[ft.Page] = None) -> None:
-        """내부 ``_text`` 까지 갱신하고, 맨 아래 자동 스크롤이 켜져 있으면 스크롤을 맨 끝으로 보낸다.
+        """``auto_scroll`` 플래그만 맞춘다. 그리기는 ``page.update()`` 에 맡긴다."""
+        del page
+        self.sync_autoscroll()
 
-        Flet 에서는 레이아웃 반영 후 스크롤을 걸어야 하므로 ``page`` 가 있을 때만
-        ``scroll_to`` 를 예약한다. ``scroll_to`` 는 Flet 0.85 에서 동기 메서드라
-        await 하면 ``TypeError`` 가 나는 변종이 있어, awaitable 인 경우에만 await 한다.
-        """
-        try:
-            self._text.update()
-        except Exception:
-            pass
-        try:
-            self.update()
-        except Exception:
-            pass
-        if page is None or not self._autoscroll:
+    async def flush_async(
+        self, *, alive: Optional[Callable[[], bool]] = None
+    ) -> None:
+        if not _is_scroll_alive(alive) or not self._is_live():
             return
-
-        async def _scroll_bottom() -> None:
-            try:
-                # 텍스트 갱신과 레이아웃 반영을 한 프레임 양보해 둔다.
-                import asyncio
-                try:
-                    await asyncio.sleep(0)
-                except Exception:
-                    pass
-                ret = self._scroll_host.scroll_to(offset=-1, duration=0)
-                # Flet 변종에 따라 sync(None) / coroutine 모두 가능.
-                if ret is not None and hasattr(ret, "__await__"):
-                    await ret
-            except Exception:
-                pass
-
-        try:
-            page.run_task(_scroll_bottom)
-        except Exception:
-            # run_task 자체가 안되는 환경에서는 sync 시도 폴백.
-            try:
-                self._scroll_host.scroll_to(offset=-1, duration=0)
-            except Exception:
-                pass
+        self.sync_autoscroll()
 
 
 def make_vertical_resize_handle(

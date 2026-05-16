@@ -99,6 +99,9 @@ def _radio(value: str, label: str, group_value: str) -> ft.Container:
 # (CPU/IPC 보호). Web 송출(WebRTC)은 캡쳐 FPS 를 그대로 따라간다.
 _PREVIEW_MAX_FPS = 15
 
+# 대시보드 탭 재진입·이탈 시 미리보기 스레드 정리 (Flet 0.85 는 on_unmount 가 거의 오지 않음)
+_prev_dashboard_preview_ctrl: "_DashboardController | None" = None
+
 
 class _DashboardController:
     def __init__(self, state: AppState) -> None:
@@ -117,6 +120,20 @@ class _DashboardController:
 
     def attach_preview(self, image: ft.Image) -> None:
         self._preview_image = image
+
+    def shutdown(self) -> None:
+        """탭 이탈 시 백그라운드 캡처·UI flush 를 멈춘다 (페이지에서 제거된 Image.update 방지)."""
+        self._mounted = False
+        self._stop_event.set()
+        t = self._preview_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
+        self._preview_thread = None
+        with self._prev_lock:
+            self._pending_preview_jpg[0] = None
+        self._preview_flush_scheduled[0] = False
+        self._preview_image = None
+        self.page = None
 
     def start_preview_loop(self, page: ft.Page) -> None:
         if self._preview_thread is not None:
@@ -176,6 +193,8 @@ class _DashboardController:
                     data = self._pending_preview_jpg[0]
                     self._pending_preview_jpg[0] = None
                 if data is None:
+                    break
+                if not self._mounted:
                     break
                 img = self._preview_image
                 if img is None:
@@ -267,6 +286,12 @@ class _DashboardController:
 
 
 def build_dashboard(state: AppState) -> ft.Control:
+    global _prev_dashboard_preview_ctrl
+
+    if _prev_dashboard_preview_ctrl is not None:
+        _prev_dashboard_preview_ctrl.shutdown()
+        _prev_dashboard_preview_ctrl = None
+
     ctrl = _DashboardController(state)
     cap = state.settings.capture
 
@@ -514,11 +539,21 @@ def build_dashboard(state: AppState) -> ft.Control:
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
+    _prev_dashboard_preview_ctrl = ctrl
     page_obj = getattr(state, "page", None)
     if page_obj is not None:
         ctrl.start_preview_loop(page_obj)
 
     return page_root
+
+
+def shutdown_dashboard_preview_if_any() -> None:
+    """다른 탭으로 나갈 때 호출 — 미리보기 스레드와 대기 중인 flush 를 멈춘다."""
+    global _prev_dashboard_preview_ctrl
+
+    if _prev_dashboard_preview_ctrl is not None:
+        _prev_dashboard_preview_ctrl.shutdown()
+        _prev_dashboard_preview_ctrl = None
 
 
 def _open_window_picker(
@@ -781,4 +816,4 @@ def _set_picked_monitor(
             pass
 
 
-__all__ = ["build_dashboard"]
+__all__ = ["build_dashboard", "shutdown_dashboard_preview_if_any"]

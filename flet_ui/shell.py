@@ -242,7 +242,11 @@ class StreamMasterApp:
     @staticmethod
     def _stop_route_log_pollers(leaving: str) -> None:
         """탭 전환 시 이전 페이지의 로그 폴링 스레드를 멈춘다 (고아 스레드·중복 소비 방지)."""
-        if leaving == ROUTE_ARDUINO:
+        if leaving == ROUTE_DASHBOARD:
+            from .pages.page_dashboard import shutdown_dashboard_preview_if_any
+
+            shutdown_dashboard_preview_if_any()
+        elif leaving == ROUTE_ARDUINO:
             from .pages.page_arduino import shutdown_arduino_log_poller_if_any
 
             shutdown_arduino_log_poller_if_any()
