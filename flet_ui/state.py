@@ -205,6 +205,8 @@ class WebStreamSettings:
     https: bool = False
     ssl_cert: str = ""
     ssl_key: str = ""
+    # Web Stream 전용. 원격 호스트 h264_hardware_encode 와 별도.
+    h264_hardware_encode: bool = True
 
 
 @dataclass
@@ -410,6 +412,9 @@ class AppState:
         web.https = bool(d.get("web_stream_https", web.https))
         web.ssl_cert = str(d.get("web_stream_ssl_cert", web.ssl_cert) or "")
         web.ssl_key = str(d.get("web_stream_ssl_key", web.ssl_key) or "")
+        web.h264_hardware_encode = bool(
+            d.get("web_stream_h264_hardware_encode", web.h264_hardware_encode)
+        )
 
         a = d.get("arduino_serial") or {}
         if isinstance(a, dict):
@@ -537,6 +542,7 @@ class AppState:
             "web_stream_https": web.https,
             "web_stream_ssl_cert": web.ssl_cert,
             "web_stream_ssl_key": web.ssl_key,
+            "web_stream_h264_hardware_encode": web.h264_hardware_encode,
             "arduino_serial": {
                 "port": ard.port,
                 "baud": ard.baud,
@@ -650,6 +656,7 @@ class AppState:
                     max_stream_side=int(web.max_side),
                     audio_output_name=web.audio_output or None,
                     ssl_context=ssl_ctx,
+                    h264_hardware_encode=web.h264_hardware_encode,
                 )
                 web_streamer.start()
                 self._streamer = web_streamer

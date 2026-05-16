@@ -831,6 +831,10 @@ class SharedVideoTrack(VideoStreamTrack):
         super().stop()
 
 
+class WebSharedVideoTrack(SharedVideoTrack):
+    """Web Stream 전용 마커 — 코덱·REMB·GPU 경로가 원격 ``SharedVideoTrack`` 과 분리된다."""
+
+
 class SharedAudioTrack(AudioStreamTrack):
     """구독 큐에서 PCM 청크를 받아 송출하는 WebRTC 오디오 트랙."""
 
@@ -989,11 +993,13 @@ class WebStreamServer:
         max_stream_side: int = 720,
         audio_output_name: Optional[str] = None,
         ssl_context: Optional[ssl.SSLContext] = None,
+        h264_hardware_encode: bool = True,
     ) -> None:
         self.host = str(host).strip() or "0.0.0.0"
         self.port = int(port)
         self.fps = float(fps)
         self.max_stream_side = max(0, min(4096, int(max_stream_side)))
+        self._h264_hardware_encode = bool(h264_hardware_encode)
         aon = (audio_output_name or "").strip()
         self._audio_output_name: Optional[str] = aon if aon else None
         self._ssl_context: Optional[ssl.SSLContext] = ssl_context
@@ -1069,6 +1075,16 @@ class WebStreamServer:
         self._audio_low_signal = False
         self._audio_low_signal_logged = False
         self._audio_stop.clear()
+        try:
+            from streaming.web_stream_codec import apply_web_stream_codec_patches
+
+            for line in apply_web_stream_codec_patches(
+                fps=self.fps,
+                h264_hardware=self._h264_hardware_encode,
+            ):
+                log_web_event(f"코덱: {line}")
+        except Exception as exc:
+            log_web_event(f"코덱 패치 실패: {exc}", error=True)
         self._audio_thread = threading.Thread(
             target=self._audio_capture_loop,
             daemon=True,
@@ -1110,6 +1126,12 @@ class WebStreamServer:
         self._audio_mic_name = ""
         self._audio_low_signal = False
         self._audio_low_signal_logged = False
+        try:
+            from streaming.web_stream_codec import release_web_stream_codec_patches
+
+            release_web_stream_codec_patches()
+        except Exception:
+            pass
 
     def _audio_capture_loop(self) -> None:
         # Windows WASAPI 루프백만 지원. 맥에서 soundcard 를 켜면 CoreAudio 경로가
@@ -1292,8 +1314,14 @@ class WebStreamServer:
 
         # Offer의 m-line·mid와 맞추려면 반드시 setRemoteDescription 후 addTrack (aiortc는 빈 sender 슬롯에 replace)
         await pc.setRemoteDescription(offer)
+        try:
+            from streaming.web_stream_codec import prefer_h264_on_peer_connection
+
+            prefer_h264_on_peer_connection(pc)
+        except Exception as exc:
+            log_web_event(f"H.264 우선 협상 스킵: {exc}", error=True)
         pc.addTrack(
-            SharedVideoTrack(
+            WebSharedVideoTrack(
                 self.video,
                 fps=self.fps,
                 max_stream_side=self.max_stream_side,

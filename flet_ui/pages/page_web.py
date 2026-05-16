@@ -318,6 +318,14 @@ def build_web_stream(state: AppState) -> ft.Control:
         )
         preset_chips.append(chip)
 
+    h264_hw_cb = ft.Checkbox(
+        label="H.264 인코딩",
+        value=bool(web.h264_hardware_encode),
+        active_color=T.PRIMARY,
+        on_change=lambda e: _persist_web_h264_hw(state, bool(e.control.value)),
+        label_style=label_lg(),
+    )
+
     media_card = section_card(
         title="미디어 품질",
         icon=ft.Icons.TUNE,
@@ -339,6 +347,7 @@ def build_web_stream(state: AppState) -> ft.Control:
                         ft.Row(spacing=8, wrap=True, controls=preset_chips),
                     ],
                 ),
+                h264_hw_cb,
             ],
         ),
     )
@@ -425,6 +434,14 @@ def _set_enable(state: AppState, value: bool | None) -> None:
 
 def _set_https(state: AppState, value: bool | None) -> None:
     state.settings.web.https = bool(value)
+
+
+def _persist_web_h264_hw(state: AppState, enabled: bool) -> None:
+    state.settings.web.h264_hardware_encode = enabled
+    try:
+        state.save()
+    except Exception:
+        pass
 
 
 def _refresh_audio(state: AppState, dd: ft.Dropdown) -> None:

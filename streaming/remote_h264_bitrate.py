@@ -52,6 +52,8 @@ def _apply_target_from_frame(encoder: object, frame: object) -> None:
         tgt = recommend_h264_bitrate_bps(w, h, _StreamFpsHint[0])
         enc = encoder  # H264Encoder / H264HardwareEncoder
         enc.target_bitrate = tgt  # type: ignore[attr-defined]
+        # Web Stream REMB 하한(웹 송신 RTCP 패치에서 WebSharedVideoTrack 만 사용).
+        enc._oddments_remb_floor = int(max(800_000, tgt * 85 // 100))  # type: ignore[attr-defined]
     except Exception:
         pass
 
