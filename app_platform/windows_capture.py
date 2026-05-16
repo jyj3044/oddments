@@ -33,8 +33,20 @@ DWORD = wintypes.DWORD
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
+PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
 SRCCOPY = 0x00CC0020
+GW_CHILD = 5
+GW_HWNDNEXT = 2
+
+# CEF/Chromium 계열: 최상위 HWND PrintWindow 가 검은 화면이면 자식 렌더 창을 우선한다.
+_PW_RENDER_CLASS_HINTS = (
+    "chrome_renderwidgethosthwnd",
+    "cefclient",
+    "intermediate d3d window",
+)
+
+_pw_target_cache: dict[int, int] = {}
 
 
 def ensure_windows_dpi_awareness() -> None:
@@ -235,6 +247,123 @@ def _window_rect_for_printwindow(hwnd: int) -> tuple[int, int, int, int]:
     )
 
 
+def _window_class_lower(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(HWND(hwnd), buf, 256)
+    return (buf.value or "").strip().lower()
+
+
+def _enum_descendant_hwnds(hwnd: int) -> list[int]:
+    """보이는 자손 HWND (직접 자식·손자 포함)."""
+    out: list[int] = []
+
+    def walk(parent: int) -> None:
+        child = user32.GetWindow(HWND(parent), GW_CHILD)
+        while child:
+            c = int(child)
+            if user32.IsWindowVisible(HWND(c)):
+                out.append(c)
+                walk(c)
+            child = user32.GetWindow(HWND(c), GW_HWNDNEXT)
+
+    walk(int(hwnd))
+    return out
+
+
+def _client_area(hwnd: int) -> int:
+    cc = _client_rect_screen(hwnd)
+    if cc is None:
+        return 0
+    _l, _t, w, h = cc
+    return max(0, w) * max(0, h)
+
+
+def _invalidate_printwindow_target(root_hwnd: int) -> None:
+    _pw_target_cache.pop(int(root_hwnd), None)
+
+
+def _pick_printwindow_hwnd(root_hwnd: int) -> int:
+    """
+    PrintWindow 대상 HWND.
+    CEF/리그 클라이언트 등은 최상위가 아닌 렌더 자식에서만 PW가 성공하는 경우가 많다.
+    """
+    root = int(root_hwnd)
+    cached = _pw_target_cache.get(root)
+    if cached is not None and user32.IsWindow(HWND(cached)):
+        return int(cached)
+
+    candidates: list[int] = [root]
+    candidates.extend(_enum_descendant_hwnds(root))
+    root_area = max(1, _client_area(root))
+
+    hinted: list[int] = []
+    by_area: list[tuple[int, int]] = []
+    for h in candidates:
+        cls = _window_class_lower(h)
+        area = _client_area(h)
+        if area < 64 * 64:
+            continue
+        if any(hint in cls for hint in _PW_RENDER_CLASS_HINTS):
+            hinted.append(h)
+        by_area.append((area, h))
+    by_area.sort(reverse=True)
+
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def add(h: int) -> None:
+        if h not in seen:
+            seen.add(h)
+            ordered.append(h)
+
+    for h in hinted:
+        add(h)
+    for _area, h in by_area:
+        add(h)
+    add(root)
+
+    best_hwnd = root
+    best_score = -1.0
+    for h in ordered:
+        if h != root and _client_area(h) < int(0.12 * root_area):
+            continue
+        probe = _probe_printwindow_quality(h)
+        if probe is None:
+            continue
+        score, _img = probe
+        if score > best_score:
+            best_score = score
+            best_hwnd = h
+        if score >= 18.0 and h in hinted:
+            break
+
+    _pw_target_cache[root] = int(best_hwnd)
+    return int(best_hwnd)
+
+
+def _probe_printwindow_quality(hwnd: int) -> tuple[float, np.ndarray] | None:
+    """작은 영역 PrintWindow 시도 — 검은 화면·빈 창은 낮은 점수."""
+    cc = _client_rect_screen(hwnd)
+    if cc is None:
+        wr = wintypes.RECT()
+        if not user32.GetWindowRect(HWND(hwnd), ctypes.byref(wr)):
+            return None
+        w = int(wr.right - wr.left)
+        h = int(wr.bottom - wr.top)
+    else:
+        _l, _t, w, h = cc
+    if w <= 0 or h <= 0:
+        return None
+    scale = min(1.0, 160.0 / max(w, h))
+    pw = max(32, int(w * scale))
+    ph = max(32, int(h * scale))
+    img = _grab_bgr_printwindow(int(hwnd), pw, ph)
+    if img is None or _frame_looks_black(img):
+        return None
+    gray = img.mean(axis=2)
+    return float(gray.std()), img
+
+
 def _client_rect_screen(hwnd: int) -> tuple[int, int, int, int] | None:
     """클라이언트 영역을 화면 좌표로. (left, top, w, h)"""
     h = HWND(hwnd)
@@ -335,8 +464,9 @@ def _crop_image_to_client_area(
     return img[oy : oy + ch, ox : ox + cw].copy()
 
 
-def _grab_bgr_printwindow(hwnd: int, width: int, height: int) -> np.ndarray | None:
-    """PrintWindow + 비트맵 — 일부 D3D/창 합성에서 mss만 검은 경우에 유효."""
+def _grab_bgr_printwindow_raw(
+    hwnd: int, width: int, height: int, flags: int
+) -> np.ndarray | None:
     if width <= 0 or height <= 0:
         return None
     h = HWND(hwnd)
@@ -353,9 +483,7 @@ def _grab_bgr_printwindow(hwnd: int, width: int, height: int) -> np.ndarray | No
                 return None
             try:
                 old = gdi32.SelectObject(hdc_mem, hbmp)
-                ok = user32.PrintWindow(h, hdc_mem, PW_RENDERFULLCONTENT)
-                if not ok:
-                    user32.PrintWindow(h, hdc_mem, 0)
+                user32.PrintWindow(h, hdc_mem, DWORD(flags))
                 gdi32.SelectObject(hdc_mem, old)
                 row_bytes = width * 4
                 size = row_bytes * height
@@ -373,6 +501,40 @@ def _grab_bgr_printwindow(hwnd: int, width: int, height: int) -> np.ndarray | No
             gdi32.DeleteDC(hdc_mem)
     finally:
         user32.ReleaseDC(h, hdc_src)
+
+
+def _grab_bgr_printwindow(hwnd: int, width: int, height: int) -> np.ndarray | None:
+    """PrintWindow + 비트맵 — 일부 D3D/창 합성에서 mss만 검은 경우에 유효."""
+    if width <= 0 or height <= 0:
+        return None
+    flag_sets = (
+        PW_RENDERFULLCONTENT,
+        PW_RENDERFULLCONTENT | PW_CLIENTONLY,
+        0,
+        PW_CLIENTONLY,
+    )
+    for flags in flag_sets:
+        img = _grab_bgr_printwindow_raw(hwnd, width, height, flags)
+        if img is not None and not _frame_looks_black(img):
+            return img
+    return None
+
+
+def _grab_bgr_printwindow_for_root(
+    root_hwnd: int, *, _allow_repick: bool = True
+) -> np.ndarray | None:
+    """root HWND 기준으로 PW 대상(자식 포함)을 고른 뒤 전체 해상도로 캡처."""
+    target = _pick_printwindow_hwnd(root_hwnd)
+    _l, _t, tw, th = _window_rect_for_printwindow(
+        target if target != root_hwnd else root_hwnd
+    )
+    img = _grab_bgr_printwindow(target, tw, th)
+    if img is not None:
+        return img
+    if target != root_hwnd and _allow_repick:
+        _invalidate_printwindow_target(root_hwnd)
+        return _grab_bgr_printwindow_for_root(root_hwnd, _allow_repick=False)
+    return None
 
 
 class WindowCapture:
@@ -403,13 +565,16 @@ class WindowCapture:
         win_area = max(1, w * h)
 
         # 창 위에 다른 창이 겹쳐도 대상 창 자체를 우선 얻기 위해 PrintWindow 먼저 시도.
+        # CEF(리그 클라이언트 등)는 렌더 자식 HWND에서만 PW가 되는 경우가 많다.
         # 일부 앱(D3D/보안/관리자 권한 차이)은 PrintWindow를 거부할 수 있어 실패 시 화면 복사 경로로 폴백.
         pw_left, pw_top, pw_w, pw_h = _window_rect_for_printwindow(self.hwnd)
-        alt = _grab_bgr_printwindow(self.hwnd, pw_w, pw_h)
+        alt = _grab_bgr_printwindow_for_root(self.hwnd)
         if alt is not None:
-            alt = _crop_image_to_client_area(alt, self.hwnd, pw_left, pw_top)
+            if _pick_printwindow_hwnd(self.hwnd) == self.hwnd:
+                alt = _crop_image_to_client_area(alt, self.hwnd, pw_left, pw_top)
             if not _frame_looks_black(alt):
                 return alt
+            _invalidate_printwindow_target(self.hwnd)
 
         def grab_mss_region(l: int, t: int, ww: int, hh: int) -> np.ndarray:
             reg = {"left": l, "top": t, "width": ww, "height": hh}
