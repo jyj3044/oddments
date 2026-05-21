@@ -343,6 +343,7 @@ class DetectionSettings:
     template_paths: tuple[str, ...] = ()
     template_threshold: float = 0.80
     cooldown_sec: float = ALERT_COOLDOWN_DEFAULT
+    custom_sound_path: str = ""
     keyword_ocr_enabled: bool = True
     ocr_variant_groups: tuple[str, ...] = ()
     region_rules: tuple[RegionRuleSettings, ...] = ()
@@ -481,7 +482,9 @@ class AppState:
         self._on_state_listeners: list[Callable[[], None]] = []
         self._theme_listeners: list[Callable[[], None]] = []
 
-        set_ocr_keyword_alert_sound_handler(self._handle_keyword_sound)
+        # 알림음은 감지 루프(_detection_loop)에서만 재생한다. OCR 로그 콜백은 쿨다운 없이
+        # 중복 호출될 수 있어 여기서는 연결하지 않는다.
+        set_ocr_keyword_alert_sound_handler(None)
 
     # ─── 설정 ──────────────────────────────────────────────
 
@@ -519,6 +522,7 @@ class AppState:
         det.template_paths = tuple(d.get("template_paths", []))
         det.template_threshold = float(d.get("template_threshold", det.template_threshold))
         det.cooldown_sec = float(d.get("cooldown_sec", det.cooldown_sec))
+        det.custom_sound_path = str(d.get("custom_sound_path", det.custom_sound_path) or "")
         engines = d.get("ocr_engines")
         if isinstance(engines, list):
             det.keyword_ocr_enabled = bool(engines)
@@ -673,6 +677,7 @@ class AppState:
             "template_threshold": det.template_threshold,
             "ocr_engines": [ENGINE_RAPIDOCR] if det.keyword_ocr_enabled else [],
             "cooldown_sec": det.cooldown_sec,
+            "custom_sound_path": det.custom_sound_path,
             "ocr_variant_groups": list(det.ocr_variant_groups),
             "ocr_main_expanded": bool(det.main_expanded),
             "region_rules": [_region_rule_to_dict(r) for r in det.region_rules],
@@ -778,6 +783,7 @@ class AppState:
                 ocr_engines=engines,
                 ocr_variant_groups=groups,
                 region_rules=tuple(region_rules),
+                custom_sound_path=det.custom_sound_path,
             )
         self._det_cfg_wake.set()
         self._det_kw_abort.set()
@@ -887,6 +893,7 @@ class AppState:
             target=self._detection_loop, name="oddments-detect", daemon=True
         )
         self._det_thread.start()
+        self._reset_alert_sound_cooldowns()
         self._sound_armed = True
         # Start 직후: 송출 중 상태로 진입했으므로 사용자 키 필터를 시리얼에 반영하고,
         # 포커스 변화 first-edge 가 잘못 발화하지 않도록 마지막 상태를 초기화.
@@ -922,6 +929,7 @@ class AppState:
 
     def stop_capture(self, *, blocking: bool = False) -> None:
         self._sound_armed = False
+        self._reset_alert_sound_cooldowns()
         try:
             stop_queued_alert_sounds()
         except Exception:  # noqa: BLE001
@@ -1035,8 +1043,10 @@ class AppState:
 
     # ─── 알림음 ───────────────────────────────────────────
 
-    def _handle_keyword_sound(self) -> None:
-        self._maybe_play_sound()
+    def _reset_alert_sound_cooldowns(self) -> None:
+        with self._sound_lock:
+            self._last_sound_ts_by_event.clear()
+            self._last_sound_ts = 0.0
 
     def _maybe_play_sound(
         self,
@@ -1055,16 +1065,20 @@ class AppState:
         )
         with self._sound_lock:
             now = time.monotonic()
-            last = self._last_sound_ts_by_event.get(key, 0.0)
-            if now - last < cooldown:
+            last = self._last_sound_ts_by_event.get(key)
+            if last is not None and cooldown > 0.0 and (now - last) < cooldown:
                 return
+        try:
+            played = play_alert_sound(custom_sound_path or None)
+        except Exception:  # noqa: BLE001
+            return
+        if not played:
+            return
+        with self._sound_lock:
+            now = time.monotonic()
             self._last_sound_ts_by_event[key] = now
             if key == "main":
                 self._last_sound_ts = now
-        try:
-            play_alert_sound(custom_sound_path or None)
-        except Exception:  # noqa: BLE001
-            pass
 
     # ─── 캡처 프레임 구독 ────────────────────────────────
 

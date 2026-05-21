@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -80,6 +81,18 @@ class RegionRuleHelperTests(unittest.TestCase):
 
 
 class RegionRuleSettingsTests(unittest.TestCase):
+    def test_main_custom_sound_round_trip_through_settings_dict(self) -> None:
+        state = AppState()
+        state.settings.detection.custom_sound_path = "D:/sounds/main.mp3"
+
+        data = state._serialize_settings_dict()
+        loaded = AppState()
+        loaded._apply_settings_dict(data)
+
+        self.assertEqual(loaded.settings.detection.custom_sound_path, "D:/sounds/main.mp3")
+        loaded._sync_cfg_from_settings()
+        self.assertEqual(loaded.get_cfg().custom_sound_path, "D:/sounds/main.mp3")
+
     def test_region_rules_round_trip_through_settings_dict(self) -> None:
         state = AppState()
         state.settings.detection.main_expanded = True
@@ -152,6 +165,28 @@ class RegionRuleSettingsTests(unittest.TestCase):
 
 
 class RegionPipelineTests(unittest.TestCase):
+    def test_main_keyword_hit_uses_custom_sound_path(self) -> None:
+        frame = np.zeros((40, 40, 3), dtype=np.uint8)
+        cfg = DetectionConfig(
+            alert_keywords=("위험",),
+            ocr_engines=("rapidocr",),
+            custom_sound_path="D:/main.mp3",
+        )
+        original = pipeline.kw.run_keyword_detection
+
+        def fake_run_keyword_detection(*args, **kwargs):
+            return True, []
+
+        pipeline.kw.run_keyword_detection = fake_run_keyword_detection
+        try:
+            result = pipeline.run_detection_detailed(frame, cfg)
+        finally:
+            pipeline.kw.run_keyword_detection = original
+
+        self.assertTrue(result.triggered)
+        self.assertEqual(result.events[0].id, "main")
+        self.assertEqual(result.events[0].custom_sound_path, "D:/main.mp3")
+
     def test_region_keyword_hit_offsets_overlays_and_returns_event(self) -> None:
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
         cfg = DetectionConfig(
@@ -233,8 +268,9 @@ class RegionAlertCooldownTests(unittest.TestCase):
         calls: list[str | None] = []
         original = state_module.play_alert_sound
 
-        def fake_play_alert_sound(path: str | None = None) -> None:
+        def fake_play_alert_sound(path: str | None = None) -> bool:
             calls.append(path)
+            return True
 
         state_module.play_alert_sound = fake_play_alert_sound
         try:
@@ -262,6 +298,68 @@ class RegionAlertCooldownTests(unittest.TestCase):
             state_module.play_alert_sound = original
 
         self.assertEqual(calls, [None, "D:/r1.wav", "D:/r2.wav"])
+
+    def test_cooldown_starts_only_after_successful_play(self) -> None:
+        app = AppState()
+        app._sound_armed = True
+        calls: list[str | None] = []
+        original = state_module.play_alert_sound
+
+        def fake_fail(_path: str | None = None) -> bool:
+            calls.append(_path)
+            return False
+
+        state_module.play_alert_sound = fake_fail
+        try:
+            app._maybe_play_sound(event_id="main", cooldown_sec=10.0)
+            app._maybe_play_sound(event_id="main", cooldown_sec=10.0)
+        finally:
+            state_module.play_alert_sound = original
+
+        self.assertEqual(calls, [None, None])
+
+    def test_cooldown_blocks_repeat_until_elapsed(self) -> None:
+        app = AppState()
+        app._sound_armed = True
+        calls: list[str | None] = []
+        original = state_module.play_alert_sound
+        # 각 _maybe_play_sound: 쿨다운 확인 1회, 재생 성공 시 기록 1회
+        mono = iter([0.0, 0.0, 5.0, 11.0, 11.0])
+
+        def fake_play(path: str | None = None) -> bool:
+            calls.append(path)
+            return True
+
+        state_module.play_alert_sound = fake_play
+        try:
+            with mock.patch("flet_ui.state.time.monotonic", side_effect=mono):
+                app._maybe_play_sound(event_id="main", cooldown_sec=10.0)
+                app._maybe_play_sound(event_id="main", cooldown_sec=10.0)
+                app._maybe_play_sound(event_id="main", cooldown_sec=10.0)
+        finally:
+            state_module.play_alert_sound = original
+
+        self.assertEqual(calls, [None, None])
+
+    def test_reset_alert_sound_cooldowns_allows_immediate_play(self) -> None:
+        app = AppState()
+        app._sound_armed = True
+        original = state_module.play_alert_sound
+        calls: list[str | None] = []
+
+        def fake_play(path: str | None = None) -> bool:
+            calls.append(path)
+            return True
+
+        state_module.play_alert_sound = fake_play
+        try:
+            app._maybe_play_sound(event_id="main", cooldown_sec=10.0)
+            app._reset_alert_sound_cooldowns()
+            app._maybe_play_sound(event_id="main", cooldown_sec=10.0)
+        finally:
+            state_module.play_alert_sound = original
+
+        self.assertEqual(calls, [None, None])
 
 
 class RegionSelectionMappingTests(unittest.TestCase):

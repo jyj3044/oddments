@@ -152,6 +152,34 @@ def build_ocr_settings(state: AppState) -> ft.Control:
 
     cooldown_field.on_change = _on_cooldown_change
 
+    main_sound_field = text_field(
+        value=det.custom_sound_path,
+        expand=True,
+        read_only=True,
+    )
+
+    def _set_main_sound_path(path: str) -> None:
+        det.custom_sound_path = path
+        _push_detection_cfg()
+
+    pick_main_sound_btn = outline_button(
+        "파일 선택",
+        on_click=lambda _e: _pick_alert_sound(
+            state,
+            main_sound_field,
+            dialog_title="메인 OCR 알림음 선택",
+            log_tag="main",
+            set_path=_set_main_sound_path,
+        ),
+    )
+    reset_main_sound_btn = outline_button(
+        "기본 알림음",
+        on_click=lambda _e: _set_default_alert_sound(
+            main_sound_field,
+            lambda: _set_main_sound_path(""),
+        ),
+    )
+
     tpl_add_btn = outline_button(
         "추가...",
         on_click=lambda _e: _pick_template(state, tpl_field, det),
@@ -200,6 +228,22 @@ def build_ocr_settings(state: AppState) -> ft.Control:
                     controls=[
                         _labeled_small_field("매칭 임계값", threshold_field),
                         _labeled_small_field("알림 쿨다운(초)", cooldown_field),
+                    ],
+                ),
+                ft.Column(
+                    spacing=T.SPACE_SM,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    controls=[
+                        ft.Text("알림음", style=label_lg(), color=T.ON_SURFACE),
+                        ft.Row(
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            controls=[
+                                main_sound_field,
+                                pick_main_sound_btn,
+                                reset_main_sound_btn,
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -731,11 +775,12 @@ def _build_region_rule_control(
 
     pick_sound_btn = outline_button(
         "파일 선택",
-        on_click=lambda _e: _pick_region_sound(
+        on_click=lambda _e: _pick_alert_sound(
             state,
             sound_field,
-            rule,
-            lambda new_path: _replace_rule(
+            dialog_title="특정영역 알림음 선택",
+            log_tag=f"region:{rule.id}",
+            set_path=lambda new_path: _replace_rule(
                 _current_rule(custom_sound_path=new_path),
                 do_refresh=True,
             ),
@@ -743,7 +788,7 @@ def _build_region_rule_control(
     )
     reset_sound_btn = outline_button(
         "기본 알림음",
-        on_click=lambda _e: _set_default_region_sound(
+        on_click=lambda _e: _set_default_alert_sound(
             sound_field,
             lambda: _replace_rule(
                 _current_rule(custom_sound_path=""),
@@ -867,7 +912,12 @@ def _color_preview_box(value: str) -> ft.Container:
 
 def _main_summary(det) -> str:
     kw_count = len([k for k in det.keywords.replace("\n", ",").split(",") if k.strip()])
-    return f"키워드 {kw_count}개 · 쿨다운 {det.cooldown_sec:.1f}초"
+    sound = (
+        det.custom_sound_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if det.custom_sound_path
+        else "기본음"
+    )
+    return f"키워드 {kw_count}개 · 쿨다운 {det.cooldown_sec:.1f}초 · {sound}"
 
 
 def _region_preview_control(state: AppState, rect: RegionRect | None) -> ft.Control:
@@ -1414,10 +1464,12 @@ def _window_capture_rect_for_mapping(hwnd: int) -> tuple[int, int, int, int] | N
         return None
 
 
-def _pick_region_sound(
+def _pick_alert_sound(
     state: AppState,
     sound_field: ft.TextField,
-    rule: RegionRuleSettings,
+    *,
+    dialog_title: str,
+    log_tag: str,
     set_path,
 ) -> None:
     page = getattr(state, "page", None)
@@ -1429,9 +1481,9 @@ def _pick_region_sound(
 
         try:
             fp = ensure_file_picker(page)
-            log_app_event("INFO", f"pick_files start (region sound, id={rule.id})")
+            log_app_event("INFO", f"pick_files start (alert sound, {log_tag})")
             files = await fp.pick_files(
-                dialog_title="특정영역 알림음 선택",
+                dialog_title=dialog_title,
                 allow_multiple=False,
                 allowed_extensions=["wav", "mp3", "aiff", "aif"],
             )
@@ -1453,7 +1505,7 @@ def _pick_region_sound(
         show_snack(page, f"알림음 파일 선택 실패: {exc}", error=True)
 
 
-def _set_default_region_sound(sound_field: ft.TextField, apply_default) -> None:
+def _set_default_alert_sound(sound_field: ft.TextField, apply_default) -> None:
     sound_field.value = ""
     if sound_field.page is not None:
         sound_field.update()

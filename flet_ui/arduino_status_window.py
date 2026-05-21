@@ -143,6 +143,14 @@ def _field(label: str, value: ft.Control) -> ft.Row:
     )
 
 
+def _apply_always_on_top(page: ft.Page, enabled: bool) -> None:
+    try:
+        page.window.always_on_top = bool(enabled)
+        page.update()
+    except Exception:
+        pass
+
+
 def _start_shutdown_watchdog(
     *,
     parent_pid: int,
@@ -196,6 +204,14 @@ def _status_window_main(
     page.window.min_width = 360
     page.window.min_height = 260
 
+    always_on_top_cb = ft.Checkbox(
+        label="항상위",
+        value=False,
+        active_color=T.PRIMARY,
+        label_style=label_md(),
+        on_change=lambda e: _apply_always_on_top(page, bool(e.control.value)),
+    )
+
     type_text = ft.Text("-", style=body_md(), color=T.ON_SURFACE)
     state_slot = ft.Container(content=_run_indicator(""))
     next_col = ft.Column(controls=[], spacing=6, tight=True)
@@ -210,7 +226,13 @@ def _status_window_main(
                     ft.Row(
                         controls=[
                             ft.Icon(ft.Icons.MEMORY, size=20, color=T.PRIMARY),
-                            ft.Text("Arduino 상태", style=title_md(), color=T.ON_SURFACE),
+                            ft.Text(
+                                "Arduino 상태",
+                                style=title_md(),
+                                color=T.ON_SURFACE,
+                                expand=True,
+                            ),
+                            always_on_top_cb,
                         ],
                         spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,

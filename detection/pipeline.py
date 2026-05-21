@@ -34,14 +34,15 @@ def run_detection_detailed(
     plain_hits = False
     kw_ovs: List[OverlayRect] = []
     if cfg.alert_keywords and cfg.ocr_engines:
-        plain_hits, kw_ovs = kw.run_keyword_detection(
-            frame_bgr,
-            cfg.alert_keywords,
-            cfg.ocr_engines,
-            stop_event,
-            variant_groups=cfg.ocr_variant_groups,
-            kw_abort=kw_abort,
-        )
+        with suppress_ocr_keyword_alert_sound():
+            plain_hits, kw_ovs = kw.run_keyword_detection(
+                frame_bgr,
+                cfg.alert_keywords,
+                cfg.ocr_engines,
+                stop_event,
+                variant_groups=cfg.ocr_variant_groups,
+                kw_abort=kw_abort,
+            )
     if stop_event is not None and stop_event.is_set():
         return DetectionRunResult(False, "")
     # OCR 미사용(settings 에서 ocr_engines 비움) 시 키워드 OCR·템플릿 매칭 모두 생략
@@ -111,11 +112,18 @@ def run_detection_detailed(
     overlays = kw_ovs + tpl_ovs + region_ovs
     get_overlay_store().touch(overlays)
 
+    main_sound = cfg.custom_sound_path
     if plain_hits:
-        events.insert(0, DetectionHitEvent("main", "메인", 0.0, ""))
+        events.insert(
+            0,
+            DetectionHitEvent("main", "메인", 0.0, main_sound),
+        )
         return DetectionRunResult(True, "키워드 텍스트", tuple(overlays), tuple(events))
     if tpl_ovs:
-        events.insert(0, DetectionHitEvent("main", "메인", 0.0, ""))
+        events.insert(
+            0,
+            DetectionHitEvent("main", "메인", 0.0, main_sound),
+        )
         return DetectionRunResult(True, "템플릿 이미지", tuple(overlays), tuple(events))
     if events:
         first = events[0]

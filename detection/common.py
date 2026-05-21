@@ -79,6 +79,7 @@ class DetectionConfig:
     # 비어 있으면 전처리 변형 전부 사용. OCR_VARIANT_GROUPS_DISABLED 이면 변형 OCR 호출 안 함.
     ocr_variant_groups: Tuple[str, ...] = ()
     region_rules: Tuple[RegionDetectionConfig, ...] = ()
+    custom_sound_path: str = ""
 
 
 def stable_overlay_bgr(tag: str, x: int, y: int, w: int, h: int) -> Tuple[int, int, int]:
