@@ -58,3 +58,4 @@ maplealert_settings.json
 oddments_settings.json
 alert_settings.json
 logs/arduino_runtime_status.json
+assets/*
