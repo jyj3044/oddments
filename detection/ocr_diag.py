@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, List, Optional, Sequence
 
 # 한 줄 앞에 이 sentinel 이 붙어 있으면 LogConsole 이 그 줄을 알림 색(밝은 빨강) 으로 렌더링한다.
@@ -16,6 +17,7 @@ _lock = threading.Lock()
 _next_call_id: int = 0
 _completed_calls: int = 0
 _on_keyword_alert_sound: Optional[Callable[[], None]] = None
+_sound_suppress_count: int = 0
 
 
 def set_ocr_keyword_alert_sound_handler(
@@ -24,6 +26,19 @@ def set_ocr_keyword_alert_sound_handler(
     """OCR 응답에 알림 키워드가 있을 때 호출할 콜백(보통 UI 스레드에서 소리). None 이면 비활성."""
     global _on_keyword_alert_sound
     _on_keyword_alert_sound = fn
+
+
+@contextmanager
+def suppress_ocr_keyword_alert_sound():
+    """이 블록 안의 OCR 알림 로그는 소리 콜백만 생략한다."""
+    global _sound_suppress_count
+    with _lock:
+        _sound_suppress_count += 1
+    try:
+        yield
+    finally:
+        with _lock:
+            _sound_suppress_count = max(0, _sound_suppress_count - 1)
 
 
 def _fmt_detail(detail: str, *, max_len: int = 120) -> str:
@@ -148,7 +163,9 @@ def end_ocr_call(
     if is_alert:
         line = f"{ALERT_LOG_LINE_PREFIX}{line}"
     _queue.put(line)
-    if is_alert and _on_keyword_alert_sound is not None:
+    with _lock:
+        sound_suppressed = _sound_suppress_count > 0
+    if is_alert and not sound_suppressed and _on_keyword_alert_sound is not None:
         try:
             _on_keyword_alert_sound()
         except Exception:

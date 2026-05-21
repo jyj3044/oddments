@@ -33,8 +33,11 @@ from detection import (
     DetectionConfig,
     OCR_VARIANT_GROUPS_DISABLED,
     OCR_VARIANT_UI_CHOICES,
+    RegionDetectionConfig,
+    RegionRect,
     get_overlay_store,
     ocr_runtime_ok,
+    run_detection_detailed,
     run_detection_with_overlays,
 )
 from detection.ocr_backends import ENGINE_RAPIDOCR
@@ -186,6 +189,41 @@ def _writable_settings_path() -> Path:
     return _settings_base_dir() / SETTINGS_FILENAME
 
 
+def _safe_float(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_hex_color(value: object, default: str = "#ff3030") -> str:
+    raw = str(value or "").strip()
+    if raw.startswith("#"):
+        raw = raw[1:]
+    if len(raw) != 6:
+        raw = default.lstrip("#")
+    try:
+        int(raw, 16)
+    except ValueError:
+        raw = default.lstrip("#")
+    return "#" + raw.lower()
+
+
+def _hex_to_bgr(value: object) -> tuple[int, int, int]:
+    h = _normalize_hex_color(value).lstrip("#")
+    r = int(h[0:2], 16)
+    g = int(h[2:4], 16)
+    b = int(h[4:6], 16)
+    return b, g, r
+
+
 @dataclass
 class ArduinoSettings:
     port: str = "COM3"
@@ -219,6 +257,80 @@ class CaptureSettings:
 
 
 @dataclass
+class RegionRuleSettings:
+    id: str
+    name: str
+    enabled: bool = True
+    keywords: str = ""
+    rect: RegionRect | None = None
+    ocr_variant_groups: tuple[str, ...] = ()
+    color_match_enabled: bool = False
+    color_hex: str = "#ff3030"
+    color_tolerance: int = 24
+    cooldown_sec: float = ALERT_COOLDOWN_DEFAULT
+    custom_sound_path: str = ""
+    expanded: bool = False
+
+
+def _region_rect_from_obj(value: object) -> RegionRect | None:
+    if not isinstance(value, dict):
+        return None
+    x = _safe_int(value.get("x"), 0)
+    y = _safe_int(value.get("y"), 0)
+    w = _safe_int(value.get("w"), 0)
+    h = _safe_int(value.get("h"), 0)
+    if w <= 0 or h <= 0:
+        return None
+    return RegionRect(max(0, x), max(0, y), w, h)
+
+
+def _region_rect_to_dict(rect: RegionRect | None) -> dict | None:
+    if rect is None:
+        return None
+    return {"x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h}
+
+
+def _region_rule_from_dict(value: object, index: int) -> RegionRuleSettings | None:
+    if not isinstance(value, dict):
+        return None
+    rid = str(value.get("id") or f"region-{index + 1}")
+    name = str(value.get("name") or f"영역 {index + 1}")
+    raw_groups = value.get("ocr_variant_groups", [])
+    groups = tuple(str(v) for v in raw_groups) if isinstance(raw_groups, list) else ()
+    return RegionRuleSettings(
+        id=rid,
+        name=name,
+        enabled=bool(value.get("enabled", True)),
+        keywords=str(value.get("keywords", "")),
+        rect=_region_rect_from_obj(value.get("rect")),
+        ocr_variant_groups=groups,
+        color_match_enabled=bool(value.get("color_match_enabled", False)),
+        color_hex=_normalize_hex_color(value.get("color_hex", "#ff3030")),
+        color_tolerance=max(0, min(100, _safe_int(value.get("color_tolerance"), 24))),
+        cooldown_sec=max(0.0, _safe_float(value.get("cooldown_sec"), ALERT_COOLDOWN_DEFAULT)),
+        custom_sound_path=str(value.get("custom_sound_path") or ""),
+        expanded=bool(value.get("expanded", False)),
+    )
+
+
+def _region_rule_to_dict(rule: RegionRuleSettings) -> dict:
+    return {
+        "id": rule.id,
+        "name": rule.name,
+        "enabled": bool(rule.enabled),
+        "keywords": rule.keywords,
+        "rect": _region_rect_to_dict(rule.rect),
+        "ocr_variant_groups": list(rule.ocr_variant_groups),
+        "color_match_enabled": bool(rule.color_match_enabled),
+        "color_hex": _normalize_hex_color(rule.color_hex),
+        "color_tolerance": max(0, min(100, int(rule.color_tolerance))),
+        "cooldown_sec": max(0.0, float(rule.cooldown_sec)),
+        "custom_sound_path": rule.custom_sound_path,
+        "expanded": bool(rule.expanded),
+    }
+
+
+@dataclass
 class DetectionSettings:
     keywords: str = DEFAULT_KEYWORDS
     template_paths: tuple[str, ...] = ()
@@ -226,6 +338,8 @@ class DetectionSettings:
     cooldown_sec: float = ALERT_COOLDOWN_DEFAULT
     keyword_ocr_enabled: bool = True
     ocr_variant_groups: tuple[str, ...] = ()
+    region_rules: tuple[RegionRuleSettings, ...] = ()
+    main_expanded: bool = False
 
 
 @dataclass
@@ -354,6 +468,7 @@ class AppState:
         self._sound_armed = False
         self._sound_lock = threading.Lock()
         self._last_sound_ts = 0.0
+        self._last_sound_ts_by_event: dict[str, float] = {}
 
         self._on_frame_listeners: list[Callable[[np.ndarray], None]] = []
         self._on_state_listeners: list[Callable[[], None]] = []
@@ -401,9 +516,28 @@ class AppState:
         if isinstance(engines, list):
             det.keyword_ocr_enabled = bool(engines)
         det.ocr_variant_groups = tuple(d.get("ocr_variant_groups", []))
+        det.main_expanded = bool(d.get("ocr_main_expanded", det.main_expanded))
+        raw_region_rules = d.get("region_rules", [])
+        if isinstance(raw_region_rules, list):
+            parsed_rules: list[RegionRuleSettings] = []
+            for i, raw_rule in enumerate(raw_region_rules):
+                rule = _region_rule_from_dict(raw_rule, i)
+                if rule is not None:
+                    parsed_rules.append(rule)
+            det.region_rules = tuple(parsed_rules)
 
         cap.fps = int(d.get("capture_fps", cap.fps) or cap.fps)
         cap.source_mode = str(d.get("capture_source_mode", cap.source_mode))
+        try:
+            cap.monitor_index = max(1, int(d.get("capture_monitor_index", cap.monitor_index) or 1))
+        except (TypeError, ValueError):
+            cap.monitor_index = 1
+        try:
+            raw_hwnd = d.get("capture_picked_hwnd", cap.picked_hwnd)
+            cap.picked_hwnd = int(raw_hwnd) if raw_hwnd not in (None, "") else None
+        except (TypeError, ValueError):
+            cap.picked_hwnd = None
+        cap.picked_summary = str(d.get("capture_picked_summary", cap.picked_summary) or "")
 
         web.enabled = bool(d.get("web_stream_enabled", web.enabled))
         web.port = int(d.get("web_stream_port", web.port) or web.port)
@@ -533,8 +667,13 @@ class AppState:
             "ocr_engines": [ENGINE_RAPIDOCR] if det.keyword_ocr_enabled else [],
             "cooldown_sec": det.cooldown_sec,
             "ocr_variant_groups": list(det.ocr_variant_groups),
+            "ocr_main_expanded": bool(det.main_expanded),
+            "region_rules": [_region_rule_to_dict(r) for r in det.region_rules],
             "capture_fps": cap.fps,
             "capture_source_mode": cap.source_mode,
+            "capture_monitor_index": cap.monitor_index,
+            "capture_picked_hwnd": cap.picked_hwnd,
+            "capture_picked_summary": cap.picked_summary,
             "web_stream_enabled": web.enabled,
             "web_stream_port": web.port,
             "web_stream_max_side": web.max_side,
@@ -596,6 +735,34 @@ class AppState:
                 groups = OCR_VARIANT_GROUPS_DISABLED
         else:
             groups = ()
+        region_rules: list[RegionDetectionConfig] = []
+        for rule in det.region_rules:
+            if rule.rect is None:
+                continue
+            region_keywords = tuple(
+                tok.strip()
+                for tok in rule.keywords.replace("\n", ",").split(",")
+                if tok.strip()
+            )
+            region_groups = rule.ocr_variant_groups
+            if not region_groups:
+                region_groups = OCR_VARIANT_GROUPS_DISABLED
+            region_rules.append(
+                RegionDetectionConfig(
+                    id=rule.id,
+                    name=rule.name,
+                    enabled=bool(rule.enabled),
+                    alert_keywords=region_keywords,
+                    rect=rule.rect,
+                    ocr_engines=engines,
+                    ocr_variant_groups=region_groups,
+                    color_match_enabled=bool(rule.color_match_enabled),
+                    color_bgr=_hex_to_bgr(rule.color_hex),
+                    color_tolerance=max(0, min(100, int(rule.color_tolerance))),
+                    cooldown_sec=max(0.0, float(rule.cooldown_sec)),
+                    custom_sound_path=rule.custom_sound_path,
+                )
+            )
         with self._cfg_lock:
             self._cfg = DetectionConfig(
                 alert_keywords=keywords,
@@ -603,6 +770,7 @@ class AppState:
                 template_threshold=det.template_threshold,
                 ocr_engines=engines,
                 ocr_variant_groups=groups,
+                region_rules=tuple(region_rules),
             )
         self._det_cfg_wake.set()
         self._det_kw_abort.set()
@@ -820,10 +988,12 @@ class AppState:
                 continue
             self._det_kw_abort.clear()
             try:
-                triggered, reason, _ = run_detection_with_overlays(
+                result = run_detection_detailed(
                     frame, self.get_cfg(), self._det_stop, self._det_kw_abort
                 )
+                triggered, reason = result.triggered, result.reason
             except Exception as exc:  # noqa: BLE001
+                result = None
                 triggered, reason = False, f"감지 오류: {exc}"
                 try:
                     from flet_ui.crash_diagnostics import record_exception
@@ -838,7 +1008,20 @@ class AppState:
             self._last_triggered = triggered
             self._last_reason = reason
             if triggered:
-                self._maybe_play_sound()
+                if result is not None and result.events:
+                    for event in result.events:
+                        cooldown = (
+                            self.settings.detection.cooldown_sec
+                            if event.id == "main"
+                            else event.cooldown_sec
+                        )
+                        self._maybe_play_sound(
+                            event_id=event.id,
+                            cooldown_sec=cooldown,
+                            custom_sound_path=event.custom_sound_path,
+                        )
+                else:
+                    self._maybe_play_sound()
             # 포커스 변화 감지는 별도 ``oddments-focus`` 스레드가 200ms 주기로 처리.
             if self._det_cfg_wake.wait(timeout=DETECTION_TICK_MS / 1000.0):
                 self._det_cfg_wake.clear()
@@ -848,16 +1031,31 @@ class AppState:
     def _handle_keyword_sound(self) -> None:
         self._maybe_play_sound()
 
-    def _maybe_play_sound(self) -> None:
+    def _maybe_play_sound(
+        self,
+        *,
+        event_id: str = "main",
+        cooldown_sec: float | None = None,
+        custom_sound_path: str = "",
+    ) -> None:
         if not self._sound_armed:
             return
+        key = event_id or "main"
+        cooldown = (
+            self.settings.detection.cooldown_sec
+            if cooldown_sec is None
+            else max(0.0, float(cooldown_sec))
+        )
         with self._sound_lock:
             now = time.monotonic()
-            if now - self._last_sound_ts < self.settings.detection.cooldown_sec:
+            last = self._last_sound_ts_by_event.get(key, 0.0)
+            if now - last < cooldown:
                 return
-            self._last_sound_ts = now
+            self._last_sound_ts_by_event[key] = now
+            if key == "main":
+                self._last_sound_ts = now
         try:
-            play_alert_sound()
+            play_alert_sound(custom_sound_path or None)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1766,6 +1964,7 @@ __all__ = [
     "WebStreamSettings",
     "CaptureSettings",
     "DetectionSettings",
+    "RegionRuleSettings",
     "OCR_VARIANT_UI_CHOICES",
     "drain_ocr_log_lines",
     "get_ocr_call_total",

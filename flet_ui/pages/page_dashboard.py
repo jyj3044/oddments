@@ -805,6 +805,14 @@ def _set_picked_monitor(
 ) -> None:
     state.settings.capture.monitor_index = int(idx)
     state.settings.capture.source_mode = "monitor"
+    try:
+        state.save()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        state._notify_state()
+    except Exception:  # noqa: BLE001
+        pass
     page = getattr(state, "page", None)
     if page is None:
         return

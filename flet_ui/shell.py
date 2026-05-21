@@ -237,7 +237,30 @@ class StreamMasterApp:
         self._refresh_nav_buttons()
         self._render_current_page()
         if self.page is not None:
-            self.page.update()
+            try:
+                self.page.update()
+            except Exception as exc:  # noqa: BLE001
+                tb_text = traceback.format_exc()
+                traceback.print_exc()
+                try:
+                    from .crash_diagnostics import record_exception
+
+                    record_exception(
+                        "flet_navigation",
+                        f"페이지 전환 업데이트 오류 (route={self.current_route}): {exc}",
+                        detail=tb_text,
+                        exc=exc,
+                    )
+                except Exception:
+                    try:
+                        log_app_event(
+                            "ERROR",
+                            f"페이지 전환 업데이트 오류 (route={self.current_route}): {exc}",
+                            detail=tb_text,
+                        )
+                    except Exception:
+                        pass
+                raise
 
     @staticmethod
     def _stop_route_log_pollers(leaving: str) -> None:

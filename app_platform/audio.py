@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -34,10 +35,19 @@ def stop_queued_alert_sounds() -> None:
             _afplay_children.clear()
 
 
-def play_alert_sound() -> None:
+def play_alert_sound(path: str | None = None) -> None:
     if sys.platform == "win32":
         import winsound
 
+        if path:
+            try:
+                winsound.PlaySound(
+                    path,
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NOSTOP,
+                )
+                return
+            except Exception:
+                pass
         flags = (
             winsound.SND_ALIAS
             | winsound.SND_ASYNC
@@ -48,10 +58,11 @@ def play_alert_sound() -> None:
 
     if sys.platform == "darwin":
         try:
+            sound_path = path if path and os.path.isfile(path) else "/System/Library/Sounds/Glass.aiff"
             p = subprocess.Popen(
                 [
                     "afplay",
-                    "/System/Library/Sounds/Glass.aiff",
+                    sound_path,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
