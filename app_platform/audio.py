@@ -8,6 +8,8 @@ import sys
 import threading
 from typing import List
 
+from .settings_paths import resolve_settings_path_if_exists
+
 _MCI_ALIAS = "oddments_alert"
 
 _afplay_lock = threading.Lock()
@@ -15,11 +17,8 @@ _afplay_children: List[subprocess.Popen] = []
 
 
 def resolve_alert_sound_path(path: str | None) -> str | None:
-    """존재하는 알림음 파일 경로만 반환한다."""
-    if not path or not str(path).strip():
-        return None
-    candidate = os.path.abspath(os.path.expanduser(str(path).strip()))
-    return candidate if os.path.isfile(candidate) else None
+    """존재하는 알림음 파일 경로만 반환한다 (``assets/`` 상대 경로 지원)."""
+    return resolve_settings_path_if_exists(path)
 
 
 def _win_mci_send(command: str) -> bool:

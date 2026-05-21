@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -89,9 +90,15 @@ class RegionRuleSettingsTests(unittest.TestCase):
         loaded = AppState()
         loaded._apply_settings_dict(data)
 
-        self.assertEqual(loaded.settings.detection.custom_sound_path, "D:/sounds/main.mp3")
+        self.assertEqual(
+            Path(loaded.settings.detection.custom_sound_path),
+            Path("D:/sounds/main.mp3"),
+        )
         loaded._sync_cfg_from_settings()
-        self.assertEqual(loaded.get_cfg().custom_sound_path, "D:/sounds/main.mp3")
+        self.assertEqual(
+            Path(loaded.get_cfg().custom_sound_path),
+            Path("D:/sounds/main.mp3"),
+        )
 
     def test_region_rules_round_trip_through_settings_dict(self) -> None:
         state = AppState()
@@ -129,7 +136,7 @@ class RegionRuleSettingsTests(unittest.TestCase):
         self.assertEqual(rule.color_hex, "#ff3030")
         self.assertEqual(rule.color_tolerance, 100)
         self.assertAlmostEqual(rule.cooldown_sec, 1.5)
-        self.assertEqual(rule.custom_sound_path, "D:/sounds/warn.wav")
+        self.assertEqual(Path(rule.custom_sound_path), Path("D:/sounds/warn.wav"))
         self.assertTrue(rule.expanded)
         self.assertNotIn("color_min_ratio", data["region_rules"][0])
 

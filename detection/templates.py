@@ -9,6 +9,8 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+from app_platform.settings_paths import resolve_settings_path
+
 from .common import OverlayRect, stable_overlay_bgr
 
 # 약간의 스케일·압축 차이를 흡수 (캡처와 템플릿 파일 해상도 불일치 완화)
@@ -109,7 +111,7 @@ def match_all_templates(
     out: List[OverlayRect] = []
     seen_rect: set[Tuple[int, int, int, int]] = set()
     for p in template_paths:
-        p = (p or "").strip()
+        p = resolve_settings_path((p or "").strip())
         if not p:
             continue
         base = os.path.basename(p)

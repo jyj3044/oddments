@@ -28,6 +28,7 @@ from app_platform import (
     stop_queued_alert_sounds,
     window_pick_supported,
 )
+from app_platform.settings_paths import to_settings_storage_path
 from capture import CaptureThread, enumerate_monitors
 from detection import (
     DetectionConfig,
@@ -315,7 +316,9 @@ def _region_rule_from_dict(value: object, index: int) -> RegionRuleSettings | No
         color_hex=_normalize_hex_color(value.get("color_hex", "#ff3030")),
         color_tolerance=max(0, min(100, _safe_int(value.get("color_tolerance"), 24))),
         cooldown_sec=max(0.0, _safe_float(value.get("cooldown_sec"), ALERT_COOLDOWN_DEFAULT)),
-        custom_sound_path=str(value.get("custom_sound_path") or ""),
+        custom_sound_path=to_settings_storage_path(
+            str(value.get("custom_sound_path") or "")
+        ),
         expanded=bool(value.get("expanded", False)),
     )
 
@@ -519,10 +522,20 @@ class AppState:
         ard = self.settings.arduino
 
         det.keywords = str(d.get("keywords", det.keywords))
-        det.template_paths = tuple(d.get("template_paths", []))
+        raw_templates = d.get("template_paths", [])
+        if isinstance(raw_templates, list):
+            det.template_paths = tuple(
+                to_settings_storage_path(str(p))
+                for p in raw_templates
+                if str(p).strip()
+            )
+        else:
+            det.template_paths = ()
         det.template_threshold = float(d.get("template_threshold", det.template_threshold))
         det.cooldown_sec = float(d.get("cooldown_sec", det.cooldown_sec))
-        det.custom_sound_path = str(d.get("custom_sound_path", det.custom_sound_path) or "")
+        det.custom_sound_path = to_settings_storage_path(
+            str(d.get("custom_sound_path", det.custom_sound_path) or "")
+        )
         engines = d.get("ocr_engines")
         if isinstance(engines, list):
             det.keyword_ocr_enabled = bool(engines)

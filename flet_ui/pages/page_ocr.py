@@ -111,9 +111,13 @@ def build_ocr_settings(state: AppState) -> ft.Control:
     )
 
     def _on_tpl_change(_e: ft.ControlEvent) -> None:
+        from app_platform.settings_paths import to_settings_storage_path
+
         raw = tpl_field.value or ""
         det.template_paths = tuple(
-            p.strip() for p in raw.replace("\n", ";").split(";") if p.strip()
+            to_settings_storage_path(p.strip())
+            for p in raw.replace("\n", ";").split(";")
+            if p.strip()
         )
         _push_detection_cfg()
 
@@ -159,7 +163,9 @@ def build_ocr_settings(state: AppState) -> ft.Control:
     )
 
     def _set_main_sound_path(path: str) -> None:
-        det.custom_sound_path = path
+        from app_platform.settings_paths import to_settings_storage_path
+
+        det.custom_sound_path = to_settings_storage_path(path)
         _push_detection_cfg()
 
     pick_main_sound_btn = outline_button(
@@ -1477,6 +1483,8 @@ def _pick_alert_sound(
         return
 
     async def _async_pick() -> None:
+        from app_platform.settings_paths import to_settings_storage_path
+
         from ..log_buffers import log_app_event
 
         try:
@@ -1492,10 +1500,11 @@ def _pick_alert_sound(
             path = getattr(files[0], "path", None)
             if not path:
                 return
-            sound_field.value = path
+            stored = to_settings_storage_path(path)
+            sound_field.value = stored
             if sound_field.page is not None:
                 sound_field.update()
-            set_path(path)
+            set_path(stored)
         except Exception as exc:  # noqa: BLE001
             show_snack(page, f"알림음 파일 선택 실패: {exc}", error=True)
 
@@ -1519,6 +1528,8 @@ def _pick_template(state: AppState, tpl_field: ft.TextField, det) -> None:
         return
 
     async def _async_pick() -> None:
+        from app_platform.settings_paths import to_settings_storage_path
+
         from ..log_buffers import log_app_event
 
         try:
@@ -1538,8 +1549,11 @@ def _pick_template(state: AppState, tpl_field: ft.TextField, det) -> None:
             existing = list(det.template_paths) if det.template_paths else []
             for f in files:
                 path = getattr(f, "path", None)
-                if path and path not in existing:
-                    existing.append(path)
+                if not path:
+                    continue
+                stored = to_settings_storage_path(path)
+                if stored and stored not in existing:
+                    existing.append(stored)
             det.template_paths = tuple(existing)
             tpl_field.value = ";".join(existing)
             try:
