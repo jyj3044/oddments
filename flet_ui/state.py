@@ -68,12 +68,14 @@ from streaming.web_log import drain_web_log_lines, log_web_event, reset_web_log
 if sys.platform == "win32":
     from arduino.serial_bridge import (
         ArduinoKeyBridge,
+        ArduinoRuntimeStatus,
         bridge_supported,
         clear_arduino_notice_buffer,
         clear_key_bridge_debug_log,
         clear_received_serial_log,
         drain_key_bridge_debug_lines,
         drain_received_serial_lines,
+        get_arduino_runtime_status,
         list_com_ports,
         log_arduino_notice,
         parse_key_filter_spec,
@@ -124,6 +126,11 @@ else:  # 비 Windows 환경에서는 무동작 스텁으로 대체
 
     def drain_key_bridge_debug_lines(max_n: int = 200) -> list[str]:  # type: ignore[no-redef]
         return []
+
+    ArduinoRuntimeStatus = object  # type: ignore[assignment]
+
+    def get_arduino_runtime_status() -> object | None:  # type: ignore[no-redef]
+        return None
 
     def set_key_bridge_debug_logging(enabled: bool) -> None:  # type: ignore[no-redef]
         pass
@@ -1178,6 +1185,9 @@ class AppState:
         if not self._arduino_supported:
             return None
         return self._arduino.last_error()
+
+    def arduino_runtime_status(self) -> ArduinoRuntimeStatus | None:
+        return get_arduino_runtime_status()  # type: ignore[return-value]
 
     # ─── 포커스 이벤트 → Arduino ────────────────────────
 

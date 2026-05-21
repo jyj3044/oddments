@@ -8,11 +8,14 @@ Windows: 지정한 키(가상 키 코드)가 눌리거나 떼질 때 Arduino(COM
 
 from __future__ import annotations
 
+import json
 import queue
 import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 if sys.platform == "win32":
@@ -34,9 +37,132 @@ _FKEY_RE = re.compile(r"^f(\d{1,2})$", re.IGNORECASE)
 _kb_debug_q: queue.SimpleQueue[str] = queue.SimpleQueue()
 _kb_debug_on = False
 _serial_rx_q: queue.SimpleQueue[str] = queue.SimpleQueue()
+_runtime_status_lock = threading.Lock()
+_runtime_status: "ArduinoRuntimeStatus | None" = None
+
+
+def _runtime_status_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd()
+
+
+ARDUINO_RUNTIME_STATUS_PATH = _runtime_status_base_dir() / "logs" / "arduino_runtime_status.json"
 
 _notice_lock = threading.Lock()
 _notice_buf: list[str] = []
+
+
+@dataclass(frozen=True)
+class ArduinoRuntimeStatus:
+    version: int
+    macro_type: str
+    run_state: str
+    next_ms: dict[str, int]
+    received_at: float
+    raw: str
+
+
+def parse_arduino_runtime_status_line(
+    line: str,
+    *,
+    received_at: float | None = None,
+) -> ArduinoRuntimeStatus | None:
+    raw = (line or "").strip()
+    if not raw.startswith("{"):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    run_state = str(data.get("r") or "").strip().lower()
+    if run_state not in {"idle", "running", "paused"}:
+        return None
+
+    try:
+        version = int(data.get("v"))
+    except (TypeError, ValueError):
+        return None
+
+    macro_type = str(data.get("t") or "").strip()
+    if not macro_type:
+        return None
+
+    raw_next = data.get("n")
+    if not isinstance(raw_next, dict):
+        return None
+    next_ms: dict[str, int] = {}
+    for key, value in raw_next.items():
+        k = str(key).strip()
+        if not k:
+            continue
+        try:
+            ms = int(value)
+        except (TypeError, ValueError):
+            continue
+        next_ms[k] = max(0, ms)
+
+    return ArduinoRuntimeStatus(
+        version=version,
+        macro_type=macro_type,
+        run_state=run_state,
+        next_ms=next_ms,
+        received_at=time.time() if received_at is None else float(received_at),
+        raw=raw,
+    )
+
+
+def _store_runtime_status_from_line(line: str) -> None:
+    global _runtime_status
+    status = parse_arduino_runtime_status_line(line)
+    if status is None:
+        return
+    with _runtime_status_lock:
+        _runtime_status = status
+    write_arduino_runtime_status_file(status)
+
+
+def runtime_status_to_dict(status: ArduinoRuntimeStatus) -> dict[str, object]:
+    return {
+        "v": int(status.version),
+        "t": status.macro_type,
+        "r": status.run_state,
+        "n": dict(status.next_ms),
+        "received_at": float(status.received_at),
+        "raw": status.raw,
+    }
+
+
+def write_arduino_runtime_status_file(
+    status: ArduinoRuntimeStatus,
+    *,
+    path: Path | str | None = None,
+) -> None:
+    target = Path(path) if path is not None else ARDUINO_RUNTIME_STATUS_PATH
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(
+            json.dumps(runtime_status_to_dict(status), ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        tmp.replace(target)
+    except OSError:
+        pass
+
+
+def get_arduino_runtime_status() -> ArduinoRuntimeStatus | None:
+    with _runtime_status_lock:
+        return _runtime_status
+
+
+def clear_arduino_runtime_status() -> None:
+    global _runtime_status
+    with _runtime_status_lock:
+        _runtime_status = None
 
 
 def log_arduino_notice(message: str) -> None:
@@ -103,6 +229,7 @@ def clear_received_serial_log() -> None:
             _serial_rx_q.get_nowait()
         except queue.Empty:
             break
+    clear_arduino_runtime_status()
 
 
 def _kb_debug_line(msg: str) -> None:
@@ -333,6 +460,7 @@ class ArduinoKeyBridge:
                         txt = repr(bytes(raw_line))
                     txt = txt.strip("\r")
                     if txt:
+                        _store_runtime_status_from_line(txt)
                         ts = time.strftime("%H:%M:%S")
                         _serial_rx_q.put(f"[RX] {ts} {txt}\n")
 
@@ -541,3 +669,26 @@ def list_com_ports() -> list[tuple[str, str]]:
 
 def bridge_supported() -> bool:
     return sys.platform == "win32" and keyboard is not None and serial is not None
+
+
+__all__ = [
+    "ArduinoKeyBridge",
+    "ArduinoRuntimeStatus",
+    "bridge_supported",
+    "clear_arduino_notice_buffer",
+    "clear_arduino_runtime_status",
+    "clear_key_bridge_debug_log",
+    "clear_received_serial_log",
+    "drain_key_bridge_debug_lines",
+    "drain_received_serial_lines",
+    "get_arduino_runtime_status",
+    "key_pick_choices",
+    "list_com_ports",
+    "log_arduino_notice",
+    "parse_arduino_runtime_status_line",
+    "parse_key_filter_spec",
+    "runtime_status_to_dict",
+    "set_key_bridge_debug_logging",
+    "take_arduino_notice_lines",
+    "write_arduino_runtime_status_file",
+]

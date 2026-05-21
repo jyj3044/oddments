@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
+import multiprocessing as mp
+import os
 import threading
 from typing import Callable
 
@@ -39,6 +42,44 @@ KEY_CHOICES_FALLBACK = (
 
 # 아두이노 탭 재진입 시 이전 폴링 스레드 정리. (Flet 0.85 Column 은 on_mount 가 거의 오지 않음)
 _prev_arduino_log_ctrl: _ArduinoPageController | None = None
+_runtime_status_processes_lock = threading.Lock()
+_runtime_status_processes: list[tuple[mp.Process, mp.Event]] = []
+
+
+def terminate_arduino_status_windows() -> None:
+    with _runtime_status_processes_lock:
+        entries = list(_runtime_status_processes)
+        _runtime_status_processes.clear()
+    for proc, stop_event in entries:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+    for proc, _stop_event in entries:
+        try:
+            if proc.is_alive():
+                proc.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
+
+
+atexit.register(terminate_arduino_status_windows)
+
+
+def _page_loop_open(page: ft.Page) -> bool:
+    try:
+        loop = page.session.connection.loop
+    except Exception:
+        return False
+    try:
+        return not loop.is_closed()
+    except Exception:
+        return False
 
 
 class _ArduinoPageController:
@@ -52,6 +93,26 @@ class _ArduinoPageController:
         self.apply_baud_state = None  # type: ignore[assignment]
         self._last_active: bool | None = None
         self._mounted = False
+
+    def launch_runtime_status_window(self) -> None:
+        from ..arduino_status_window import run_status_window
+        stop_event = mp.Event()
+        try:
+            proc = mp.Process(
+                target=run_status_window,
+                args=(os.getpid(), stop_event),
+                daemon=True,
+                name="ArduinoStatusWindow",
+            )
+            proc.start()
+            with _runtime_status_processes_lock:
+                _runtime_status_processes[:] = [
+                    (p, e) for p, e in _runtime_status_processes if p.is_alive()
+                ]
+                _runtime_status_processes.append((proc, stop_event))
+            log_arduino_notice("[상태] Arduino 상태창 실행")
+        except Exception as exc:  # noqa: BLE001
+            log_arduino_notice(f"[상태] Arduino 상태창 실행 실패: {exc}")
 
     def start(self, page: ft.Page) -> None:
         self.page = page
@@ -88,6 +149,9 @@ class _ArduinoPageController:
             return
         page = self.page
         if page is None:
+            return
+        if not _page_loop_open(page):
+            self._mounted = False
             return
 
         status = self.status_text
@@ -133,6 +197,9 @@ class _ArduinoPageController:
                 pass
 
         try:
+            if not _page_loop_open(page):
+                self._mounted = False
+                return
             page.run_task(_apply)
         except Exception:
             self._mounted = False
@@ -219,6 +286,13 @@ def build_arduino_link(state: AppState) -> ft.Control:
     connection_card = section_card(
         title="연결 설정",
         icon=ft.Icons.SETTINGS_INPUT_COMPONENT,
+        actions=[
+            outline_button(
+                "상태창",
+                icon=ft.Icons.INFO_OUTLINE,
+                on_click=lambda _e: ctrl.launch_runtime_status_window(),
+            )
+        ],
         expand=True,
         content=ft.Column(
             spacing=T.SPACE_MD,

@@ -386,6 +386,12 @@ def main(page: ft.Page) -> None:
     _install_window_tracking(page, state)
 
     def _on_disconnect(_e: ft.ControlEvent | None = None) -> None:
+        try:
+            from flet_ui.pages.page_arduino import shutdown_arduino_log_poller_if_any
+
+            shutdown_arduino_log_poller_if_any()
+        except Exception:
+            pass
         # 창을 닫는 그 순간의 width/height 를 한 번 더 잡아둔다. on_event 가
         # 호출되기 전에 종료 이벤트가 먼저 도착하는 경우를 대비한 안전망.
         try:
@@ -404,6 +410,12 @@ def main(page: ft.Page) -> None:
             pass
         try:
             state.save()
+        except Exception:
+            pass
+        try:
+            from flet_ui.pages.page_arduino import terminate_arduino_status_windows
+
+            terminate_arduino_status_windows()
         except Exception:
             pass
         try:
@@ -1474,11 +1486,18 @@ def _frozen_exe_dir() -> Path | None:
 
 
 if __name__ == "__main__":
+    import multiprocessing as _multiprocessing
+
+    _multiprocessing.freeze_support()
     install_process_crash_handlers()
     os.makedirs(os.path.join(ASSETS_DIR, "preview"), exist_ok=True)
     _target = main
     if "--remote-viewer" in sys.argv:
         _target = remote_viewer_main
+    elif "--arduino-status-window" in sys.argv:
+        from flet_ui.arduino_status_window import main as arduino_status_window_main
+
+        _target = arduino_status_window_main
     else:
         require_windows_admin_or_exit(__file__)
     try:

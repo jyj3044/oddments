@@ -57,3 +57,4 @@ maplealert_settings.json
 .venv-build
 oddments_settings.json
 alert_settings.json
+logs/arduino_runtime_status.json
