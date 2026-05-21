@@ -47,7 +47,12 @@ def _runtime_status_base_dir() -> Path:
     return Path.cwd()
 
 
-ARDUINO_RUNTIME_STATUS_PATH = _runtime_status_base_dir() / "logs" / "arduino_runtime_status.json"
+def arduino_runtime_status_path() -> Path:
+    """런타임 상태 JSON 경로 (호출 시점 cwd/실행 파일 기준)."""
+    return _runtime_status_base_dir() / "logs" / "arduino_runtime_status.json"
+
+
+ARDUINO_RUNTIME_STATUS_PATH = arduino_runtime_status_path()
 
 _notice_lock = threading.Lock()
 _notice_buf: list[str] = []
@@ -141,7 +146,7 @@ def write_arduino_runtime_status_file(
     *,
     path: Path | str | None = None,
 ) -> None:
-    target = Path(path) if path is not None else ARDUINO_RUNTIME_STATUS_PATH
+    target = Path(path) if path is not None else arduino_runtime_status_path()
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".tmp")
@@ -159,10 +164,19 @@ def get_arduino_runtime_status() -> ArduinoRuntimeStatus | None:
         return _runtime_status
 
 
+def _remove_arduino_runtime_status_file(*, path: Path | str | None = None) -> None:
+    target = Path(path) if path is not None else arduino_runtime_status_path()
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def clear_arduino_runtime_status() -> None:
     global _runtime_status
     with _runtime_status_lock:
         _runtime_status = None
+    _remove_arduino_runtime_status_file()
 
 
 def log_arduino_notice(message: str) -> None:
@@ -596,6 +610,7 @@ class ArduinoKeyBridge:
         with self._lock:
             self._last_error = None
             self._traffic_error = None
+        clear_arduino_runtime_status()
 
     def is_active(self) -> bool:
         """시리얼·키 리스너가 동작 중이면 True."""
@@ -672,8 +687,10 @@ def bridge_supported() -> bool:
 
 
 __all__ = [
+    "ARDUINO_RUNTIME_STATUS_PATH",
     "ArduinoKeyBridge",
     "ArduinoRuntimeStatus",
+    "arduino_runtime_status_path",
     "bridge_supported",
     "clear_arduino_notice_buffer",
     "clear_arduino_runtime_status",

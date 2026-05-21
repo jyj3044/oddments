@@ -12,6 +12,7 @@ from flet_ui.arduino_status_window import (
 )
 from flet_ui.pages.page_arduino import _page_loop_open
 from arduino.serial_bridge import (
+    clear_arduino_runtime_status,
     parse_arduino_runtime_status_line,
     runtime_status_to_dict,
     write_arduino_runtime_status_file,
@@ -93,6 +94,8 @@ class ArduinoRuntimeStatusParserTests(unittest.TestCase):
         )
 
     def test_parent_pid_is_read_from_status_window_args(self) -> None:
+        from flet_ui.arduino_status_window import _status_path_from_argv
+
         self.assertEqual(
             _parent_pid_from_argv(["prog", "--parent-pid", "1234"]),
             1234,
@@ -102,6 +105,10 @@ class ArduinoRuntimeStatusParserTests(unittest.TestCase):
             0,
         )
         self.assertEqual(_parent_pid_from_argv(["prog"]), 0)
+        self.assertEqual(
+            _status_path_from_argv(["prog", "--status-path", r"C:\tmp\st.json"]),
+            Path(r"C:\tmp\st.json"),
+        )
 
     def test_current_process_is_detected_alive(self) -> None:
         from flet_ui.arduino_status_window import _process_alive
@@ -120,6 +127,40 @@ class ArduinoRuntimeStatusParserTests(unittest.TestCase):
         _parent_watchdog_iteration(99999999, exit_func=lambda: called.append(True))
 
         self.assertEqual(called, [True])
+
+    def test_clear_runtime_status_removes_snapshot_file(self) -> None:
+        status = parse_arduino_runtime_status_line(
+            '{"v":1,"t":"ILLIUM","r":"idle","n":{"gate":1000}}',
+            received_at=1.0,
+        )
+        assert status is not None
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "arduino_runtime_status.json"
+            write_arduino_runtime_status_file(status, path=path)
+            self.assertTrue(path.is_file())
+
+            from arduino.serial_bridge import _remove_arduino_runtime_status_file
+
+            _remove_arduino_runtime_status_file(path=path)
+            self.assertFalse(path.exists())
+
+        clear_arduino_runtime_status()
+
+    def test_normalize_snapshot_keeps_data_when_stale(self) -> None:
+        from flet_ui.arduino_status_window import _normalize_snapshot
+
+        snapshot = {
+            "t": "ILLIUM",
+            "r": "running",
+            "n": {"gate": 1000},
+            "received_at": 0.0,
+        }
+        out, received_at, stale = _normalize_snapshot(snapshot, now=20.0)
+
+        self.assertIs(out, snapshot)
+        self.assertEqual(received_at, 0.0)
+        self.assertTrue(stale)
 
     def test_page_loop_open_rejects_closed_loop(self) -> None:
         class FakeLoop:

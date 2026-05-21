@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
 import threading
 import time
-from concurrent.futures import TimeoutError
 from pathlib import Path
 from typing import Any
 
 import flet as ft
 
-from arduino.serial_bridge import ARDUINO_RUNTIME_STATUS_PATH
+from arduino.serial_bridge import arduino_runtime_status_path
 
 from .components import (
     STATUS_ERROR,
@@ -26,16 +24,34 @@ from .components import (
 )
 from .theme import StreamMasterTheme as T, body_md, label_md, title_md
 
-_STALE_AFTER_SECONDS = 3.0
+_STALE_AFTER_SECONDS = 15.0
+
+
+def _arg_value(argv: list[str], flag: str) -> str | None:
+    try:
+        idx = argv.index(flag)
+        return argv[idx + 1]
+    except (ValueError, IndexError):
+        return None
 
 
 def _parent_pid_from_argv(argv: list[str] | None = None) -> int:
     args = list(sys.argv if argv is None else argv)
-    try:
-        idx = args.index("--parent-pid")
-        return max(0, int(args[idx + 1]))
-    except (ValueError, IndexError, TypeError):
+    raw = _arg_value(args, "--parent-pid")
+    if raw is None:
         return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _status_path_from_argv(argv: list[str] | None = None) -> Path | None:
+    args = list(sys.argv if argv is None else argv)
+    raw = _arg_value(args, "--status-path")
+    if not raw:
+        return None
+    return Path(raw)
 
 
 def _process_alive(pid: int) -> bool:
@@ -80,13 +96,20 @@ def _parent_watchdog_iteration(
         exit_func()
 
 
-def _status_path() -> Path:
-    return ARDUINO_RUNTIME_STATUS_PATH
-
-
-def _load_status_snapshot() -> dict[str, Any] | None:
+def _page_loop_open(page: ft.Page) -> bool:
     try:
-        data = json.loads(_status_path().read_text(encoding="utf-8"))
+        loop = page.session.connection.loop
+    except Exception:
+        return False
+    try:
+        return not loop.is_closed()
+    except Exception:
+        return False
+
+
+def _load_status_snapshot(status_path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(status_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
@@ -120,47 +143,14 @@ def _field(label: str, value: ft.Control) -> ft.Row:
     )
 
 
-def _page_loop(page: ft.Page) -> asyncio.AbstractEventLoop | None:
-    try:
-        loop = page.session.connection.loop
-    except Exception:
-        return None
-    try:
-        if loop.is_closed():
-            return None
-    except Exception:
-        return None
-    return loop
-
-
-def _request_window_destroy(page: ft.Page) -> None:
-    loop = _page_loop(page)
-    if loop is None:
-        _exit_status_window()
-    try:
-        fut = asyncio.run_coroutine_threadsafe(page.window.destroy(), loop)
-        fut.result(timeout=1.5)
-    except (TimeoutError, Exception):
-        pass
-    _exit_status_window()
-
-
 def _start_shutdown_watchdog(
     *,
-    page: ft.Page,
     parent_pid: int,
-    shutdown_event: Any | None,
 ) -> None:
     def _loop() -> None:
         while True:
-            if shutdown_event is not None:
-                try:
-                    if shutdown_event.is_set():
-                        _request_window_destroy(page)
-                except Exception:
-                    _exit_status_window()
             if _should_exit_for_parent(parent_pid):
-                _request_window_destroy(page)
+                _exit_status_window()
             time.sleep(0.2)
 
     threading.Thread(
@@ -170,29 +160,33 @@ def _start_shutdown_watchdog(
     ).start()
 
 
-def _normalize_snapshot(snapshot: dict[str, Any] | None, now: float) -> tuple[dict[str, Any] | None, float]:
+def _normalize_snapshot(
+    snapshot: dict[str, Any] | None,
+    now: float,
+) -> tuple[dict[str, Any] | None, float, bool]:
+    """스냅샷·수신 시각·만료 여부. 만료여도 마지막 값은 화면에 유지한다."""
     received_at = now
+    stale = True
     if snapshot is not None:
-        try:
-            received_at = float(snapshot.get("received_at") or now)
-        except (TypeError, ValueError):
+        raw_received = snapshot.get("received_at")
+        if raw_received is None:
             received_at = now
-        if now - received_at > _STALE_AFTER_SECONDS:
-            snapshot = None
-    return snapshot, received_at
+        else:
+            try:
+                received_at = float(raw_received)
+            except (TypeError, ValueError):
+                received_at = now
+        stale = now - received_at > _STALE_AFTER_SECONDS
+    return snapshot, received_at, stale
 
 
 def _status_window_main(
     page: ft.Page,
     *,
     parent_pid: int = 0,
-    shutdown_event: Any | None = None,
+    status_path: str | Path | None = None,
 ) -> None:
-    _start_shutdown_watchdog(
-        page=page,
-        parent_pid=parent_pid,
-        shutdown_event=shutdown_event,
-    )
+    _start_shutdown_watchdog(parent_pid=parent_pid)
 
     page.title = "Arduino 상태"
     page.bgcolor = T.SURFACE_BRIGHT
@@ -240,27 +234,38 @@ def _status_window_main(
         )
     )
 
+    status_file = Path(status_path) if status_path is not None else arduino_runtime_status_path()
     last_render = {"key": ""}
 
     def refresh_loop() -> None:
         while True:
-            snapshot, received_at = _normalize_snapshot(_load_status_snapshot(), time.time())
+            if not _page_loop_open(page):
+                time.sleep(0.25)
+                continue
+
             now = time.time()
+            snapshot, received_at, stale = _normalize_snapshot(
+                _load_status_snapshot(status_file),
+                now,
+            )
+            age_sec = max(0, int(now - received_at))
             if snapshot is None:
                 render_key = "none"
             else:
                 render_key = (
                     f"{snapshot.get('t')}:{snapshot.get('r')}:{snapshot.get('n')}:"
-                    f"{max(0, int(now - received_at))}"
+                    f"{age_sec}:{int(stale)}"
                 )
-            if render_key != last_render["key"]:
-                last_render["key"] = render_key
+            if render_key == last_render["key"]:
+                time.sleep(0.25)
+                continue
+            last_render["key"] = render_key
+
+            async def _apply() -> None:
                 if snapshot is None:
                     type_text.value = "-"
                     state_slot.content = _run_indicator("")
-                    next_col.controls = [
-                        ft.Text("수신된 상태값이 없습니다.", style=body_md(), color=T.ON_SURFACE_VARIANT)
-                    ]
+                    next_col.controls = []
                     last_seen_text.value = "-"
                 else:
                     run_state = str(snapshot.get("r") or "")
@@ -273,20 +278,39 @@ def _status_window_main(
                             controls.append(
                                 ft.Row(
                                     controls=[
-                                        ft.Text(str(key), style=body_md(), color=T.ON_SURFACE, expand=True),
-                                        ft.Text(_seconds_text(value), style=body_md(), color=T.ON_SURFACE),
+                                        ft.Text(
+                                            str(key),
+                                            style=body_md(),
+                                            color=T.ON_SURFACE,
+                                            expand=True,
+                                        ),
+                                        ft.Text(
+                                            _seconds_text(value),
+                                            style=body_md(),
+                                            color=T.ON_SURFACE,
+                                        ),
                                     ],
                                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                 )
                             )
-                    next_col.controls = controls or [
-                        ft.Text("-", style=body_md(), color=T.ON_SURFACE_VARIANT)
-                    ]
-                    last_seen_text.value = f"{max(0, int(now - received_at))}초 전"
+                    next_col.controls = controls
+                    suffix = " (만료)" if stale else ""
+                    last_seen_text.value = f"{age_sec}초 전{suffix}"
+
+                for ctrl in (type_text, state_slot, next_col, last_seen_text):
+                    try:
+                        ctrl.update()
+                    except Exception:
+                        pass
                 try:
                     page.update()
                 except Exception:
                     _exit_status_window()
+
+            try:
+                page.run_task(_apply)
+            except Exception:
+                _exit_status_window()
             time.sleep(0.25)
 
     threading.Thread(
@@ -296,19 +320,14 @@ def _status_window_main(
     ).start()
 
 
-def run_status_window(parent_pid: int = 0, shutdown_event: Any | None = None) -> None:
-    ft.app(
-        target=lambda page: _status_window_main(
-            page,
-            parent_pid=parent_pid,
-            shutdown_event=shutdown_event,
-        )
+def main(page: ft.Page) -> None:
+    argv_path = _status_path_from_argv()
+    _status_window_main(
+        page,
+        parent_pid=_parent_pid_from_argv(),
+        status_path=argv_path if argv_path is not None else arduino_runtime_status_path(),
     )
 
 
-def main(page: ft.Page) -> None:
-    _status_window_main(page, parent_pid=_parent_pid_from_argv())
-
-
 if __name__ == "__main__":
-    run_status_window(parent_pid=_parent_pid_from_argv())
+    ft.app(target=main)

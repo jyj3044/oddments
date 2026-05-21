@@ -423,6 +423,9 @@ def main(page: ft.Page) -> None:
         finally:
             detach_flet_page()
             shutdown_log_store()
+        # Flet 이 창 닫힌 뒤에도 이벤트 루프·보조 스레드로 프로세스가 남는 경우가 있어
+        # 데스크톱 앱은 정리 직후 프로세스를 확실히 종료한다.
+        os._exit(0)
 
     page.on_disconnect = _on_disconnect
     page.on_close = _on_disconnect

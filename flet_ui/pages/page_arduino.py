@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import atexit
-import multiprocessing as mp
 import os
+import subprocess
+import sys
 import threading
+from pathlib import Path
 from typing import Callable
 
 import flet as ft
@@ -41,31 +43,44 @@ KEY_CHOICES_FALLBACK = (
 )
 
 # 아두이노 탭 재진입 시 이전 폴링 스레드 정리. (Flet 0.85 Column 은 on_mount 가 거의 오지 않음)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _prev_arduino_log_ctrl: _ArduinoPageController | None = None
 _runtime_status_processes_lock = threading.Lock()
-_runtime_status_processes: list[tuple[mp.Process, mp.Event]] = []
+_runtime_status_processes: list[subprocess.Popen[bytes]] = []
+
+
+def _kill_status_subprocess(proc: subprocess.Popen[bytes]) -> None:
+    """Flet 보조 창은 자식 프로세스까지 묶여 있어 Windows 에서 트리 단위로 종료한다."""
+    if proc.poll() is not None:
+        return
+    pid = proc.pid
+    if sys.platform == "win32" and pid:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def terminate_arduino_status_windows() -> None:
     with _runtime_status_processes_lock:
         entries = list(_runtime_status_processes)
         _runtime_status_processes.clear()
-    for proc, stop_event in entries:
-        try:
-            stop_event.set()
-        except Exception:
-            pass
-    for proc, _stop_event in entries:
-        try:
-            if proc.is_alive():
-                proc.join(timeout=2.0)
-        except Exception:
-            pass
-        try:
-            if proc.is_alive():
-                proc.terminate()
-        except Exception:
-            pass
+    for proc in entries:
+        _kill_status_subprocess(proc)
 
 
 atexit.register(terminate_arduino_status_windows)
@@ -95,23 +110,45 @@ class _ArduinoPageController:
         self._mounted = False
 
     def launch_runtime_status_window(self) -> None:
-        from ..arduino_status_window import run_status_window
-        stop_event = mp.Event()
+        from arduino.serial_bridge import arduino_runtime_status_path
+
+        parent_pid = os.getpid()
+        status_path = str(arduino_runtime_status_path().resolve())
+        if getattr(sys, "frozen", False):
+            cmd = [
+                sys.executable,
+                "--arduino-status-window",
+                "--parent-pid",
+                str(parent_pid),
+                "--status-path",
+                status_path,
+            ]
+        else:
+            main_py = _PROJECT_ROOT / "main.py"
+            if not main_py.is_file():
+                log_arduino_notice("[상태] Arduino 상태창 실행 실패: main.py 없음")
+                return
+            cmd = [
+                sys.executable,
+                str(main_py),
+                "--arduino-status-window",
+                "--parent-pid",
+                str(parent_pid),
+                "--status-path",
+                status_path,
+            ]
         try:
-            proc = mp.Process(
-                target=run_status_window,
-                args=(os.getpid(), stop_event),
-                daemon=True,
-                name="ArduinoStatusWindow",
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(_PROJECT_ROOT),
             )
-            proc.start()
             with _runtime_status_processes_lock:
                 _runtime_status_processes[:] = [
-                    (p, e) for p, e in _runtime_status_processes if p.is_alive()
+                    p for p in _runtime_status_processes if p.poll() is None
                 ]
-                _runtime_status_processes.append((proc, stop_event))
+                _runtime_status_processes.append(proc)
             log_arduino_notice("[상태] Arduino 상태창 실행")
-        except Exception as exc:  # noqa: BLE001
+        except OSError as exc:
             log_arduino_notice(f"[상태] Arduino 상태창 실행 실패: {exc}")
 
     def start(self, page: ft.Page) -> None:
